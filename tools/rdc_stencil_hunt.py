@@ -1,40 +1,48 @@
 """
-rdc_stencil_hunt.py -- exhaustively determine whether ANY draw in the frame
-writes stencil, and if so, which pass and with what reference values.
+rdc_stencil_hunt.py -- determine whether ANY draw in the frame writes stencil,
+and which depth targets are actually used.
 
 Run:
     set RDC_PATH=...\\capture.rdc
     qrenderdoc.exe --python rdc_stencil_hunt.py
 
-Why a dedicated script: the recon sampled 12 of 1365 draws and reported
-"writes stencil: no". Unreal's CustomDepth pass is often only a handful of
-draws, so sparse sampling cannot answer this question -- absence of evidence
-was being reported as evidence of absence.
+Two lessons are baked into this version.
 
-Method: depth-stencil state in D3D12 is baked into the PSO, not set on the
-command list. So every draw sharing a PSO shares its stencil configuration.
-Walking every draw in ascending EID order (which keeps RenderDoc's replay
-incremental rather than seeking) and grouping by pipelineResourceId gives an
-exhaustive answer for the cost of one pass over the frame.
+1. SetFrameEvent(eid, force=True) replays the frame FROM THE START every call.
+   Scanning 1550 draws that way replays ~1.2M draws -- quadratic, and it ran for
+   20 minutes at 1 CPU-second per minute before being killed. Passing force=False
+   lets RenderDoc replay incrementally when stepping forward, so a single
+   ascending pass is linear.
 
-Output identifies, per PSO:
-  - whether stencil writes are enabled and with what write mask
-  - the stencil reference values used (the actual per-object IDs, if any)
-  - which depth target it renders to, and the EID range
+2. GetUsage(resourceId) returns every event that touched a resource, and how,
+   with no replay at all. Most of what the previous version was paying replay
+   costs to discover was already available for free.
+
+A wall-clock budget bounds the sampling pass, and whatever was covered is
+reported honestly rather than silently truncated.
 """
 
 import os
 import glob
+import time
 from collections import OrderedDict
 
 import renderdoc as rd
 
 OUT = []
+BUDGET_SECONDS = float(os.environ.get("RDC_BUDGET", "420"))
 
 
 def emit(line=""):
     OUT.append(str(line))
     print(line)
+
+
+def head(t):
+    emit()
+    emit("=" * 78)
+    emit(t)
+    emit("=" * 78)
 
 
 def resolve_capture_path():
@@ -56,9 +64,15 @@ def flatten(actions, out=None):
     return out
 
 
+def usage_name(u):
+    s = str(u)
+    return s.split(".")[-1] if "." in s else s
+
+
 def main():
     path = resolve_capture_path()
     emit("capture: %s" % path)
+    emit("time budget for the replay pass: %.0fs" % BUDGET_SECONDS)
 
     cap = rd.OpenCaptureFile()
     if cap.OpenFile(path, "", None) != rd.ResultCode.Succeeded:
@@ -70,108 +84,112 @@ def main():
         actions = flatten(ctrl.GetRootActions())
         null = rd.ResourceId.Null()
 
+        ds_targets = [t for t in textures.values()
+                      if (t.creationFlags & rd.TextureCategory.DepthTarget)
+                      and ("S8" in t.format.Name())]
+
+        # ---- free census via GetUsage ---------------------------------------
+        head("DEPTH TARGET USAGE (no replay -- straight from the capture)")
+        for t in sorted(ds_targets, key=lambda x: -(x.width * x.height)):
+            try:
+                usages = ctrl.GetUsage(t.resourceId)
+            except Exception as e:
+                emit("%s: GetUsage failed: %r" % (t.resourceId, e))
+                continue
+
+            kinds = OrderedDict()
+            for u in usages:
+                kinds.setdefault(usage_name(u.usage), []).append(u.eventId)
+
+            emit("%s  %dx%d  %s"
+                 % (t.resourceId, t.width, t.height, t.format.Name()))
+            if not usages:
+                emit("    NEVER USED in this frame (allocated but idle)")
+            for k, eids in kinds.items():
+                emit("    %-28s %5d events   EIDs %d..%d"
+                     % (k, len(eids), min(eids), max(eids)))
+            emit()
+
+        # ---- stencil state, linear pass with force=False ---------------------
+        head("STENCIL STATE (linear scan, force=False)")
+
         draws = [a for a in actions if a.flags & rd.ActionFlags.Drawcall]
-        draws.sort(key=lambda a: a.eventId)   # ascending keeps replay incremental
-        emit("drawcalls to inspect: %d" % len(draws))
-        emit()
+        draws.sort(key=lambda a: a.eventId)
+        emit("drawcalls: %d" % len(draws))
 
         psos = OrderedDict()
         failures = 0
+        inspected = 0
+        started = time.time()
+        budget_hit = False
 
-        for i, a in enumerate(draws):
-            if i % 200 == 0:
-                emit("  ... %d/%d" % (i, len(draws)))
+        for a in draws:
+            if time.time() - started > BUDGET_SECONDS:
+                budget_hit = True
+                break
             try:
-                ctrl.SetFrameEvent(a.eventId, True)
+                # force=False is the whole point: it permits incremental replay.
+                ctrl.SetFrameEvent(a.eventId, False)
                 st = ctrl.GetD3D12PipelineState()
+                dss = st.outputMerger.depthStencilState
                 pso = st.pipelineResourceId
-                om = st.outputMerger
-                dss = om.depthStencilState
+                inspected += 1
 
                 rec = psos.get(pso)
                 if rec is None:
-                    rec = {
-                        "draws": 0,
-                        "stencilEnable": bool(dss.stencilEnable),
-                        "depthEnable": bool(dss.depthEnable),
-                        "depthWrites": bool(dss.depthWrites),
-                        "writeMasks": set(),
-                        "refs": set(),
-                        "targets": set(),
-                        "first": a.eventId,
-                        "last": a.eventId,
-                        "ops": set(),
-                    }
+                    rec = {"draws": 0, "stencilEnable": bool(dss.stencilEnable),
+                           "writeMasks": set(), "refs": set(), "targets": set(),
+                           "first": a.eventId, "last": a.eventId}
                     psos[pso] = rec
-
                 rec["draws"] += 1
                 rec["last"] = a.eventId
                 if a.depthOut != null:
                     rec["targets"].add(a.depthOut)
-
-                # Reference value is dynamic (OMSetStencilRef), so it must be
-                # collected per draw even though the rest is baked into the PSO.
                 if dss.stencilEnable:
                     for f in (dss.frontFace, dss.backFace):
                         rec["writeMasks"].add(f.writeMask)
                         rec["refs"].add(f.reference)
-                        rec["ops"].add(str(f.passOperation))
             except Exception as e:
                 failures += 1
                 if failures <= 3:
                     emit("  !! eid=%d failed: %r" % (a.eventId, e))
 
+        elapsed = time.time() - started
+        emit("inspected %d/%d draws in %.1fs (%.1f draws/s)"
+             % (inspected, len(draws), elapsed, inspected / max(elapsed, 0.001)))
+        if budget_hit:
+            emit("BUDGET EXHAUSTED -- coverage is PARTIAL. Results below describe")
+            emit("only the first %d draws; raise RDC_BUDGET to extend." % inspected)
+        emit("unique PSOs seen: %d" % len(psos))
         emit()
-        emit("=" * 78)
-        emit("PSOs WITH STENCIL WRITES ENABLED")
-        emit("=" * 78)
 
         writers = [(p, r) for p, r in psos.items()
                    if r["stencilEnable"] and any(r["writeMasks"])]
-
-        if not writers:
-            emit("NONE. No PSO in this frame enables stencil writes.")
-            emit()
-            emit("This is now an exhaustive result, not a sample: every drawcall")
-            emit("was inspected and grouped by PSO.")
-            emit()
-            emit("Consequence: Stray's CustomDepth pass is either disabled or")
-            emit("depth-only (r.CustomDepth = 0 or 1, not 3). The stencil route")
-            emit("requires forcing r.CustomDepth 3 through IConsoleManager at")
-            emit("runtime, which moves the engine-introspection work earlier.")
-        else:
-            for pso, r in sorted(writers, key=lambda kv: -kv[1]["draws"]):
-                tgts = ", ".join(
-                    "%s(%s)" % (t, textures[t].format.Name() if t in textures else "?")
-                    for t in r["targets"])
-                emit("PSO %s" % pso)
-                emit("    draws        : %d   EIDs %d..%d" % (r["draws"], r["first"], r["last"]))
-                emit("    depth target : %s" % (tgts or "none"))
-                emit("    writeMask    : %s" % sorted(r["writeMasks"]))
-                emit("    references   : %s" % sorted(r["refs"]))
-                emit("    pass op      : %s" % sorted(r["ops"]))
-                emit()
-
-        emit("=" * 78)
-        emit("SUMMARY")
-        emit("=" * 78)
-        emit("unique PSOs in frame     : %d" % len(psos))
-        emit("PSOs with stencilEnable  : %d" % sum(1 for r in psos.values() if r["stencilEnable"]))
-        emit("PSOs writing stencil     : %d" % len(writers))
-        emit("state read failures      : %d" % failures)
-
-        # Stencil TEST without WRITE still matters: it means something upstream
-        # populated the buffer, which would be a route to identity we did not
-        # allocate ourselves.
         testers = [(p, r) for p, r in psos.items()
                    if r["stencilEnable"] and not any(r["writeMasks"])]
+
+        if writers:
+            emit("PSOs WRITING STENCIL: %d" % len(writers))
+            for pso, r in sorted(writers, key=lambda kv: -kv[1]["draws"]):
+                tg = ", ".join(str(t) for t in r["targets"])
+                emit("  PSO %s  draws=%d  EIDs %d..%d" % (pso, r["draws"], r["first"], r["last"]))
+                emit("      target=%s writeMask=%s refs=%s"
+                     % (tg, sorted(r["writeMasks"]), sorted(r["refs"])))
+        else:
+            emit("NO PSO writes stencil%s."
+                 % (" in the portion inspected" if budget_hit else " anywhere in this frame"))
+
         if testers:
             emit()
-            emit("NOTE: %d PSO(s) TEST stencil without writing it." % len(testers))
-            emit("Something is populating that buffer -- worth following up.")
-            for pso, r in testers[:5]:
-                emit("    PSO %s  draws=%d  EIDs %d..%d  refs=%s"
+            emit("PSOs that TEST stencil without writing: %d" % len(testers))
+            for pso, r in testers[:8]:
+                emit("  PSO %s  draws=%d  EIDs %d..%d  refs=%s"
                      % (pso, r["draws"], r["first"], r["last"], sorted(r["refs"])))
+            emit("  (something upstream populates that buffer -- worth following)")
+
+        if failures:
+            emit()
+            emit("state read failures: %d" % failures)
 
     finally:
         ctrl.Shutdown()

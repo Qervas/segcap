@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
-project(segcap LANGUAGES CXX)
+# C is required as well as CXX: MinHook is C, and without it CMake reports
+# "can not determine linker language for target: minhook".
+project(segcap LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,6 +23,28 @@ add_compile_definitions(
 )
 
 add_compile_options(/W4 /permissive- /utf-8)
+
+# ---------------------------------------------------------------------------
+# minhook -- built directly rather than via its own CMakeLists, which pulls in
+# DLL packaging targets and options we do not want. It is four C files.
+# ---------------------------------------------------------------------------
+add_library(minhook STATIC
+  third_party/minhook/src/buffer.c
+  third_party/minhook/src/hook.c
+  third_party/minhook/src/trampoline.c
+  third_party/minhook/src/hde/hde64.c
+)
+target_include_directories(minhook PUBLIC third_party/minhook/include)
+# Third-party C; do not hold it to our warning level.
+target_compile_options(minhook PRIVATE /W0)
+
+# ---------------------------------------------------------------------------
+# injector -- gets segcap.dll into a target process
+# ---------------------------------------------------------------------------
+add_executable(injector src/injector/injector.cpp)
+set_target_properties(injector PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
 
 # ---------------------------------------------------------------------------
 # testapp -- D3D12 ground-truth fixture
