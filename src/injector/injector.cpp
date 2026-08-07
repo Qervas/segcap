@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -164,6 +165,73 @@ done:
     return ok;
 }
 
+// Launch a process suspended, inject, then resume.
+//
+// This exists because descriptor->resource mapping can only be built by
+// observing CreateRenderTargetView / CreateDepthStencilView. Views created
+// before we are injected are unrecoverable -- there is no API to enumerate
+// existing descriptors. Injecting into an already-running process therefore
+// leaves permanent blind spots: against the test fixture, every single
+// OMSetRenderTargets lookup missed.
+//
+// Starting suspended guarantees we are present before the device exists.
+bool LaunchSuspendedAndInject(const std::wstring& exe, const std::wstring& args,
+                              const std::wstring& dll, const std::wstring& workDir) {
+    std::wstring cmdline = L"\"" + exe + L"\"";
+    if (!args.empty()) cmdline += L" " + args;
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+
+    // CreateProcessW may modify the command line buffer, so it cannot be const.
+    std::vector<wchar_t> mutableCmd(cmdline.begin(), cmdline.end());
+    mutableCmd.push_back(L'\0');
+
+    if (!CreateProcessW(exe.c_str(), mutableCmd.data(), nullptr, nullptr, FALSE,
+                        CREATE_SUSPENDED, nullptr,
+                        workDir.empty() ? nullptr : workDir.c_str(), &si, &pi)) {
+        LogLastError("CreateProcessW");
+        return false;
+    }
+
+    Log("launched suspended: pid %lu", pi.dwProcessId);
+
+    // Created BEFORE injection so the DLL can always find it. The DLL signals
+    // this once its hooks are live. Resuming without waiting makes suspended
+    // launch pointless -- LoadLibraryW returns as soon as DllMain returns, and
+    // DllMain only spawns the init thread.
+    wchar_t evName[64];
+    _snwprintf_s(evName, _TRUNCATE, L"Local\\segcap_hooks_ready_%lu", pi.dwProcessId);
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, evName);
+
+    const bool ok = Inject(pi.dwProcessId, dll);
+    if (!ok) {
+        Log("injection failed; terminating the suspended process rather than");
+        Log("resuming it un-instrumented and pretending that worked");
+        TerminateProcess(pi.hProcess, 1);
+    } else {
+        if (ready) {
+            Log("waiting for hooks to come up before resuming...");
+            const DWORD w = WaitForSingleObject(ready, 30000);
+            if (w == WAIT_OBJECT_0) {
+                Log("hooks reported ready");
+            } else {
+                Log("WARNING: timed out waiting for hooks; resuming anyway.");
+                Log("         descriptors created before hooks are live cannot");
+                Log("         be recovered, so expect misses in the log");
+            }
+        }
+        Log("resuming main thread");
+        ResumeThread(pi.hThread);
+    }
+    if (ready) CloseHandle(ready);
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return ok;
+}
+
 std::wstring Widen(const char* s) {
     const int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
     if (n <= 1) return std::wstring();
@@ -179,12 +247,18 @@ std::wstring BaseName(const std::wstring& path) {
 
 void Usage(const char* exe) {
     std::printf(
-        "usage: %s (--pid N | --name EXE) --dll PATH [--wait SECONDS]\n"
+        "usage: %s (--pid N | --name EXE | --launch EXE [ARGS...]) --dll PATH\n"
         "\n"
-        "  --pid N        target process id\n"
-        "  --name EXE     target executable name, e.g. d3d12_testapp.exe\n"
-        "  --dll PATH     DLL to inject (absolute path strongly preferred)\n"
-        "  --wait S       poll up to S seconds for the process to appear\n",
+        "  --pid N         attach to a running process id\n"
+        "  --name EXE      attach to a running process by executable name\n"
+        "  --launch EXE    start EXE suspended, inject, then resume.\n"
+        "                  PREFERRED: attaching to an already-running process\n"
+        "                  misses every descriptor created before injection,\n"
+        "                  and those cannot be recovered afterwards.\n"
+        "  --args \"...\"    arguments passed to the --launch target\n"
+        "  --workdir DIR   working directory for --launch\n"
+        "  --dll PATH      DLL to inject (absolute path strongly preferred)\n"
+        "  --wait S        poll up to S seconds for the process to appear\n",
         exe);
 }
 
@@ -192,7 +266,7 @@ void Usage(const char* exe) {
 
 int main(int argc, char** argv) {
     DWORD pid = 0;
-    std::wstring name, dll;
+    std::wstring name, dll, launchExe, launchArgs, workDir;
     int waitSeconds = 0;
 
     for (int i = 1; i < argc; ++i) {
@@ -202,11 +276,18 @@ int main(int argc, char** argv) {
         else if (a == "--name" && hasNext) name = Widen(argv[++i]);
         else if (a == "--dll" && hasNext) dll = Widen(argv[++i]);
         else if (a == "--wait" && hasNext) waitSeconds = std::atoi(argv[++i]);
+        else if (a == "--workdir" && hasNext) workDir = Widen(argv[++i]);
+        // --launch takes ONLY the executable, and target arguments go in
+        // --args. An earlier version consumed every remaining token after
+        // --launch, which silently swallowed --dll and produced a usage dump
+        // instead of an error naming the real problem.
+        else if (a == "--launch" && hasNext) launchExe = Widen(argv[++i]);
+        else if (a == "--args" && hasNext) launchArgs = Widen(argv[++i]);
         else if (a == "--help") { Usage(argv[0]); return 0; }
         else { Log("unknown argument: %s", a.c_str()); Usage(argv[0]); return 2; }
     }
 
-    if (dll.empty() || (pid == 0 && name.empty())) {
+    if (dll.empty() || (pid == 0 && name.empty() && launchExe.empty())) {
         Usage(argv[0]);
         return 2;
     }
@@ -222,6 +303,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     Log("dll: %ls", dll.c_str());
+
+    if (!launchExe.empty()) {
+        return LaunchSuspendedAndInject(launchExe, launchArgs, dll, workDir) ? 0 : 1;
+    }
 
     if (pid == 0) {
         const int deadline = waitSeconds > 0 ? waitSeconds : 0;

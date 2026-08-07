@@ -47,6 +47,19 @@ set_target_properties(injector PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# segcap -- the injected capture DLL
+# ---------------------------------------------------------------------------
+add_library(segcap SHARED
+  src/segcap/dllmain.cpp
+  src/segcap/hooks.cpp
+)
+target_link_libraries(segcap PRIVATE minhook d3d12 dxgi)
+set_target_properties(segcap PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# ---------------------------------------------------------------------------
 # testapp -- D3D12 ground-truth fixture
 #
 # Renders a grid of quads writing known stencil values. The capture layer is
