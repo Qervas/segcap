@@ -232,6 +232,50 @@ bool LaunchSuspendedAndInject(const std::wstring& exe, const std::wstring& args,
     return ok;
 }
 
+// Poll hard for a process to appear, then inject immediately.
+//
+// This exists because Steam launches Stray.exe (a shim) and the actual renderer
+// is its child, Stray-Win64-Shipping.exe. Wrapping the launch with %command%
+// would put our DLL in the shim, which renders nothing. And a plain suspended
+// launch of the Shipping exe is defeated by SteamAPI_RestartAppIfNecessary --
+// the game asks Steam to relaunch it and exits, which is exactly how RenderDoc
+// silently ended up hooked to nothing earlier in this project.
+//
+// Polling at 5ms wins the race in practice: a UE4 title loads hundreds of DLLs
+// before it creates a D3D12 device, so there is a wide window between "process
+// exists" and "first CreateDepthStencilView". Whether we actually won is
+// measurable rather than assumed -- segcap logs descriptor misses, and a
+// nonzero count means we were late.
+//
+// Deliberately NOT suspending the target's threads first: CreateRemoteThread +
+// LoadLibraryW needs the loader lock, and suspending a thread that already
+// holds it deadlocks the process.
+DWORD WaitForProcessAndInject(const std::wstring& name, const std::wstring& dll,
+                              int timeoutSeconds) {
+    Log("watching for %ls (timeout %ds)...", name.c_str(), timeoutSeconds);
+    Log("launch the game now; injection happens the instant its process appears");
+
+    const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeoutSeconds) * 1000;
+    DWORD pid = 0;
+    while (GetTickCount64() < deadline) {
+        pid = FindProcessByName(name);
+        if (pid) break;
+        Sleep(5);
+    }
+
+    if (!pid) {
+        Log("timed out; %ls never appeared", name.c_str());
+        return 0;
+    }
+
+    Log("detected %ls as pid %lu -- injecting immediately", name.c_str(), pid);
+    if (!Inject(pid, dll)) {
+        Log("injection failed");
+        return 0;
+    }
+    return pid;
+}
+
 std::wstring Widen(const char* s) {
     const int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
     if (n <= 1) return std::wstring();
@@ -255,6 +299,12 @@ void Usage(const char* exe) {
         "                  PREFERRED: attaching to an already-running process\n"
         "                  misses every descriptor created before injection,\n"
         "                  and those cannot be recovered afterwards.\n"
+        "  --watch EXE     poll for EXE and inject the instant it appears.\n"
+        "                  Use this for Steam titles: start the injector first,\n"
+        "                  then launch the game normally. Steam runs a shim whose\n"
+        "                  child is the real renderer, and the game may relaunch\n"
+        "                  itself via Steam, so neither --launch nor a %%command%%\n"
+        "                  wrapper reliably lands on the right process.\n"
         "  --args \"...\"    arguments passed to the --launch target\n"
         "  --workdir DIR   working directory for --launch\n"
         "  --dll PATH      DLL to inject (absolute path strongly preferred)\n"
@@ -266,8 +316,8 @@ void Usage(const char* exe) {
 
 int main(int argc, char** argv) {
     DWORD pid = 0;
-    std::wstring name, dll, launchExe, launchArgs, workDir;
-    int waitSeconds = 0;
+    std::wstring name, dll, launchExe, launchArgs, workDir, watchName;
+    int waitSeconds = 120;  // only used by --watch; generous by default
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -283,11 +333,12 @@ int main(int argc, char** argv) {
         // instead of an error naming the real problem.
         else if (a == "--launch" && hasNext) launchExe = Widen(argv[++i]);
         else if (a == "--args" && hasNext) launchArgs = Widen(argv[++i]);
+        else if (a == "--watch" && hasNext) watchName = Widen(argv[++i]);
         else if (a == "--help") { Usage(argv[0]); return 0; }
         else { Log("unknown argument: %s", a.c_str()); Usage(argv[0]); return 2; }
     }
 
-    if (dll.empty() || (pid == 0 && name.empty() && launchExe.empty())) {
+    if (dll.empty() || (pid == 0 && name.empty() && launchExe.empty() && watchName.empty())) {
         Usage(argv[0]);
         return 2;
     }
@@ -306,6 +357,18 @@ int main(int argc, char** argv) {
 
     if (!launchExe.empty()) {
         return LaunchSuspendedAndInject(launchExe, launchArgs, dll, workDir) ? 0 : 1;
+    }
+
+    if (!watchName.empty()) {
+        const DWORD hit = WaitForProcessAndInject(watchName, dll, waitSeconds);
+        if (!hit) return 1;
+        Sleep(400);
+        if (IsModuleLoaded(hit, BaseName(dll))) {
+            Log("VERIFIED: %ls loaded in pid %lu", BaseName(dll).c_str(), hit);
+            return 0;
+        }
+        Log("WARNING: LoadLibraryW succeeded but the module is not listed");
+        return 1;
     }
 
     if (pid == 0) {

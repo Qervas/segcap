@@ -14,6 +14,8 @@
 
 #include <windows.h>
 
+#include <share.h>
+
 #include <cstdarg>
 #include <cstdio>
 #include <mutex>
@@ -38,7 +40,14 @@ public:
             const size_t dot = p.find_last_of(L'.');
             if (dot != std::wstring::npos) p = p.substr(0, dot);
             p += L".log";
-            _wfopen_s(&file_, p.c_str(), L"w");
+            // _wfsopen with _SH_DENYWR, NOT _wfopen_s. The _s variants open
+            // with _SH_DENYRW, which locks the file so completely that nothing
+            // can read it while the host process lives -- so the log of a game
+            // session is unreadable until the game exits. For a tool whose only
+            // output during a run is this file, that is a serious defect: it
+            // makes live diagnosis impossible and turns "did the hook fire?"
+            // into a question you can only answer after quitting.
+            file_ = _wfsopen(p.c_str(), L"w", _SH_DENYWR);
         }
         start_ = GetTickCount64();
     }

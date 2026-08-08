@@ -17,6 +17,11 @@ constexpr int kPresentSlot = 8;              // IDXGISwapChain::Present
 constexpr int kExecuteCommandListsSlot = 10; // ID3D12CommandQueue::ExecuteCommandLists
 constexpr int kCreateRTVSlot = 20;           // ID3D12Device::CreateRenderTargetView
 constexpr int kCreateDSVSlot = 21;           // ID3D12Device::CreateDepthStencilView
+// How much the currently elected target is favoured. Large enough that a
+// marginally-better challenger cannot displace it, small enough that a target
+// which stops being viable (goes to zero or negative) still loses.
+constexpr int kIncumbencyBonus = 40;
+
 constexpr int kCreateCommittedResourceSlot = 27; // ID3D12Device::CreateCommittedResource
 constexpr int kResourceBarrierSlot = 26;     // ID3D12GraphicsCommandList::ResourceBarrier
 constexpr int kOMSetRenderTargetsSlot = 46;  // ID3D12GraphicsCommandList::OMSetRenderTargets
@@ -199,6 +204,9 @@ bool Hooks::AcquireSwapChainVTable() {
 
 bool Hooks::Install() {
     if (installed_) return true;
+
+    LogInfo("mode: %s", censusOnly_ ? "CENSUS ONLY (no GPU work issued)"
+                                    : "capture (readback enabled)");
 
     if (MH_Initialize() != MH_OK) {
         LogError("MH_Initialize failed");
@@ -417,14 +425,24 @@ std::vector<ElectionScore> Hooks::ScoreTargets(
         if (t.clearCount > 0) score += 30;
 
         // The most-bound target in the frame is the scene depth buffer, whose
-        // stencil UE4 fully owns (sandbox bit, lighting channels, receive-decal
-        // bit). Writing there would change what the player sees.
+        // stencil UE4 fully owns -- sandbox bit, lighting channels, receive-decal
+        // bit, all confirmed by reading actual stencil write masks out of a
+        // RenderDoc capture of this game.
+        //
+        // This is a HARD rejection, not a penalty. An earlier version subtracted
+        // 200, which the persistence bonus then partly cancelled, leaving scene
+        // depth at a positive score -- so if the real CustomDepth target ever
+        // disappeared we would elect it and emit masks made of lighting-channel
+        // bits. "No viable candidate" is the correct answer in that situation;
+        // a confidently wrong mask is worse than none.
         if (maxBinds > 0 && t.bindCount == maxBinds && maxBinds > 8) {
-            score -= 200;
-            _snprintf_s(detail, _TRUNCATE,
-                        "%s; MOST-BOUND (%u binds) => scene depth, stencil owned by UE4",
-                        detail, t.bindCount);
-        } else if (t.bindCount == 0 && t.clearCount > 0) {
+            _snprintf_s(s.reason, _TRUNCATE,
+                        "rejected: MOST-BOUND (%u binds) => scene depth, stencil owned by UE4",
+                        t.bindCount);
+            out.push_back(s);
+            continue;
+        }
+        if (t.bindCount == 0 && t.clearCount > 0) {
             score += 40;
             _snprintf_s(detail, _TRUNCATE,
                         "%s; cleared but never bound => CustomDepth with no opt-ins",
@@ -435,13 +453,42 @@ std::vector<ElectionScore> Hooks::ScoreTargets(
                         detail, t.bindCount);
         }
 
+        // Persistence. Against Stray, the genuine CustomDepth target appeared in
+        // 1096 of 1099 census blocks spanning the whole 118s session, while two
+        // transient loading-screen depth buffers lived ~25s and scored
+        // identically on every per-frame signal. Without this term the election
+        // flipped between those two on essentially every frame.
+        if (t.framesSeen >= 600) {
+            score += 60;
+            _snprintf_s(detail, _TRUNCATE, "%s; persistent (%u frames)", detail, t.framesSeen);
+        } else if (t.framesSeen >= 120) {
+            score += 30;
+            _snprintf_s(detail, _TRUNCATE, "%s; seen %u frames", detail, t.framesSeen);
+        } else {
+            _snprintf_s(detail, _TRUNCATE, "%s; new (%u frames)", detail, t.framesSeen);
+        }
+
+        // Incumbency. Switching targets mid-capture splits the mask stream
+        // across two buffers, so a challenger must be clearly better, not
+        // marginally. This is what actually stops the thrashing; persistence
+        // alone would still flip while two candidates are neck and neck.
+        if (t.resource == electedTarget_) {
+            score += kIncumbencyBonus;
+            _snprintf_s(detail, _TRUNCATE, "%s; INCUMBENT", detail);
+        }
+
         s.score = score;
         _snprintf_s(s.reason, _TRUNCATE, "%s", detail);
         out.push_back(s);
     }
 
-    std::sort(out.begin(), out.end(),
-              [](const ElectionScore& a, const ElectionScore& b) { return a.score > b.score; });
+    // Ties broken by resource address, not left to sort order. Two candidates
+    // scoring equally must still produce the same winner every frame -- an
+    // arbitrary tie-break is a coin flip re-tossed 30 times a second.
+    std::sort(out.begin(), out.end(), [](const ElectionScore& a, const ElectionScore& b) {
+        if (a.score != b.score) return a.score > b.score;
+        return a.resource < b.resource;
+    });
     return out;
 }
 
@@ -496,7 +543,15 @@ std::vector<TargetFingerprint> Hooks::SnapshotTargets() {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<TargetFingerprint> out;
     out.reserve(targets_.size());
-    for (auto& kv : targets_) out.push_back(kv.second);
+    for (auto& kv : targets_) {
+        // Accumulate lifetime observation count before handing the snapshot to
+        // the scorer. Only depth-stencil candidates are worth tracking; counting
+        // every colour target would grow this map without bound.
+        if (HasStencilPlane(kv.second.format)) {
+            kv.second.framesSeen = ++framesSeen_[kv.first];
+        }
+        out.push_back(kv.second);
+    }
     return out;
 }
 
@@ -561,7 +616,11 @@ void Hooks::OnPresent() {
     const bool electionChanged = (winner != electedTarget_);
     electedTarget_ = winner;
 
-    if (electedTarget_ && device_ && queue_) {
+    // Census-only mode issues no GPU work at all: no copy, no barriers, nothing
+    // submitted on the game's queue. Used for first contact with an unfamiliar
+    // title, where a wrong shadowed state would show up as a GPU hang rather
+    // than an error message. Observe first, then act.
+    if (!censusOnly_ && electedTarget_ && device_ && queue_) {
         if (readback_.Prepare(device_, electedTarget_)) {
             readback_.Enqueue(queue_, electedTarget_, StateOf(electedTarget_), frameIndex_);
         }

@@ -41,6 +41,20 @@ DWORD WINAPI InitThread(LPVOID) {
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     segcap::LogInfo("host: %ls", exe);
 
+    // Census-only is selected by dropping a marker file next to the DLL. An
+    // environment variable would not work: we inherit the host's environment,
+    // which Steam fixed when it created the process.
+    wchar_t marker[MAX_PATH] = {};
+    if (GetModuleFileNameW(g_self, marker, MAX_PATH)) {
+        std::wstring m(marker);
+        const size_t dot = m.find_last_of(L'.');
+        if (dot != std::wstring::npos) m = m.substr(0, dot);
+        m += L".census";
+        const bool census = GetFileAttributesW(m.c_str()) != INVALID_FILE_ATTRIBUTES;
+        segcap::Hooks::Get().SetCensusOnly(census);
+        segcap::LogInfo("census marker %ls: %s", m.c_str(), census ? "PRESENT" : "absent");
+    }
+
     // The host may not have created its device yet when we are injected at
     // startup. Retry rather than give up: a single failed attempt at t=0 would
     // make injection order silently matter.

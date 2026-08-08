@@ -48,6 +48,13 @@ struct TargetFingerprint {
     uint32_t firstBindOrdinal = 0; // call ordinal within the frame
     D3D12_RESOURCE_STATES lastState = D3D12_RESOURCE_STATE_COMMON;
     bool everBoundAsDepth = false;
+    // Frames this resource has been observed in, accumulated across the whole
+    // session rather than reset per frame. Against Stray this is the signal
+    // that separates the real CustomDepth target (seen in 1096 of 1099 census
+    // blocks, spanning the entire session) from transient loading-screen depth
+    // buffers that existed for 25 seconds and scored identically on every
+    // per-frame signal.
+    uint32_t framesSeen = 0;
 };
 
 // Result of scoring one candidate. The reason string exists so that a wrong
@@ -67,6 +74,11 @@ public:
     // with the reason already logged.
     bool Install();
     void Uninstall();
+
+    // Must be set before Install(). Driven by a marker file rather than an
+    // environment variable: an injected DLL inherits the host's environment,
+    // which was fixed when Steam created the process, so we cannot influence it.
+    void SetCensusOnly(bool on) { censusOnly_ = on; }
 
     // ---- state recovered from the game ----------------------------------
 
@@ -174,6 +186,8 @@ private:
     std::unordered_map<SIZE_T, ID3D12Resource*> descriptorToResource_;
     std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> resourceState_;
     std::unordered_map<ID3D12Resource*, TargetFingerprint> targets_;
+    // Survives the per-frame clear of targets_, so persistence can be scored.
+    std::unordered_map<ID3D12Resource*, uint32_t> framesSeen_;
 
     ID3D12Device* device_ = nullptr;
     ID3D12CommandQueue* queue_ = nullptr;
@@ -191,6 +205,9 @@ private:
     Readback readback_;
     ID3D12Resource* electedTarget_ = nullptr;
     uint32_t masksDumped_ = 0;
+    // Set from SEGCAP_CENSUS_ONLY=1. Suppresses all GPU work so an unfamiliar
+    // title can be observed before anything is submitted on its queue.
+    bool censusOnly_ = false;
 };
 
 }  // namespace segcap
