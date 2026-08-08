@@ -140,11 +140,24 @@ public class Win32Input {
     [DllImport("user32.dll", SetLastError=true)]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
 
-    // Returns the PID owning the current foreground window.
+    // Returns the PID owning the current foreground window, or 0 if there is
+    // NO foreground window at all.
+    //
+    // Those two cases must not be conflated. GetForegroundWindow() returns NULL
+    // transiently -- notably during an exclusive-fullscreen mode switch, which
+    // is exactly what Stray does around 20s after launch. Reporting that as
+    // "pid 0 = Idle" led to a confident and wrong conclusion that the session
+    // was locked. It was not; we were simply polling mid-transition.
     public static uint ForegroundPid() {
+        IntPtr fg = GetForegroundWindow();
+        if (fg == IntPtr.Zero) return 0;
         uint pid;
-        GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+        GetWindowThreadProcessId(fg, out pid);
         return pid;
+    }
+
+    public static bool HasForegroundWindow() {
+        return GetForegroundWindow() != IntPtr.Zero;
     }
 
     // Verification is by PROCESS, not window handle.
@@ -272,16 +285,23 @@ if (-not $NoInput) {
     # A failed focus silently sinks the entire session -- gamepad ignored, stuck
     # at the menu, ProcessEvent never confirms, no masks -- so it is worth
     # several attempts and a fallback.
+    # Poll patiently. Stray reaches its menu and switches to exclusive fullscreen
+    # over tens of seconds, and during that switch there is briefly NO foreground
+    # window at all. A short poll lands mid-transition and reports failure for a
+    # game that is about to be perfectly focused.
     $focused = $false
-    for ($i = 0; $i -lt 25; $i++) {
+    for ($i = 0; $i -lt 90; $i++) {
         $game.Refresh()
+        if ($game.HasExited) { break }
         if ($game.MainWindowHandle -eq 0) { Start-Sleep -Seconds 1; continue }
+
+        # No foreground window at all == mid mode-switch. Wait, do not escalate.
+        if (-not [Win32Input]::HasForegroundWindow()) { Start-Sleep -Seconds 1; continue }
 
         if ([Win32Input]::ForceForeground($game.MainWindowHandle, [uint32]$game.Id)) {
             $focused = $true; break
         }
-        # Escalate: a real click focuses at the OS level whatever the app does.
-        if ($i -ge 3) {
+        if ($i -ge 10) {
             [Win32Input]::ClickToFocus($game.MainWindowHandle)
             if ([Win32Input]::ForceForeground($game.MainWindowHandle, [uint32]$game.Id)) {
                 $focused = $true; break
@@ -290,8 +310,9 @@ if (-not $NoInput) {
         Start-Sleep -Seconds 1
     }
     $fgPid = [Win32Input]::ForegroundPid()
-    $fgName = (Get-Process -Id $fgPid -ErrorAction SilentlyContinue).ProcessName
-    Write-Host "[auto] window focused: $focused  (foreground pid $fgPid = $fgName, game pid $($game.Id))"
+    $fgDesc = if (-not [Win32Input]::HasForegroundWindow()) { "<none - mid mode-switch>" }
+              else { (Get-Process -Id $fgPid -ErrorAction SilentlyContinue).ProcessName }
+    Write-Host "[auto] window focused: $focused  (foreground: $fgDesc, game pid $($game.Id))"
     if (-not $focused) {
         Write-Host "[auto] WARNING: could not take focus; gamepad input will be ignored"
     }
@@ -315,6 +336,16 @@ while ((Get-Date) -lt $deadline) {
     if (-not (Get-Process -Id $game.Id -ErrorAction SilentlyContinue)) {
         Write-Host "[auto] !! game exited early -- possible crash, check the log"
         break
+    }
+
+    # Re-assert focus during the run. A fullscreen mode switch, an overlay, or
+    # anything else stealing foreground mid-session would silently stop all
+    # gamepad input from reaching the game for the remainder of the capture.
+    if (-not $NoInput -and [Win32Input]::ForegroundPid() -ne [uint32]$game.Id) {
+        $game.Refresh()
+        if ($game.MainWindowHandle -ne 0 -and [Win32Input]::HasForegroundWindow()) {
+            [Win32Input]::ForceForeground($game.MainWindowHandle, [uint32]$game.Id) | Out-Null
+        }
     }
     # Only stop early on SUCCESS. An earlier version also broke on "not found in
     # slots", which meant a failed run terminated before the object samples ran
