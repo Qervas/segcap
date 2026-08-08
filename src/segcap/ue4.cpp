@@ -343,6 +343,16 @@ std::string Engine::NameToString(uint32_t comparisonIndex) const {
 void Engine::ReportSample(const char* label) {
     if (!objects_) return;
 
+    // Rebuild the readable-region map before every walk.
+    //
+    // It was previously built once at discovery. When Stray's level streamed in,
+    // the object array grew 196k -> 319k slots and UE allocated new chunks in
+    // regions that did not exist when the map was made -- so IsReadable rejected
+    // them and 8165 objects of a 21273 sample silently disappeared. The symptom
+    // was a resolved count that DROPPED as the game loaded more content, which
+    // is the opposite of what should happen.
+    BuildReadableMap();
+
     // Rejection counters, because "340 of 21699 resolved" is a symptom and not
     // a diagnosis. Knowing WHICH check rejected an entry is the difference
     // between "the array is mostly empty" and "my validation is too strict".
@@ -390,8 +400,14 @@ void Engine::ReportSample(const char* label) {
 
 int Engine::CountDerivedFrom(const char* target) {
     if (!objects_ || !nameBlocks_) return 0;
+    BuildReadableMap();  // see ReportSample: the map goes stale as the level streams in
+
     int matches = 0;
     const int32_t total = objects_->NumElements;
+    // Breakdown by concrete class, because "622 primitives" does not tell us
+    // whether they are static meshes worth marking or invisible collision
+    // volumes. Task 8 needs to know what it is actually flagging.
+    std::vector<std::pair<std::string, int>> byClass;
 
     for (int32_t i = 0; i < total; ++i) {
         ObjectRef ref;
@@ -407,9 +423,24 @@ int Engine::CountDerivedFrom(const char* target) {
             if (!LooksLikeUObject(reinterpret_cast<void*>(klass))) break;
             const auto nameIdx = *reinterpret_cast<uint32_t*>(
                 reinterpret_cast<uint8_t*>(klass) + UObjectLayout::kNamePrivate);
-            if (NameToString(nameIdx) == target) { ++matches; break; }
+            if (NameToString(nameIdx) == target) {
+                ++matches;
+                bool found = false;
+                for (auto& c : byClass) {
+                    if (c.first == ref.className) { ++c.second; found = true; break; }
+                }
+                if (!found && byClass.size() < 256) byClass.emplace_back(ref.className, 1);
+                break;
+            }
             klass = *reinterpret_cast<uintptr_t*>(reinterpret_cast<uint8_t*>(klass) + 0x40);
         }
+    }
+
+    std::sort(byClass.begin(), byClass.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    LogInfo("ue4: %d objects derive from %s:", matches, target);
+    for (size_t i = 0; i < byClass.size() && i < 16; ++i) {
+        LogInfo("ue4:     %5d  %s", byClass[i].second, byClass[i].first.c_str());
     }
     return matches;
 }
