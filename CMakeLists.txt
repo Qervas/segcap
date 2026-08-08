@@ -39,6 +39,24 @@ target_include_directories(minhook PUBLIC third_party/minhook/include)
 target_compile_options(minhook PRIVATE /W0)
 
 # ---------------------------------------------------------------------------
+# ViGEmClient -- user-mode SDK for the virtual gamepad bus driver.
+# Built from source (one .cpp) rather than consuming a prebuilt lib, so it
+# matches our CRT settings.
+# ---------------------------------------------------------------------------
+add_library(vigemclient STATIC third_party/ViGEmClient/src/ViGEmClient.cpp)
+target_include_directories(vigemclient PUBLIC third_party/ViGEmClient/include)
+target_compile_options(vigemclient PRIVATE /W0)   # third-party; not our warning level
+
+# ---------------------------------------------------------------------------
+# vpad -- virtual gamepad driver for unattended capture runs
+# ---------------------------------------------------------------------------
+add_executable(vpad src/vpad/vpad.cpp)
+target_link_libraries(vpad PRIVATE vigemclient setupapi)
+set_target_properties(vpad PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# ---------------------------------------------------------------------------
 # injector -- gets segcap.dll into a target process
 # ---------------------------------------------------------------------------
 add_executable(injector src/injector/injector.cpp)
