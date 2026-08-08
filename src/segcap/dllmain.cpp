@@ -9,6 +9,7 @@
 
 #include <windows.h>
 
+#include "customdepth.h"
 #include "hooks.h"
 #include "log.h"
 #include "ue4.h"
@@ -16,6 +17,11 @@
 namespace {
 
 HMODULE g_self = nullptr;
+
+// Set from a "segcap.mark" marker file next to the DLL. Writing to the game is
+// opt-in per run: every session so far has been read-only, and that must stay
+// the default rather than something that happens because a flag was left on.
+bool g_markCustomDepth = false;
 
 // Signalled once hooks are live. The injector creates this event before
 // injecting and waits on it before resuming a suspended process.
@@ -54,6 +60,15 @@ DWORD WINAPI InitThread(LPVOID) {
         const bool census = GetFileAttributesW(m.c_str()) != INVALID_FILE_ATTRIBUTES;
         segcap::Hooks::Get().SetCensusOnly(census);
         segcap::LogInfo("census marker %ls: %s", m.c_str(), census ? "PRESENT" : "absent");
+
+        std::wstring mk(marker);
+        const size_t dot2 = mk.find_last_of(L'.');
+        if (dot2 != std::wstring::npos) mk = mk.substr(0, dot2);
+        mk += L".mark";
+        g_markCustomDepth = GetFileAttributesW(mk.c_str()) != INVALID_FILE_ATTRIBUTES;
+        segcap::LogInfo("mark marker %ls: %s", mk.c_str(),
+                        g_markCustomDepth ? "PRESENT -- WILL MUTATE GAME STATE"
+                                          : "absent (read-only run)");
     }
 
     // The host may not have created its device yet when we are injected at
@@ -87,6 +102,7 @@ DWORD WINAPI InitThread(LPVOID) {
 // a temporary, discovers the addresses into it, and destroys it on the next
 // semicolon. Discovery "succeeded" and every address was thrown away.
 segcap::ue4::Engine g_engine;
+segcap::CustomDepthMarker g_marker;
 
 DWORD WINAPI DiscoverThread(LPVOID) {
     for (int attempt = 1; attempt <= 40; ++attempt) {
@@ -194,6 +210,24 @@ DWORD WINAPI DiscoverThread(LPVOID) {
                 segcap::LogInfo("ue4: >>> task executed on game thread %lu <<<",
                                 GetCurrentThreadId());
             });
+
+            // ---- task 8: opt primitives into CustomDepth --------------------
+            //
+            // Gated behind a marker file, deliberately. This is the only code in
+            // the project that mutates the game, and it must never happen by
+            // accident on a run intended as read-only.
+            if (g_markCustomDepth) {
+                segcap::LogInfo("customdepth: MARK MODE ENABLED");
+                pe.RunOnGameThread([](segcap::ue4::Engine& e) {
+                    if (!g_marker.Resolve(e)) return;
+                    // Start with a handful. Proof by intervention is far easier
+                    // to reason about on a few objects than on 38,000, and if
+                    // something goes wrong the blast radius is small.
+                    const int n = g_marker.MarkPrimitives(e, 64, true);
+                    segcap::LogInfo("customdepth: %d primitives now render into "
+                                    "CustomDepth with stencil ids 1..%d", n, n);
+                });
+            }
         }
     }
 
