@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ue4.h"
@@ -87,10 +88,22 @@ private:
 
     std::vector<MarkedPrimitive> marked_;
     std::unordered_map<uint8_t, MarkedPrimitive> slotTable_;
+    // Marking runs repeatedly as the level streams in. Without this, each pass
+    // would reassign a different slot to the same object, making identities
+    // unstable across frames for no reason.
+    std::unordered_set<void*> alreadyMarked_;
+    // Where the next bounded pass resumes. Each pass is capped so it cannot
+    // stall the game thread, and successive passes sweep the whole array rather
+    // than re-walking the same prefix.
+    int32_t markResumeIndex_ = 0;
 
     uint64_t writesAttempted_ = 0;
     uint64_t writesVerified_ = 0;
     uint64_t writesRejected_ = 0;
+    // How many times the engine's setter actually flipped the bit. Distinguishes
+    // "the call ran and the pass is disabled" from "the call did nothing",
+    // which need entirely different fixes.
+    uint64_t setterEffective_ = 0;
 };
 
 }  // namespace segcap

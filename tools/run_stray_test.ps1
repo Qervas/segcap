@@ -60,6 +60,46 @@ public class Win32Input {
     public static extern uint SendInput(uint n, INPUT[] pInputs, int cbSize);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint id, uint to, bool attach);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr pid);
+    [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint action, uint param, IntPtr v, uint winIni);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+
+    const uint SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001;
+    const uint SPIF_SENDCHANGE = 0x02;
+
+    // Windows refuses SetForegroundWindow from a process that does not own the
+    // current foreground window -- it flashes the taskbar instead. Three
+    // mechanisms together defeat that reliably:
+    //
+    //   1. drop the foreground lock timeout to zero
+    //   2. attach our input queue to the current foreground thread, which makes
+    //      Windows treat us as "the same" input context and permits the switch
+    //   3. then ShowWindow + BringWindowToTop + SetForegroundWindow
+    //
+    // Needed because an unattended dataset run cannot rely on a human clicking
+    // the window: the virtual gamepad delivers input correctly, but an unfocused
+    // window ignores it.
+    public static bool ForceForeground(IntPtr hWnd) {
+        if (hWnd == IntPtr.Zero) return false;
+        SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, IntPtr.Zero, SPIF_SENDCHANGE);
+
+        uint fgThread = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+        uint myThread = GetCurrentThreadId();
+        bool attached = false;
+        if (fgThread != 0 && fgThread != myThread) {
+            attached = AttachThreadInput(myThread, fgThread, true);
+        }
+
+        ShowWindow(hWnd, 9);          // SW_RESTORE
+        BringWindowToTop(hWnd);
+        bool ok = SetForegroundWindow(hWnd);
+
+        if (attached) AttachThreadInput(myThread, fgThread, false);
+        return ok && GetForegroundWindow() == hWnd;
+    }
 
     const uint KEYEVENTF_KEYUP = 0x0002;
     const uint KEYEVENTF_SCANCODE = 0x0008;
@@ -144,11 +184,21 @@ if (-not $NoInput) {
     }
     Start-Sleep -Seconds 20   # let the menu finish animating in
 
-    if ($game.MainWindowHandle -ne 0) {
-        [Win32Input]::ShowWindow($game.MainWindowHandle, 9) | Out-Null   # SW_RESTORE
-        [Win32Input]::SetForegroundWindow($game.MainWindowHandle) | Out-Null
-        Start-Sleep -Seconds 2
+    # Focus, verified rather than assumed. An unfocused window silently ignores
+    # gamepad input, which previously required a human to click the window --
+    # exactly what an unattended dataset run cannot depend on.
+    $focused = $false
+    for ($i = 0; $i -lt 15; $i++) {
+        $game.Refresh()
+        if ($game.MainWindowHandle -eq 0) { Start-Sleep -Seconds 1; continue }
+        if ([Win32Input]::ForceForeground($game.MainWindowHandle)) { $focused = $true; break }
+        Start-Sleep -Seconds 1
     }
+    Write-Host "[auto] window focused: $focused"
+    if (-not $focused) {
+        Write-Host "[auto] WARNING: could not take focus; gamepad input will be ignored"
+    }
+    Start-Sleep -Seconds 2
 
     # Menu, then patrol for the remaining time. Patrol matters beyond getting
     # in-level: a static camera yields thousands of near-identical frames, which

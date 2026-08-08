@@ -598,9 +598,37 @@ std::vector<TargetFingerprint> Hooks::SnapshotTargets() {
 // single-channel 8-bit image -- which is also a reminder that the channel is 8
 // bits and therefore holds a per-frame slot, not an identity.
 void Hooks::OnMaskReady(const MaskFrame& frame) {
-    // A handful of frames is enough to validate; dumping every frame would
-    // write gigabytes and stall on disk I/O from the render thread.
-    if (masksDumped_ >= 3) return;
+    // Scan for content BEFORE deciding whether to dump.
+    //
+    // An earlier version dumped the first three frames unconditionally. Those
+    // landed at t=3.1s, while primitives were not marked until t=41.2s -- so
+    // every dump was of an empty buffer taken 38 seconds before there was
+    // anything to see, and the empty result was misread as CustomDepth being
+    // broken. The pipeline was correct; the shutter fired at the wrong moment.
+    //
+    // Dumping on CONTENT rather than on frame number removes the timing
+    // coupling entirely: the capture happens when there is something to capture,
+    // whenever that turns out to be.
+    bool seen[256] = {};
+    bool hasContent = false;
+    for (uint32_t y = 0; y < frame.height; ++y) {
+        const uint8_t* row = frame.data + static_cast<size_t>(y) * frame.rowPitch;
+        for (uint32_t x = 0; x < frame.width; ++x) {
+            if (row[x] != 0) hasContent = true;
+            seen[row[x]] = true;
+        }
+    }
+
+    // A few empty frames are still worth having as a baseline for the A/B
+    // comparison in task 11, but they must not consume the content budget.
+    if (!hasContent) {
+        if (emptyMasksDumped_ >= 1) return;
+        ++emptyMasksDumped_;
+    } else if (masksDumped_ >= 4) {
+        return;
+    } else {
+        ++masksDumped_;
+    }
 
     // Absolute path next to the DLL. A relative filename resolves against the
     // GAME's working directory, which put three 4MB dumps inside Stray's install
@@ -626,13 +654,8 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     }
     std::fclose(f);
 
-    // Report the distinct values present: for the fixture these must be exactly
+    // Report the distinct values present. For the fixture these must be exactly
     // {0} plus 1..16, which is the whole point of having known ground truth.
-    bool seen[256] = {};
-    for (uint32_t y = 0; y < frame.height; ++y) {
-        const uint8_t* row = frame.data + static_cast<size_t>(y) * frame.rowPitch;
-        for (uint32_t x = 0; x < frame.width; ++x) seen[row[x]] = true;
-    }
     char values[512] = {};
     size_t used = 0;
     for (int v = 0; v < 256 && used < sizeof(values) - 8; ++v) {

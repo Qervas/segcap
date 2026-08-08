@@ -104,6 +104,12 @@ bool CustomDepthMarker::WriteMarked(void* component, uint8_t stencilValue,
     // The first attempt at this marked 64 primitives with 64 verified writes and
     // the CustomDepth target still showed binds=0 -- the game-thread property
     // changed and the render thread never found out.
+    auto* preBase = reinterpret_cast<uint8_t*>(component);
+    const size_t preBoolOff =
+        static_cast<size_t>(propRenderCustomDepth_.offset) + propRenderCustomDepth_.byteOffset;
+    const uint8_t beforeCall =
+        ue4::IsReadable(preBase + preBoolOff, 1) ? *(preBase + preBoolOff) : 0;
+
     if (fnSetRenderCustomDepth_ && fnSetCustomDepthStencilValue_) {
         auto& pe = ue4::GetProcessEventHook();
 
@@ -114,6 +120,20 @@ bool CustomDepthMarker::WriteMarked(void* component, uint8_t stencilValue,
 
         struct { int32_t Value; } stencilParams = {static_cast<int32_t>(stencilValue)};
         pe.CallFunction(component, fnSetCustomDepthStencilValue_, &stencilParams);
+
+        // Did the engine call actually do anything? Checked BEFORE our own
+        // fallback write, so the two cannot be confused. The previous run could
+        // not distinguish "the setter ran and the pass is off" from "the setter
+        // silently did nothing" -- and those need completely different fixes.
+        const uint8_t afterCall =
+            ue4::IsReadable(preBase + preBoolOff, 1) ? *(preBase + preBoolOff) : 0;
+        const bool bitNowSet = (afterCall & propRenderCustomDepth_.fieldMask) != 0;
+        if (setterEffective_ == 0) {
+            LogInfo("customdepth: setter check -- byte 0x%02X -> 0x%02X, bit %s",
+                    beforeCall, afterCall, bitNowSet ? "SET by the engine call"
+                                                     : "NOT set (call had no effect)");
+        }
+        setterEffective_ += bitNowSet ? 1 : 0;
     }
 
     auto* base = reinterpret_cast<uint8_t*>(component);
@@ -172,15 +192,47 @@ int CustomDepthMarker::MarkPrimitives(ue4::Engine& engine, int limit, bool rende
         return 0;
     }
 
-    // 255 is a hard ceiling: the stencil channel is 8 bits and 0 means
-    // "unmarked". Anything above that would wrap and silently alias two objects
-    // to one id.
-    limit = std::min(limit, 255);
+    // limit <= 0 means "mark everything", cycling slot ids 1..255.
+    //
+    // Marking a bounded first-N is the wrong experiment for a first proof. The
+    // first 64 renderable components by array index turned out to be a poor
+    // sample -- they may sit in unloaded sublevels, be unregistered with the
+    // scene, or simply be off-camera, in which case CustomDepth renders nothing
+    // no matter how correct the flag is. Marking everything removes visibility
+    // as a variable, so a still-empty mask points squarely at the pass being
+    // disabled or the elected target being the wrong buffer.
+    //
+    // Slot ids necessarily repeat past 255: the stencil channel is 8 bits and 0
+    // means unmarked. That is fine here because this run is a yes/no test of
+    // whether ANYTHING renders. Turning repeated slots back into distinct
+    // identities is task 9's problem, and the reason a per-frame sidecar table
+    // exists at all.
+    // Refresh the readable-memory map first. This is the SIXTH bug caused by
+    // that snapshot going stale: ReportSample and CountDerivedFrom both refresh,
+    // MarkPrimitives did not, so GetObject rejected most of the array and only
+    // 267 of ~29,000 renderable components were ever marked.
+    engine.RefreshMemoryMap();
+
+    const bool markAll = limit <= 0;
+    if (!markAll) limit = std::min(limit, 255);
+
+    // Bound the work per pass. This runs inside ProcessEvent on the game thread,
+    // and each mark issues two UFunction calls -- walking 29,000 objects in one
+    // go would stall the engine's dispatch and hitch the game, which is exactly
+    // the "not breaking the game" failure we are trying to avoid. Marking
+    // repeats every 30s as the level streams, so a bounded pass still converges.
+    constexpr int kMaxPerPass = 3000;
 
     int assigned = 0;
+    int examined = 0;
     const int32_t total = engine.NumObjects();
 
-    for (int32_t i = 0; i < total && assigned < limit; ++i) {
+    for (int32_t i = markResumeIndex_; i < total && (markAll || assigned < limit); ++i) {
+        // Resume where the previous pass stopped, so successive passes sweep the
+        // whole array rather than re-walking the same prefix each time.
+        markResumeIndex_ = i;
+        if (++examined > kMaxPerPass) break;
+
         ue4::ObjectRef ref;
         if (!engine.GetObject(i, ref)) continue;
         if (renderableOnly && !IsRenderableComponentClass(ref.className)) continue;
@@ -190,7 +242,12 @@ int CustomDepthMarker::MarkPrimitives(ue4::Engine& engine, int limit, bool rende
         // world, and marking them would affect every future instance.
         if (ref.name.rfind("Default__", 0) == 0) continue;
 
-        const uint8_t slot = static_cast<uint8_t>(assigned + 1);   // 0 = unmarked
+        // Already marked on a previous pass. Re-marking is cheap but would
+        // reassign a different slot to the same object every pass, which would
+        // make identities unstable across frames for no reason.
+        if (alreadyMarked_.count(ref.object)) continue;
+
+        const uint8_t slot = static_cast<uint8_t>((assigned % 255) + 1);  // 0 = unmarked
         MarkedPrimitive mp;
         mp.component = ref.object;
         mp.objectIndex = ref.index;
@@ -202,6 +259,7 @@ int CustomDepthMarker::MarkPrimitives(ue4::Engine& engine, int limit, bool rende
 
         marked_.push_back(mp);
         slotTable_[slot] = mp;
+        alreadyMarked_.insert(ref.object);
         ++assigned;
 
         if (assigned <= 8) {
@@ -213,6 +271,10 @@ int CustomDepthMarker::MarkPrimitives(ue4::Engine& engine, int limit, bool rende
     LogInfo("customdepth: marked %d primitives "
             "(attempted %llu, verified %llu, rejected %llu)",
             assigned, writesAttempted_, writesVerified_, writesRejected_);
+    LogInfo("customdepth: engine setter flipped the bit on %llu/%llu -- %s",
+            setterEffective_, writesAttempted_,
+            setterEffective_ > 0 ? "the UFunction calls ARE taking effect"
+                                 : "the UFunction calls are doing NOTHING");
     return assigned;
 }
 

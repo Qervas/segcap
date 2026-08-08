@@ -220,10 +220,16 @@ DWORD WINAPI DiscoverThread(LPVOID) {
                 segcap::LogInfo("customdepth: MARK MODE ENABLED");
                 pe.RunOnGameThread([](segcap::ue4::Engine& e) {
                     if (!g_marker.Resolve(e)) return;
-                    // Start with a handful. Proof by intervention is far easier
-                    // to reason about on a few objects than on 38,000, and if
-                    // something goes wrong the blast radius is small.
-                    const int n = g_marker.MarkPrimitives(e, 64, true);
+                    // Mark EVERYTHING (limit <= 0), slots cycling 1..255.
+                    //
+                    // The first attempt marked 64 by array index and produced an
+                    // empty mask. Those 64 may simply not have been on screen,
+                    // which would make the result meaningless rather than
+                    // informative. Marking everything removes visibility as a
+                    // variable: if the mask is STILL empty, the cause is the
+                    // pass being disabled or the elected buffer being wrong, and
+                    // those are the hypotheses worth spending time on.
+                    const int n = g_marker.MarkPrimitives(e, 0, true);
                     segcap::LogInfo("customdepth: %d primitives now render into "
                                     "CustomDepth with stencil ids 1..%d", n, n);
                 });
@@ -231,10 +237,13 @@ DWORD WINAPI DiscoverThread(LPVOID) {
         }
     }
 
-    // ---- slow diagnostics last --------------------------------------------
-    // Everything below is useful context, not a gate on progress, so it runs
-    // after the two results that matter.
-    const int kIntervals[] = {60, 90, 120, 180};
+    // ---- keep marking as the level streams in ------------------------------
+    // A single marking pass at t+41s caught only 267 primitives, because the
+    // level was still loading -- the object array grows from ~173k to ~350k
+    // slots over the first couple of minutes. Re-marking picks up everything
+    // that arrives later, which is also what a real capture session needs:
+    // objects stream in and out constantly.
+    const int kIntervals[] = {60, 90, 120, 150, 180};
     int elapsed = 30;
     for (int stage : kIntervals) {
         if (stage > elapsed) Sleep((stage - elapsed) * 1000);
@@ -242,6 +251,11 @@ DWORD WINAPI DiscoverThread(LPVOID) {
         char label[32];
         _snprintf_s(label, sizeof(label), _TRUNCATE, "t+%ds", stage);
         g_engine.ReportSample(label);
+
+        if (g_markCustomDepth && segcap::ue4::GetProcessEventHook().verified()) {
+            segcap::ue4::GetProcessEventHook().RunOnGameThread(
+                [](segcap::ue4::Engine& e) { g_marker.MarkPrimitives(e, 0, true); });
+        }
     }
     if (g_engine.namesResolved()) g_engine.CountDerivedFrom("PrimitiveComponent");
     return 0;

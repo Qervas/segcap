@@ -214,6 +214,10 @@ private:
     Readback readback_;
     ID3D12Resource* electedTarget_ = nullptr;
     uint32_t masksDumped_ = 0;
+    // Counted separately so a few baseline (all-zero) captures for the task-11
+    // A/B comparison cannot consume the budget reserved for frames that
+    // actually contain mask content.
+    uint32_t emptyMasksDumped_ = 0;
     // Set from SEGCAP_CENSUS_ONLY=1. Suppresses all GPU work so an unfamiliar
     // title can be observed before anything is submitted on its queue.
     bool censusOnly_ = false;
