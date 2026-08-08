@@ -269,6 +269,17 @@ public:
     void* guObjectArray() const { return arrayAddress_; }
     bool namesResolved() const { return nameBlocks_ != nullptr; }
 
+    // Rebuilds the committed-memory map used by IsReadable.
+    //
+    // The map is a snapshot, and the game allocates constantly. A stale map
+    // makes IsReadable reject perfectly valid addresses, which does not fail
+    // loudly -- it makes objects silently disappear. This has now caused two
+    // separate bugs: object samples whose resolved count DROPPED as the level
+    // loaded, and ProcessEvent candidate 68 scoring 30145/0 in one run and
+    // 742/654 in the next, because UFunctions in newly-allocated memory were
+    // being counted as "not a UFunction" rather than "not currently visible".
+    void RefreshMemoryMap();
+
 private:
     bool FindObjectArray();
     bool FindNamePool();

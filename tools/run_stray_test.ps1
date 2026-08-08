@@ -169,8 +169,12 @@ while ((Get-Date) -lt $deadline) {
         Write-Host "[auto] !! game exited early -- possible crash, check the log"
         break
     }
-    $done = Select-String -Path $log -Pattern "ProcessEvent CONFIRMED|not found in slots" -ErrorAction SilentlyContinue
-    if ($done) { Write-Host "[auto] ProcessEvent search finished early"; break }
+    # Only stop early on SUCCESS. An earlier version also broke on "not found in
+    # slots", which meant a failed run terminated before the object samples ran
+    # -- losing exactly the diagnostic data needed to understand the failure.
+    # Stopping early on failure is precisely backwards.
+    $done = Select-String -Path $log -Pattern "ProcessEvent CONFIRMED" -ErrorAction SilentlyContinue
+    if ($done) { Write-Host "[auto] ProcessEvent confirmed; letting samples run"; }
 }
 
 # --- 6. collect --------------------------------------------------------------

@@ -343,6 +343,8 @@ std::string Engine::NameToString(uint32_t comparisonIndex) const {
     return out;
 }
 
+void Engine::RefreshMemoryMap() { BuildReadableMap(); }
+
 void Engine::ReportSample(const char* label) {
     if (!objects_) return;
 
@@ -738,6 +740,14 @@ void __fastcall ProcessEventDetour(void* self, void* function, void* parms, void
 }  // namespace
 
 bool ProcessEventHook::TryIndex(Engine& engine, int index) {
+    // Refresh before every candidate. The search runs for ~33 seconds while the
+    // game allocates continuously, and a stale memory map turns "UFunction I
+    // cannot currently see" into "not a UFunction" -- which is counted as an
+    // invalid call and can sink a correct candidate. Candidate 68 scored
+    // 30145 valid / 0 invalid in one run and 742 / 654 in the next for exactly
+    // this reason.
+    engine.RefreshMemoryMap();
+
     void* sample = engine.AnyObject();
     if (!sample) return false;
 
