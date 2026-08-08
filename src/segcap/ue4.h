@@ -1,0 +1,138 @@
+// ue4.h -- runtime discovery of Unreal Engine 4 internals in a stripped
+// shipping binary.
+//
+// APPROACH: structural search, not byte-pattern signatures.
+//
+// The usual technique is to disassemble the target, find a function that
+// references GUObjectArray, and hardcode a byte pattern with wildcards. That
+// works exactly once: the pattern is keyed to one build, one compiler version,
+// and one set of inlining decisions, and it breaks on the next patch. It also
+// requires symbols or a disassembler for a binary we deliberately have neither
+// for.
+//
+// Instead we search the module's writable data for a memory layout that
+// SATISFIES THE INVARIANTS of FChunkedFixedUObjectArray, then prove the
+// candidate by dereferencing it:
+//
+//   1. plausible field values (counts ordered, chunk arithmetic consistent)
+//   2. Objects[0] is a readable pointer
+//   3. Objects[0][0].Object is a readable pointer
+//   4. that object's vtable points into the host module's code section
+//   5. its ClassPrivate is itself a UObject whose vtable also points into code
+//
+// A false positive would have to satisfy all five. This is version-independent
+// in a way a byte pattern is not, and when it fails it fails loudly rather than
+// returning a plausible wrong address.
+//
+// Layouts below are UE4 x64 shipping (no editor). Where a size is ambiguous
+// across minor versions, the code probes rather than assumes.
+
+#pragma once
+
+#include <windows.h>
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace segcap {
+namespace ue4 {
+
+// UE4 allocates UObject storage in fixed chunks of this many elements. It is a
+// compile-time constant in the engine, not a runtime value, so it doubles as a
+// strong invariant for validating a candidate array.
+constexpr int32_t kElementsPerChunk = 64 * 1024;
+
+// struct FUObjectItem { UObject* Object; int32 Flags; int32 ClusterRootIndex;
+//                       int32 SerialNumber; /* 4 bytes padding */ };
+struct FUObjectItem {
+    void* Object;
+    int32_t Flags;
+    int32_t ClusterRootIndex;
+    int32_t SerialNumber;
+    int32_t Padding;
+};
+static_assert(sizeof(FUObjectItem) == 24, "FUObjectItem layout");
+
+// struct FChunkedFixedUObjectArray -- the payload inside FUObjectArray.
+struct FChunkedFixedUObjectArray {
+    FUObjectItem** Objects;
+    FUObjectItem* PreAllocatedObjects;
+    int32_t MaxElements;
+    int32_t NumElements;
+    int32_t MaxChunks;
+    int32_t NumChunks;
+};
+static_assert(sizeof(FChunkedFixedUObjectArray) == 32, "FChunkedFixedUObjectArray layout");
+
+// UObjectBase, x64 shipping:
+//   0x00 vtable
+//   0x08 EObjectFlags ObjectFlags
+//   0x0C int32 InternalIndex
+//   0x10 UClass* ClassPrivate
+//   0x18 FName NamePrivate   (int32 ComparisonIndex; int32 Number)
+//   0x20 UObject* OuterPrivate
+struct UObjectLayout {
+    static constexpr size_t kVTable = 0x00;
+    static constexpr size_t kObjectFlags = 0x08;
+    static constexpr size_t kInternalIndex = 0x0C;
+    static constexpr size_t kClassPrivate = 0x10;
+    static constexpr size_t kNamePrivate = 0x18;
+    static constexpr size_t kOuterPrivate = 0x20;
+};
+
+// A discovered object, flattened into something safe to hold across frames.
+// Raw UObject pointers are deliberately paired with their serial number: the
+// engine reuses slots after garbage collection, so a pointer alone is not an
+// identity.
+struct ObjectRef {
+    void* object = nullptr;
+    int32_t index = 0;
+    int32_t serialNumber = 0;
+    uint32_t nameIndex = 0;
+    std::string name;
+    std::string className;
+};
+
+class Engine {
+public:
+    // Locates the host module and searches for GUObjectArray. Returns false and
+    // logs the specific validation step that failed.
+    bool Discover();
+
+    bool ready() const { return objects_ != nullptr; }
+    int32_t NumObjects() const;
+
+    // Resolves one object by index. Returns false for empty slots, which are
+    // normal in a live array.
+    bool GetObject(int32_t index, ObjectRef& out) const;
+
+    // Resolves an FName comparison index to text.
+    std::string NameToString(uint32_t comparisonIndex) const;
+
+    void* guObjectArray() const { return arrayAddress_; }
+
+private:
+    bool FindObjectArray();
+    bool FindNamePool();
+    bool ValidateArrayCandidate(const FChunkedFixedUObjectArray* candidate) const;
+    bool LooksLikeUObject(void* obj) const;
+
+    FChunkedFixedUObjectArray* objects_ = nullptr;
+    void* arrayAddress_ = nullptr;
+    uint8_t** nameBlocks_ = nullptr;
+
+    uintptr_t moduleBase_ = 0;
+    size_t moduleSize_ = 0;
+    uintptr_t textStart_ = 0;
+    uintptr_t textEnd_ = 0;
+};
+
+// True if the address is readable without faulting. Every dereference during
+// discovery goes through this: we are walking a live process's memory looking
+// for a structure by shape, so touching a bad address is expected, not
+// exceptional, and must not take the game down.
+bool IsReadable(const void* p, size_t bytes);
+
+}  // namespace ue4
+}  // namespace segcap

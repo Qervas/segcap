@@ -11,6 +11,7 @@
 
 #include "hooks.h"
 #include "log.h"
+#include "ue4.h"
 
 namespace {
 
@@ -69,10 +70,29 @@ DWORD WINAPI InitThread(LPVOID) {
     }
 
     segcap::LogError("giving up after 30 attempts");
-    // Signal anyway: a suspended injector waiting on us must not hang forever
-    // because our setup failed. It will resume the process un-instrumented,
-    // which is visible in the log rather than silent.
     SignalReady();
+    return 1;
+}
+
+// Engine discovery runs on its own thread, well after startup.
+//
+// Two reasons it cannot share the hook thread: the scan walks the entire module
+// image looking for a structure by shape, which takes long enough that it must
+// not delay hook installation; and GUObjectArray is not populated at process
+// start, so an early scan would correctly find nothing and we would wrongly
+// conclude the technique does not work.
+DWORD WINAPI DiscoverThread(LPVOID) {
+    // Stray took 7.5s to create its D3D device; the object array is populated
+    // around the same time. Retry rather than pick a magic delay.
+    for (int attempt = 1; attempt <= 40; ++attempt) {
+        Sleep(2000);
+        segcap::LogInfo("ue4: discovery attempt %d", attempt);
+        if (segcap::ue4::Engine().Discover()) {
+            segcap::LogInfo("ue4: discovery succeeded on attempt %d", attempt);
+            return 0;
+        }
+    }
+    segcap::LogError("ue4: discovery failed after 40 attempts");
     return 1;
 }
 
@@ -85,6 +105,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             DisableThreadLibraryCalls(module);
             HANDLE t = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
             if (t) CloseHandle(t);
+            // Separate thread: the module-wide structural scan is slow and must
+            // not delay hook installation, and the object array does not exist
+            // yet at process start anyway.
+            HANDLE d = CreateThread(nullptr, 0, DiscoverThread, nullptr, 0, nullptr);
+            if (d) CloseHandle(d);
             break;
         }
         case DLL_PROCESS_DETACH:

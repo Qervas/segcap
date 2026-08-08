@@ -53,8 +53,9 @@ add_library(segcap SHARED
   src/segcap/dllmain.cpp
   src/segcap/hooks.cpp
   src/segcap/readback.cpp
+  src/segcap/ue4.cpp
 )
-target_link_libraries(segcap PRIVATE minhook d3d12 dxgi)
+target_link_libraries(segcap PRIVATE minhook d3d12 dxgi psapi)
 set_target_properties(segcap PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
