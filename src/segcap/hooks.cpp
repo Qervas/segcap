@@ -2,6 +2,7 @@
 
 #include <MinHook.h>
 
+#include <algorithm>
 #include <cstdio>
 
 #include "log.h"
@@ -16,6 +17,7 @@ constexpr int kPresentSlot = 8;              // IDXGISwapChain::Present
 constexpr int kExecuteCommandListsSlot = 10; // ID3D12CommandQueue::ExecuteCommandLists
 constexpr int kCreateRTVSlot = 20;           // ID3D12Device::CreateRenderTargetView
 constexpr int kCreateDSVSlot = 21;           // ID3D12Device::CreateDepthStencilView
+constexpr int kCreateCommittedResourceSlot = 27; // ID3D12Device::CreateCommittedResource
 constexpr int kResourceBarrierSlot = 26;     // ID3D12GraphicsCommandList::ResourceBarrier
 constexpr int kOMSetRenderTargetsSlot = 46;  // ID3D12GraphicsCommandList::OMSetRenderTargets
 constexpr int kClearDSVSlot = 47;            // ID3D12GraphicsCommandList::ClearDepthStencilView
@@ -113,6 +115,9 @@ bool Hooks::AcquireVTables() {
              CreateHook(deviceVT, kCreateDSVSlot,
                         reinterpret_cast<void*>(&Hooks::CreateDepthStencilView_),
                         reinterpret_cast<void**>(&origCreateDSV_)) &&
+             CreateHook(deviceVT, kCreateCommittedResourceSlot,
+                        reinterpret_cast<void*>(&Hooks::CreateCommittedResource_),
+                        reinterpret_cast<void**>(&origCreateCommitted_)) &&
              CreateHook(listVT, kResourceBarrierSlot,
                         reinterpret_cast<void*>(&Hooks::ResourceBarrier_),
                         reinterpret_cast<void**>(&origBarrier_)) &&
@@ -306,6 +311,28 @@ void STDMETHODCALLTYPE Hooks::ResourceBarrier_(ID3D12GraphicsCommandList* self, 
     h.origBarrier_(self, count, barriers);
 }
 
+// Resources carry an initial state that no ResourceBarrier ever announces. A
+// depth buffer created in DEPTH_WRITE and never transitioned would otherwise
+// read back as COMMON from our shadow -- observed on the test fixture. Using
+// that wrong StateBefore in a transition to COPY_SOURCE is a debug-layer error
+// at best and a GPU hang at worst, so the state map is seeded here.
+HRESULT STDMETHODCALLTYPE Hooks::CreateCommittedResource_(
+    ID3D12Device* self, const D3D12_HEAP_PROPERTIES* heapProps,
+    D3D12_HEAP_FLAGS heapFlags, const D3D12_RESOURCE_DESC* desc,
+    D3D12_RESOURCE_STATES initialState, const D3D12_CLEAR_VALUE* clearValue,
+    REFIID riid, void** resource) {
+    Hooks& h = Get();
+    const HRESULT hr = h.origCreateCommitted_(self, heapProps, heapFlags, desc,
+                                              initialState, clearValue, riid, resource);
+    if (SUCCEEDED(hr) && resource && *resource && desc &&
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        auto* res = static_cast<ID3D12Resource*>(*resource);
+        std::lock_guard<std::mutex> lock(h.mutex_);
+        h.resourceState_[res] = initialState;
+    }
+    return hr;
+}
+
 void STDMETHODCALLTYPE Hooks::ClearDepthStencilView_(ID3D12GraphicsCommandList* self,
                                                      D3D12_CPU_DESCRIPTOR_HANDLE dsv,
                                                      D3D12_CLEAR_FLAGS flags, FLOAT depth,
@@ -318,8 +345,104 @@ void STDMETHODCALLTYPE Hooks::ClearDepthStencilView_(ID3D12GraphicsCommandList* 
 
 HRESULT STDMETHODCALLTYPE Hooks::Present_(IDXGISwapChain3* self, UINT sync, UINT flags) {
     Hooks& h = Get();
+    // Backbuffer dimensions define "full resolution" for election. Read from
+    // the swapchain rather than assumed, since resolution changes at runtime
+    // and a stale value would silently disqualify every real candidate.
+    if (h.backbufferWidth_ == 0) {
+        DXGI_SWAP_CHAIN_DESC desc = {};
+        if (SUCCEEDED(self->GetDesc(&desc))) {
+            h.backbufferWidth_ = desc.BufferDesc.Width;
+            h.backbufferHeight_ = desc.BufferDesc.Height;
+            LogInfo("backbuffer %ux%u format=%s", h.backbufferWidth_, h.backbufferHeight_,
+                    FormatName(desc.BufferDesc.Format));
+        }
+    }
     h.OnPresent();
     return h.origPresent_(self, sync, flags);
+}
+
+// Score candidates for "this is the CustomDepth target".
+//
+// Only runtime-observable signals are used. Debug names are excluded on
+// purpose: they are stripped in shipping builds, so an election that leans on
+// them is a technique that only works where it is not needed.
+//
+// The discriminator that matters is bind count. In Stray's captured frame the
+// scene depth target took 1365 draws while the CustomDepth candidate took none
+// -- three orders of magnitude apart. Once primitives opt in, CustomDepth still
+// takes only a handful. So "full-res, has stencil, few binds, gets cleared" is
+// the signature, and "most-bound target in the frame" is the thing to exclude.
+std::vector<ElectionScore> Hooks::ScoreTargets(
+    const std::vector<TargetFingerprint>& targets) const {
+    uint32_t maxBinds = 0;
+    // std::max, not max: NOMINMAX is defined project-wide so the Windows macro
+    // does not exist here.
+    for (const TargetFingerprint& t : targets) maxBinds = std::max(maxBinds, t.bindCount);
+
+    std::vector<ElectionScore> out;
+    for (const TargetFingerprint& t : targets) {
+        ElectionScore s;
+        s.resource = t.resource;
+
+        // Hard requirements. Without a stencil plane there is nothing to read,
+        // and a target that is not full-res is a shadow map or a downsample.
+        if (!HasStencilPlane(t.format)) {
+            _snprintf_s(s.reason, _TRUNCATE, "rejected: no stencil plane (%s)",
+                        FormatName(t.format));
+            out.push_back(s);
+            continue;
+        }
+        const bool fullRes = backbufferWidth_ != 0 &&
+                             t.width == backbufferWidth_ && t.height == backbufferHeight_;
+        if (!fullRes) {
+            _snprintf_s(s.reason, _TRUNCATE, "rejected: %llux%u != backbuffer %ux%u",
+                        t.width, t.height, backbufferWidth_, backbufferHeight_);
+            out.push_back(s);
+            continue;
+        }
+
+        int score = 100;
+        char detail[192] = "full-res + stencil";
+
+        if (t.sampleCount == 1) {
+            score += 20;
+        } else {
+            score -= 50;  // MSAA depth cannot be read back per-pixel meaningfully
+            _snprintf_s(detail, _TRUNCATE, "%s; MSAA x%u penalised", detail, t.sampleCount);
+        }
+
+        // Cleared every frame is characteristic: UE clears CustomDepth even
+        // when nothing renders into it, which is exactly how the candidate was
+        // spotted in the RenderDoc capture.
+        if (t.clearCount > 0) score += 30;
+
+        // The most-bound target in the frame is the scene depth buffer, whose
+        // stencil UE4 fully owns (sandbox bit, lighting channels, receive-decal
+        // bit). Writing there would change what the player sees.
+        if (maxBinds > 0 && t.bindCount == maxBinds && maxBinds > 8) {
+            score -= 200;
+            _snprintf_s(detail, _TRUNCATE,
+                        "%s; MOST-BOUND (%u binds) => scene depth, stencil owned by UE4",
+                        detail, t.bindCount);
+        } else if (t.bindCount == 0 && t.clearCount > 0) {
+            score += 40;
+            _snprintf_s(detail, _TRUNCATE,
+                        "%s; cleared but never bound => CustomDepth with no opt-ins",
+                        detail);
+        } else if (t.bindCount > 0 && t.bindCount <= 8) {
+            score += 50;
+            _snprintf_s(detail, _TRUNCATE, "%s; few binds (%u) => CustomDepth pass",
+                        detail, t.bindCount);
+        }
+
+        s.score = score;
+        _snprintf_s(s.reason, _TRUNCATE, "%s", detail);
+        out.push_back(s);
+    }
+
+    std::sort(out.begin(), out.end(),
+              [](const ElectionScore& a, const ElectionScore& b) { return a.score > b.score; });
+    return out;
 }
 
 // ---------------------------------------------------------------- helpers
@@ -401,6 +524,20 @@ void Hooks::OnPresent() {
                 static_cast<void*>(t.resource), FormatName(t.format), t.width, t.height,
                 t.sampleCount, t.bindCount, t.clearCount,
                 t.everBoundAsDepth ? "yes" : "NO", StateOf(t.resource));
+    }
+
+    // The full score table is logged, not just the winner. A wrong election is
+    // only debuggable if the runner-up and the reason it lost are visible.
+    const std::vector<ElectionScore> ranked = ScoreTargets(snapshot);
+    LogInfo("  election:");
+    for (const ElectionScore& e : ranked) {
+        LogInfo("    %+5d %p  %s", e.score, static_cast<void*>(e.resource), e.reason);
+    }
+    if (!ranked.empty() && ranked.front().score > 0) {
+        LogInfo("  ELECTED %p (score %d)", static_cast<void*>(ranked.front().resource),
+                ranked.front().score);
+    } else {
+        LogWarn("  no viable CustomDepth candidate this frame");
     }
 
     {

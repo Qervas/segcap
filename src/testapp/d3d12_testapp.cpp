@@ -229,8 +229,14 @@ private:
         rtvSize_ = device_->GetDescriptorHandleIncrementSize(
             D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
+        // Two DSVs: the scene depth we actually render into, and a decoy that is
+        // cleared every frame but never bound. The decoy exists to make the
+        // election logic discriminate -- it mirrors ResourceId::1932 in Stray,
+        // which is full-res D32S8, cleared each frame, never used as a depth
+        // target. With only one depth target the election has nothing to get
+        // wrong, so the test would prove nothing.
         D3D12_DESCRIPTOR_HEAP_DESC dsvDesc = {};
-        dsvDesc.NumDescriptors = 1;
+        dsvDesc.NumDescriptors = 2;
         dsvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
         ThrowIfFailed(device_->CreateDescriptorHeap(&dsvDesc,
                                                     IID_PPV_ARGS(&dsvHeap_)),
@@ -291,9 +297,22 @@ private:
         D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {};
         dsv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
         dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-        device_->CreateDepthStencilView(
-            depthStencil_.Get(), &dsv,
-            dsvHeap_->GetCPUDescriptorHandleForHeapStart());
+
+        dsvSize_ = device_->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        D3D12_CPU_DESCRIPTOR_HANDLE h =
+            dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+        device_->CreateDepthStencilView(depthStencil_.Get(), &dsv, h);
+
+        // The decoy, identical in every respect the election can observe except
+        // that nothing ever renders into it.
+        ThrowIfFailed(device_->CreateCommittedResource(
+                          &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                          D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear,
+                          IID_PPV_ARGS(&decoyDepth_)),
+                      "CreateCommittedResource(decoy depth)");
+        h.ptr += dsvSize_;
+        device_->CreateDepthStencilView(decoyDepth_.Get(), &dsv, h);
     }
 
     void CreatePipeline() {
@@ -363,6 +382,19 @@ private:
         ThrowIfFailed(device_->CreateGraphicsPipelineState(&pd,
                                                            IID_PPV_ARGS(&pso_)),
                       "CreateGraphicsPipelineState");
+
+        // Depth-only PSO for the CustomDepth pass. UE renders CustomDepth
+        // without a colour target, and the distinct PSO matters: it is the only
+        // place the stencil configuration for that pass exists, which is
+        // precisely the "baked into the PSO, not on the command list" property
+        // the capture layer has to cope with.
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC depthOnly = pd;
+        depthOnly.PS = {nullptr, 0};
+        depthOnly.NumRenderTargets = 0;
+        for (UINT i = 0; i < 8; ++i) depthOnly.RTVFormats[i] = DXGI_FORMAT_UNKNOWN;
+        ThrowIfFailed(device_->CreateGraphicsPipelineState(&depthOnly,
+                                                           IID_PPV_ARGS(&psoDepthOnly_)),
+                      "CreateGraphicsPipelineState(depth-only)");
     }
 
     ComPtr<ID3DBlob> Compile(const char* entry, const char* target) {
@@ -458,6 +490,15 @@ private:
             dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0,
             nullptr);
 
+        // Clear the decoy too, and then deliberately never bind it. This is the
+        // exact shape of Stray's ResourceId::1932.
+        D3D12_CPU_DESCRIPTOR_HANDLE decoyDsv =
+            dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+        decoyDsv.ptr += dsvSize_;
+        cmdList_->ClearDepthStencilView(
+            decoyDsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0,
+            0, nullptr);
+
         D3D12_VIEWPORT vp = {0.0f, 0.0f, static_cast<float>(opt_.width),
                              static_cast<float>(opt_.height), 0.0f, 1.0f};
         D3D12_RECT sr = {0, 0, static_cast<LONG>(opt_.width),
@@ -474,29 +515,56 @@ private:
         const float halfW = cellW * 0.35f;
         const float halfH = cellH * 0.35f;
 
+        auto quadConstants = [&](int row, int col) {
+            const int index = row * kGridCols + col;
+            Constants c = {};
+            // Colour encodes the stencil id, so the colour image and the mask
+            // can be eyeballed against each other directly.
+            c.color[0] = static_cast<float>(index + 1) / kQuadCount;
+            c.color[1] = 0.35f + 0.5f * static_cast<float>(col) / kGridCols;
+            c.color[2] = 0.35f + 0.5f * static_cast<float>(row) / kGridRows;
+            c.color[3] = 1.0f;
+            c.offset[0] = -1.0f + cellW * (col + 0.5f);
+            c.offset[1] = -1.0f + cellH * (row + 0.5f);
+            c.scale[0] = halfW;
+            c.scale[1] = halfH;
+            return c;
+        };
+
+        // ---- scene pass -------------------------------------------------
+        // Rebinding per draw is what makes this look like a real scene depth
+        // buffer to the election logic. Engines bind per pass and there are many
+        // passes; Stray's scene depth took 1365 binds in one frame. Binding once
+        // would leave the "most-bound target is scene depth" rule untested.
         for (int row = 0; row < kGridRows; ++row) {
             for (int col = 0; col < kGridCols; ++col) {
-                const int index = row * kGridCols + col;
-                const UINT stencilValue = static_cast<UINT>(index + 1);
-
-                Constants c = {};
-                // Colour encodes the stencil id, so the colour image and the
-                // mask can be eyeballed against each other directly.
-                c.color[0] = static_cast<float>(stencilValue) / kQuadCount;
-                c.color[1] = 0.35f + 0.5f * static_cast<float>(col) / kGridCols;
-                c.color[2] = 0.35f + 0.5f * static_cast<float>(row) / kGridRows;
-                c.color[3] = 1.0f;
-                c.offset[0] = -1.0f + cellW * (col + 0.5f);
-                c.offset[1] = -1.0f + cellH * (row + 0.5f);
-                c.scale[0] = halfW;
-                c.scale[1] = halfH;
-
-                cmdList_->OMSetStencilRef(stencilValue);
-                cmdList_->SetGraphicsRoot32BitConstants(
-                    0, sizeof(Constants) / 4, &c, 0);
+                cmdList_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+                const Constants c = quadConstants(row, col);
+                // Scene stencil carries engine-ish semantics, not object IDs --
+                // mirroring UE4, where these bits are lighting channels and the
+                // receive-decal flag. Deliberately NOT the values we later
+                // assert on.
+                cmdList_->OMSetStencilRef(0x80);
+                cmdList_->SetGraphicsRoot32BitConstants(0, sizeof(Constants) / 4, &c, 0);
                 cmdList_->DrawInstanced(4, 1, 0, 0);
             }
         }
+
+        // ---- CustomDepth pass -------------------------------------------
+        // Depth-only, bound once, carrying the per-object IDs 1..16. This is the
+        // buffer the capture layer must elect and read back.
+        cmdList_->SetPipelineState(psoDepthOnly_.Get());
+        cmdList_->OMSetRenderTargets(0, nullptr, FALSE, &decoyDsv);
+        for (int row = 0; row < kGridRows; ++row) {
+            for (int col = 0; col < kGridCols; ++col) {
+                const int index = row * kGridCols + col;
+                const Constants c = quadConstants(row, col);
+                cmdList_->OMSetStencilRef(static_cast<UINT>(index + 1));
+                cmdList_->SetGraphicsRoot32BitConstants(0, sizeof(Constants) / 4, &c, 0);
+                cmdList_->DrawInstanced(4, 1, 0, 0);
+            }
+        }
+        cmdList_->SetPipelineState(pso_.Get());
 
         Transition(renderTargets_[frameIndex_].Get(),
                    D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -555,8 +623,11 @@ private:
     ComPtr<ID3D12CommandAllocator> allocators_[kFrameCount];
     ComPtr<ID3D12GraphicsCommandList> cmdList_;
     ComPtr<ID3D12Resource> depthStencil_;
+    ComPtr<ID3D12Resource> decoyDepth_;
+    UINT dsvSize_ = 0;
     ComPtr<ID3D12RootSignature> rootSig_;
     ComPtr<ID3D12PipelineState> pso_;
+    ComPtr<ID3D12PipelineState> psoDepthOnly_;
     ComPtr<ID3D12Resource> vertexBuffer_;
     D3D12_VERTEX_BUFFER_VIEW vbView_ = {};
 

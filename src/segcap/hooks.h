@@ -48,6 +48,15 @@ struct TargetFingerprint {
     bool everBoundAsDepth = false;
 };
 
+// Result of scoring one candidate. The reason string exists so that a wrong
+// election is diagnosable from the log alone -- "it picked the wrong buffer" is
+// useless without knowing which signal misled it.
+struct ElectionScore {
+    ID3D12Resource* resource = nullptr;
+    int score = 0;
+    char reason[256] = {};
+};
+
 class Hooks {
 public:
     static Hooks& Get();
@@ -73,6 +82,13 @@ public:
 
     // Snapshot of this frame's observed targets, for election scoring.
     std::vector<TargetFingerprint> SnapshotTargets();
+
+    // Rank candidates for "the CustomDepth target", most likely first.
+    // Uses only signals an injected DLL can observe at runtime -- never names.
+    std::vector<ElectionScore> ScoreTargets(const std::vector<TargetFingerprint>& targets) const;
+
+    uint32_t backbufferWidth() const { return backbufferWidth_; }
+    uint32_t backbufferHeight() const { return backbufferHeight_; }
 
 private:
     Hooks() = default;
@@ -101,6 +117,11 @@ private:
     static void STDMETHODCALLTYPE ResourceBarrier_(ID3D12GraphicsCommandList* self,
                                                    UINT count,
                                                    const D3D12_RESOURCE_BARRIER* barriers);
+    static HRESULT STDMETHODCALLTYPE CreateCommittedResource_(
+        ID3D12Device* self, const D3D12_HEAP_PROPERTIES* heapProps,
+        D3D12_HEAP_FLAGS heapFlags, const D3D12_RESOURCE_DESC* desc,
+        D3D12_RESOURCE_STATES initialState, const D3D12_CLEAR_VALUE* clearValue,
+        REFIID riid, void** resource);
     static void STDMETHODCALLTYPE ClearDepthStencilView_(ID3D12GraphicsCommandList* self,
                                                          D3D12_CPU_DESCRIPTOR_HANDLE dsv,
                                                          D3D12_CLEAR_FLAGS flags,
@@ -129,6 +150,10 @@ private:
     using ClearDSVFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*,
                                                 D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS,
                                                 FLOAT, UINT8, UINT, const D3D12_RECT*);
+    using CreateCommittedFn = HRESULT(STDMETHODCALLTYPE*)(
+        ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+        const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
+        REFIID, void**);
 
     PresentFn origPresent_ = nullptr;
     ExecuteFn origExecute_ = nullptr;
@@ -137,6 +162,7 @@ private:
     OMSetRTFn origOMSetRT_ = nullptr;
     BarrierFn origBarrier_ = nullptr;
     ClearDSVFn origClearDSV_ = nullptr;
+    CreateCommittedFn origCreateCommitted_ = nullptr;
 
     // ---- shadowed state --------------------------------------------------
     // One mutex covering all maps. These are touched on the render thread on a
@@ -150,6 +176,8 @@ private:
     ID3D12CommandQueue* queue_ = nullptr;
     uint64_t frameIndex_ = 0;
     uint32_t bindOrdinal_ = 0;
+    uint32_t backbufferWidth_ = 0;
+    uint32_t backbufferHeight_ = 0;
     bool installed_ = false;
 
     // Counts of descriptor resolutions that missed, i.e. views created before
