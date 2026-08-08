@@ -25,9 +25,21 @@ bool Readback::Prepare(ID3D12Device* device, ID3D12Resource* target, uint32_t pl
     if (!device || !target) return false;
 
     const D3D12_RESOURCE_DESC desc = target->GetDesc();
-    if (preparedFor_ == target && width_ == desc.Width && height_ == desc.Height &&
-        planeSlice_ == planeSlice) {
-        return true;  // already set up for exactly this target
+
+    // Compare the LAYOUT, not the resource pointer.
+    //
+    // A swapchain rotates between several backbuffers, so GetBuffer() returns a
+    // different ID3D12Resource* every frame. Keying on the pointer meant Prepare
+    // saw a "new" target each frame, tore down the readback buffers and command
+    // lists while copies were still in flight, and rebuilt them -- a
+    // resource-destruction storm on the render thread that crashed the game.
+    //
+    // Only the layout matters for sizing the ring: same dimensions, same format,
+    // same plane means the existing buffers fit. Enqueue receives the actual
+    // resource to copy from, so a rotating source is handled naturally.
+    if (readyForLayout_ && width_ == desc.Width && height_ == desc.Height &&
+        format_ == desc.Format && planeSlice_ == planeSlice) {
+        return true;
     }
 
     // Any in-flight copies refer to the old target, so start clean.
@@ -35,6 +47,8 @@ bool Readback::Prepare(ID3D12Device* device, ID3D12Resource* target, uint32_t pl
     device_ = device;
     preparedFor_ = target;
     planeSlice_ = planeSlice;
+    format_ = desc.Format;
+    readyForLayout_ = false;
     width_ = static_cast<uint32_t>(desc.Width);
     height_ = desc.Height;
 
@@ -102,6 +116,7 @@ bool Readback::Prepare(ID3D12Device* device, ID3D12Resource* target, uint32_t pl
 
     nextFenceValue_ = 1;
     nextSlot_ = 0;
+    readyForLayout_ = true;
     LogInfo("readback: ring ready (%u slots x %llu bytes)", kRingDepth, requiredSize_);
     return true;
 }
@@ -225,6 +240,7 @@ void Readback::ReleaseResources() {
     }
     SafeRelease(fence_);
     preparedFor_ = nullptr;
+    readyForLayout_ = false;
     width_ = height_ = 0;
     requiredSize_ = 0;
 }

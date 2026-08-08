@@ -100,6 +100,9 @@ private:
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     uint32_t planeSlice_ = 1;
+    DXGI_FORMAT format_ = DXGI_FORMAT_UNKNOWN;
+    // Ring is sized for a LAYOUT, not a specific resource -- see Prepare.
+    bool readyForLayout_ = false;
     uint64_t requiredSize_ = 0;
 
     uint64_t nextFenceValue_ = 1;
