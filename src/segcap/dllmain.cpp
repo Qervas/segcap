@@ -102,36 +102,17 @@ DWORD WINAPI DiscoverThread(LPVOID) {
         }
     }
 
-    // Re-sample periodically. Discovery lands within ~2s, but Stray does not
-    // create its D3D device until 7.5s and the level loads later still -- so an
-    // immediate sample sees only the engine's bootstrap objects (class
-    // definitions and packages) and no gameplay actors. The array's ADDRESS is
-    // stable; its CONTENTS are not, and the interesting contents arrive late.
-    const int kIntervals[] = {5, 10, 20, 40, 60, 90, 120};
-    int elapsed = 0;
-    for (int stage : kIntervals) {
-        Sleep((stage - elapsed) * 1000);
-        elapsed = stage;
-        char label[32];
-        _snprintf_s(label, sizeof(label), _TRUNCATE, "t+%ds", stage);
-        g_engine.ReportSample(label);
-    }
-
-    // Once the level is up, count what we can actually mark for CustomDepth.
-    // bRenderCustomDepth lives on UPrimitiveComponent, so its descendants are
-    // the candidate set for task 8.
+    // ---- reflection FIRST -------------------------------------------------
+    //
+    // Ordering matters more than it looks. An earlier version ran the periodic
+    // sampling and a full 325k-object CountDerivedFrom walk BEFORE this, putting
+    // the most important results at the end of a 2.5 minute pipeline. A machine
+    // crash at t+92s lost the entire run and produced nothing.
+    //
+    // Reflection needs only discovery and name resolution, both of which land at
+    // t=2s, and it is pure memory reading -- it works fine on the main menu.
+    // So it goes first, and the slow diagnostics come after.
     if (g_engine.namesResolved()) {
-        g_engine.CountDerivedFrom("PrimitiveComponent");
-
-        // Everything above only reads. ProcessEvent is what makes writing safe:
-        // UObject state belongs to the game thread, and our D3D hooks run on the
-        // render thread.
-        // Reflection: find where bRenderCustomDepth actually lives, rather than
-        // hardcoding an offset. This is verified before it is used -- if the
-        // property names come back as recognisable UE4 names, the reflection
-        // layout is right for this build; if they come back as garbage, the
-        // sanity bounds in ListProperties will have discarded them and the
-        // lookup simply fails instead of handing back an address to write to.
         void* primClass = g_engine.FindClass("PrimitiveComponent");
         segcap::LogInfo("ue4: UPrimitiveComponent UClass = %p", primClass);
 
@@ -141,12 +122,13 @@ DWORD WINAPI DiscoverThread(LPVOID) {
                             props.size());
             int shown = 0;
             for (const auto& p : props) {
-                if (shown++ >= 24) break;
+                if (shown++ >= 30) break;
                 segcap::LogInfo("ue4:     +0x%-5X size=%-5d %s", p.offset, p.size,
                                 p.name.c_str());
             }
 
-            // The two we actually need.
+            // The ones we actually need. Logged as MISSING rather than guessed:
+            // this is the last read before we start writing to a live game.
             for (const char* want : {"bRenderCustomDepth", "CustomDepthStencilValue",
                                      "bVisible", "CustomDepthStencilWriteMask"}) {
                 const auto info = g_engine.FindProperty(primClass, want);
@@ -158,7 +140,13 @@ DWORD WINAPI DiscoverThread(LPVOID) {
                 }
             }
         }
+    }
 
+    // ---- ProcessEvent second ----------------------------------------------
+    // Needs the engine actively dispatching, so give the game a moment to get
+    // going, but do not wait for the full sampling schedule.
+    if (g_engine.namesResolved()) {
+        Sleep(25000);
         auto& pe = segcap::ue4::GetProcessEventHook();
         if (pe.Install(g_engine)) {
             segcap::LogInfo("ue4: game-thread execution point ready (vtable %d)",
@@ -170,6 +158,20 @@ DWORD WINAPI DiscoverThread(LPVOID) {
             });
         }
     }
+
+    // ---- slow diagnostics last --------------------------------------------
+    // Everything below is useful context, not a gate on progress, so it runs
+    // after the two results that matter.
+    const int kIntervals[] = {60, 90, 120, 180};
+    int elapsed = 30;
+    for (int stage : kIntervals) {
+        if (stage > elapsed) Sleep((stage - elapsed) * 1000);
+        elapsed = stage;
+        char label[32];
+        _snprintf_s(label, sizeof(label), _TRUNCATE, "t+%ds", stage);
+        g_engine.ReportSample(label);
+    }
+    if (g_engine.namesResolved()) g_engine.CountDerivedFrom("PrimitiveComponent");
     return 0;
 }
 

@@ -139,11 +139,25 @@ if (-not $NoInput) {
         Start-Sleep -Seconds 2
     }
 
-    # Enter, then Space, then Enter again. Stray's menus vary by whether a save
-    # exists, so a short sequence of confirmations is more robust than one key.
-    Tap 0x1C "Enter"
-    Tap 0x39 "Space"
-    Tap 0x1C "Enter"
+    # Stray's path into gameplay is three Enter presses, confirmed from the
+    # actual screens:
+    #
+    #   main menu  ->  SELECT SAVE (slot 1 pre-highlighted)  ->  SLOT 1
+    #   (CONTINUE pre-highlighted)  ->  in game
+    #
+    # Both screens show "ENTER Select" in the prompt bar. An earlier version sent
+    # Enter/Space/Enter; the Space was almost certainly what derailed it, since
+    # nothing in this flow uses Space.
+    #
+    # A fourth Enter is harmless if we are already in gameplay, and covers the
+    # case where a save slot is empty and the flow is one screen shorter.
+    Tap 0x1C "Enter (main menu)"
+    Start-Sleep -Seconds 3
+    Tap 0x1C "Enter (select save)"
+    Start-Sleep -Seconds 3
+    Tap 0x1C "Enter (continue)"
+    Start-Sleep -Seconds 3
+    Tap 0x1C "Enter (spare)"
 }
 
 # --- 5. idle in gameplay -----------------------------------------------------
