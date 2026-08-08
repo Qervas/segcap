@@ -4,6 +4,11 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <string>
+
+// Linker-provided base of this module; avoids needing the HMODULE passed around
+// just to find where our own DLL lives.
+extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 #include "log.h"
 
@@ -597,8 +602,18 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     // write gigabytes and stall on disk I/O from the render thread.
     if (masksDumped_ >= 3) return;
 
+    // Absolute path next to the DLL. A relative filename resolves against the
+    // GAME's working directory, which put three 4MB dumps inside Stray's install
+    // folder -- writing our output into someone else's game directory.
+    wchar_t dllPath[MAX_PATH] = {};
+    GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), dllPath, MAX_PATH);
+    std::wstring dir(dllPath);
+    const size_t slash = dir.find_last_of(L"\\/");
+    dir = (slash == std::wstring::npos) ? L"." : dir.substr(0, slash);
+
     wchar_t path[MAX_PATH];
-    _snwprintf_s(path, _TRUNCATE, L"segcap_mask_%llu.pgm", frame.frameIndex);
+    _snwprintf_s(path, _TRUNCATE, L"%ls\\segcap_mask_%llu.pgm", dir.c_str(),
+                 frame.frameIndex);
 
     std::FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"wb") != 0 || !f) return;

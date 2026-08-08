@@ -624,6 +624,33 @@ void Engine::DumpStructLayout(void* ustruct, const char* label) {
     LogInfo("ue4: --- end probe ---");
 }
 
+void* Engine::FindFunction(void* uclass, const char* functionName) {
+    if (!uclass || !nameBlocks_) return nullptr;
+
+    auto structPtr = reinterpret_cast<uintptr_t>(uclass);
+    for (int depth = 0; depth < 32 && structPtr; ++depth) {
+        if (!LooksLikeUObject(reinterpret_cast<void*>(structPtr))) break;
+
+        // UStruct::Children (+0x48) is a UField chain of UObjects -- UFunctions
+        // among them -- distinct from ChildProperties (+0x50) which holds
+        // FFields. The layout probe showed both: +0x48 decoded as the UObject
+        // "SetStaticMesh", +0x50 as the FField "ForcedLodModel".
+        auto field = *reinterpret_cast<uintptr_t*>(structPtr + 0x48);
+        for (int n = 0; n < 4096 && field; ++n) {
+            if (!LooksLikeUObject(reinterpret_cast<void*>(field))) break;
+            const auto nameIdx =
+                *reinterpret_cast<uint32_t*>(field + UObjectLayout::kNamePrivate);
+            if (NameToString(nameIdx) == functionName) {
+                return reinterpret_cast<void*>(field);
+            }
+            // UField::Next lives at +0x28, after UObject's six fields.
+            field = *reinterpret_cast<uintptr_t*>(field + 0x28);
+        }
+        structPtr = *reinterpret_cast<uintptr_t*>(structPtr + UStructLayout::kSuperStruct);
+    }
+    return nullptr;
+}
+
 PropertyInfo Engine::FindProperty(void* uclass, const char* propertyName) {
     for (const PropertyInfo& p : ListProperties(uclass, true)) {
         if (p.name == propertyName) return p;
@@ -824,6 +851,13 @@ void ProcessEventHook::Uninstall() {
     // Deliberately left installed for the process lifetime -- see dllmain's
     // note on removing trampolines out from under running threads.
     verified_ = false;
+}
+
+void ProcessEventHook::CallFunction(void* object, void* function, void* params) {
+    if (!verified_ || !g_origProcessEvent || !object || !function) return;
+    // Calls the ORIGINAL, not the detour: re-entering our own hook here would
+    // recurse through the validation path for no benefit.
+    g_origProcessEvent(object, function, params, nullptr);
 }
 
 void ProcessEventHook::RunOnGameThread(GameThreadTask task) {

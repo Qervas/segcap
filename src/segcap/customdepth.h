@@ -79,6 +79,12 @@ private:
     ue4::PropertyInfo propRenderCustomDepth_;
     ue4::PropertyInfo propStencilValue_;
 
+    // The engine's own setters. Calling these rather than writing the property
+    // is what triggers MarkRenderStateDirty() and rebuilds the render-thread
+    // proxy -- without it the renderer never learns the flag changed.
+    void* fnSetRenderCustomDepth_ = nullptr;
+    void* fnSetCustomDepthStencilValue_ = nullptr;
+
     std::vector<MarkedPrimitive> marked_;
     std::unordered_map<uint8_t, MarkedPrimitive> slotTable_;
 

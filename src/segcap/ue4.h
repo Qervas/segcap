@@ -255,6 +255,16 @@ public:
     // not have that property and we must not write to a guessed location.
     PropertyInfo FindProperty(void* uclass, const char* propertyName);
 
+    // Finds a UFunction by name on a class, walking UStruct::Children (+0x48)
+    // and the SuperStruct chain.
+    //
+    // Needed because writing bRenderCustomDepth directly is not enough: the
+    // renderer reads a FPrimitiveSceneProxy built on the render thread, not the
+    // UObject property. UPrimitiveComponent::SetRenderCustomDepth sets the flag
+    // AND calls MarkRenderStateDirty(), which is what rebuilds the proxy. Our
+    // memory write changed the property and the render thread never found out.
+    void* FindFunction(void* uclass, const char* functionName);
+
     // Dumps the raw qwords of a UStruct and tries to interpret each as a
     // pointer to something named, under BOTH the pre-4.25 (UProperty, a UObject
     // with FName at +0x18) and post-4.25 (FProperty, an FField with FName at
@@ -334,6 +344,16 @@ public:
 
     // Queues work for the next ProcessEvent call. Thread-safe.
     void RunOnGameThread(GameThreadTask task);
+
+    // Calls a UFunction on an object through the engine's own ProcessEvent.
+    // MUST be called from the game thread -- i.e. from inside a RunOnGameThread
+    // task. `params` is the function's parameter struct, laid out exactly as the
+    // engine expects; nullptr for a no-arg function.
+    //
+    // This is the difference between poking memory and asking the engine to do
+    // something. Setting a property by hand leaves the render thread's proxy
+    // stale; calling the engine's setter runs its side effects too.
+    void CallFunction(void* object, void* function, void* params);
 
     bool verified() const { return verified_; }
     int vtableIndex() const { return vtableIndex_; }

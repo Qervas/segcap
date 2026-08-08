@@ -69,6 +69,22 @@ bool CustomDepthMarker::Resolve(ue4::Engine& engine) {
     LogInfo("customdepth: CustomDepthStencilValue +0x%X size %d",
             propStencilValue_.offset, propStencilValue_.size);
 
+    // The engine's setters, which do the side effects a raw write cannot.
+    fnSetRenderCustomDepth_ = engine.FindFunction(primClass, "SetRenderCustomDepth");
+    fnSetCustomDepthStencilValue_ =
+        engine.FindFunction(primClass, "SetCustomDepthStencilValue");
+
+    LogInfo("customdepth: SetRenderCustomDepth       UFunction = %p",
+            fnSetRenderCustomDepth_);
+    LogInfo("customdepth: SetCustomDepthStencilValue UFunction = %p",
+            fnSetCustomDepthStencilValue_);
+
+    if (!fnSetRenderCustomDepth_ || !fnSetCustomDepthStencilValue_) {
+        LogWarn("customdepth: setter UFunction(s) not found -- will fall back to a "
+                "raw property write, which sets the flag but leaves the render "
+                "proxy stale, so nothing will actually render");
+    }
+
     resolved_ = true;
     return true;
 }
@@ -76,6 +92,29 @@ bool CustomDepthMarker::Resolve(ue4::Engine& engine) {
 bool CustomDepthMarker::WriteMarked(void* component, uint8_t stencilValue,
                                     MarkedPrimitive& out) {
     ++writesAttempted_;
+
+    // Prefer the engine's own setters.
+    //
+    // Writing bRenderCustomDepth directly is necessary but NOT SUFFICIENT: the
+    // renderer does not read that property per frame, it reads a
+    // FPrimitiveSceneProxy built on the render thread.
+    // UPrimitiveComponent::SetRenderCustomDepth sets the flag AND calls
+    // MarkRenderStateDirty(), which is what rebuilds the proxy.
+    //
+    // The first attempt at this marked 64 primitives with 64 verified writes and
+    // the CustomDepth target still showed binds=0 -- the game-thread property
+    // changed and the render thread never found out.
+    if (fnSetRenderCustomDepth_ && fnSetCustomDepthStencilValue_) {
+        auto& pe = ue4::GetProcessEventHook();
+
+        // UFunction parameter structs are just the arguments laid out in order.
+        // A single bool is passed as one byte.
+        struct { uint32_t bValue; } depthParams = {1};
+        pe.CallFunction(component, fnSetRenderCustomDepth_, &depthParams);
+
+        struct { int32_t Value; } stencilParams = {static_cast<int32_t>(stencilValue)};
+        pe.CallFunction(component, fnSetCustomDepthStencilValue_, &stencilParams);
+    }
 
     auto* base = reinterpret_cast<uint8_t*>(component);
     const size_t boolByteOff =
