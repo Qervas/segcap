@@ -121,9 +121,21 @@ DWORD WINAPI DiscoverThread(LPVOID) {
     // bRenderCustomDepth lives on UPrimitiveComponent, so its descendants are
     // the candidate set for task 8.
     if (g_engine.namesResolved()) {
-        segcap::LogInfo("ue4: PrimitiveComponent descendants: %d",
-                        g_engine.CountDerivedFrom("PrimitiveComponent"));
-        segcap::LogInfo("ue4: Actor descendants: %d", g_engine.CountDerivedFrom("Actor"));
+        g_engine.CountDerivedFrom("PrimitiveComponent");
+
+        // Everything above only reads. ProcessEvent is what makes writing safe:
+        // UObject state belongs to the game thread, and our D3D hooks run on the
+        // render thread.
+        auto& pe = segcap::ue4::GetProcessEventHook();
+        if (pe.Install(g_engine)) {
+            segcap::LogInfo("ue4: game-thread execution point ready (vtable %d)",
+                            pe.vtableIndex());
+            // Prove the queue actually runs there, before anything depends on it.
+            pe.RunOnGameThread([](segcap::ue4::Engine&) {
+                segcap::LogInfo("ue4: >>> task executed on game thread %lu <<<",
+                                GetCurrentThreadId());
+            });
+        }
     }
     return 0;
 }

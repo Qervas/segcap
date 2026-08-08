@@ -32,6 +32,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -142,6 +143,15 @@ public:
     // UPrimitiveComponent, so anything derived from it can be marked.
     int CountDerivedFrom(const char* className);
 
+    // True if obj's class chain reaches `className`. Used both to select
+    // primitives and to prove a ProcessEvent candidate by checking its first
+    // argument really is a UFunction.
+    bool IsDerivedFrom(void* obj, const char* className) const;
+
+    // Address of any live UObject, for reading a vtable. Returns nullptr if
+    // discovery has not run.
+    void* AnyObject() const;
+
     void* guObjectArray() const { return arrayAddress_; }
     bool namesResolved() const { return nameBlocks_ != nullptr; }
 
@@ -166,6 +176,55 @@ private:
 // for a structure by shape, so touching a bad address is expected, not
 // exceptional, and must not take the game down.
 bool IsReadable(const void* p, size_t bytes);
+
+// ---------------------------------------------------------------------------
+// ProcessEvent -- a safe execution point on the game thread.
+//
+// Everything else in this file only READS. Setting bRenderCustomDepth is a
+// write, and UObject state is owned by the game thread: writing it from the
+// render thread (where our D3D hooks run) is a data race that might work a
+// thousand times and then corrupt something.
+//
+// UObject::ProcessEvent is Unreal's central dispatch for Blueprint and native
+// calls. It runs on the game thread, constantly. Hooking it gives us a legal
+// moment to touch object state.
+//
+// HONEST CAVEAT: unlike GUObjectArray and FNamePool, this cannot be found by
+// structural search -- a vtable slot is just a function pointer with no shape to
+// match. So the vtable index is a HYPOTHESIS, proven at runtime by checking that
+// the first argument is a real UFunction (its class chain must reach "Function").
+// This is the one version-keyed constant in the project, and it is never trusted
+// without that proof.
+// ---------------------------------------------------------------------------
+class ProcessEventHook {
+public:
+    // Work to run on the game thread. Called from inside ProcessEvent, so it
+    // must be short -- this runs in the middle of the engine's dispatch path.
+    using GameThreadTask = std::function<void(Engine&)>;
+
+    // Installs the hook, trying candidate vtable indices until one proves
+    // itself. Returns false with the reason logged.
+    bool Install(Engine& engine);
+    void Uninstall();
+
+    // Queues work for the next ProcessEvent call. Thread-safe.
+    void RunOnGameThread(GameThreadTask task);
+
+    bool verified() const { return verified_; }
+    int vtableIndex() const { return vtableIndex_; }
+    unsigned long gameThreadId() const { return gameThreadId_; }
+    uint64_t callCount() const { return callCount_; }
+
+private:
+    bool TryIndex(Engine& engine, int index);
+
+    int vtableIndex_ = -1;
+    bool verified_ = false;
+    unsigned long gameThreadId_ = 0;
+    uint64_t callCount_ = 0;
+};
+
+ProcessEventHook& GetProcessEventHook();
 
 }  // namespace ue4
 }  // namespace segcap

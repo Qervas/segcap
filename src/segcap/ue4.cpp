@@ -2,8 +2,11 @@
 
 #include <psapi.h>
 
+#include <MinHook.h>
+
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <utility>
 
 #include "log.h"
@@ -445,6 +448,33 @@ int Engine::CountDerivedFrom(const char* target) {
     return matches;
 }
 
+bool Engine::IsDerivedFrom(void* obj, const char* target) const {
+    if (!obj || !nameBlocks_ || !LooksLikeUObject(obj)) return false;
+    auto klass = *reinterpret_cast<uintptr_t*>(
+        reinterpret_cast<uint8_t*>(obj) + UObjectLayout::kClassPrivate);
+    for (int depth = 0; depth < 24 && klass; ++depth) {
+        if (!LooksLikeUObject(reinterpret_cast<void*>(klass))) return false;
+        const auto nameIdx = *reinterpret_cast<uint32_t*>(
+            reinterpret_cast<uint8_t*>(klass) + UObjectLayout::kNamePrivate);
+        if (NameToString(nameIdx) == target) return true;
+        klass = *reinterpret_cast<uintptr_t*>(reinterpret_cast<uint8_t*>(klass) + 0x40);
+    }
+    return false;
+}
+
+void* Engine::AnyObject() const {
+    if (!objects_) return nullptr;
+    for (int32_t i = 0; i < objects_->NumElements && i < 4096; ++i) {
+        const int32_t chunkIndex = i / kElementsPerChunk;
+        if (chunkIndex >= objects_->NumChunks) break;
+        FUObjectItem* chunk = objects_->Objects[chunkIndex];
+        if (!IsReadable(chunk, sizeof(FUObjectItem) * static_cast<size_t>(i + 1))) continue;
+        void* obj = chunk[i].Object;
+        if (obj && LooksLikeUObject(obj)) return obj;
+    }
+    return nullptr;
+}
+
 bool Engine::Discover() {
     BuildReadableMap();
 
@@ -493,6 +523,153 @@ bool Engine::Discover() {
 
     LogInfo("ue4: discovery complete, %d slots in the array", NumObjects());
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// ProcessEvent
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Candidate vtable indices for UObject::ProcessEvent in UE4 x64 shipping. The
+// exact slot moves with engine version and with which virtuals the game's build
+// includes, so a window is tried rather than a single number -- and every
+// candidate must PROVE itself before being kept.
+constexpr int kProcessEventCandidateFirst = 60;
+constexpr int kProcessEventCandidateLast = 80;
+
+// How many correctly-shaped calls a candidate must produce before we believe it.
+// One could be luck; a steady stream through the engine's dispatch path is not.
+constexpr uint64_t kProofThreshold = 24;
+
+Engine* g_engine = nullptr;
+ProcessEventHook* g_hook = nullptr;
+
+// Four parameters, not three. The real signature is
+// ProcessEvent(this, UFunction*, void*), but while SEARCHING we may briefly be
+// attached to some other virtual that takes more arguments. Declaring four
+// keeps RCX/RDX/R8/R9 faithfully passed through, so a wrong candidate is a
+// no-op rather than a corrupted call. Virtuals with more than four register
+// arguments are the residual risk, and are rare.
+using ProcessEventFn = void(__fastcall*)(void*, void*, void*, void*);
+ProcessEventFn g_origProcessEvent = nullptr;
+
+std::mutex g_queueMutex;
+std::vector<ProcessEventHook::GameThreadTask> g_queue;
+uint64_t g_validCalls = 0;
+uint64_t g_invalidCalls = 0;
+
+void __fastcall ProcessEventDetour(void* self, void* function, void* parms, void* spare) {
+    // The proof: ProcessEvent's second argument is always a UFunction. If this
+    // slot is some other virtual, that argument will be an int, a pointer to
+    // something else, or garbage -- and the class-chain walk will reject it.
+    if (g_engine && g_engine->IsDerivedFrom(function, "Function")) {
+        ++g_validCalls;
+        if (g_hook) {
+            // Drain queued work here: we are on the game thread, inside the
+            // engine's own dispatch, which is exactly the safe point we needed.
+            std::vector<ProcessEventHook::GameThreadTask> todo;
+            {
+                std::lock_guard<std::mutex> lock(g_queueMutex);
+                todo.swap(g_queue);
+            }
+            for (auto& task : todo) task(*g_engine);
+        }
+    } else {
+        ++g_invalidCalls;
+    }
+    g_origProcessEvent(self, function, parms, spare);
+}
+
+}  // namespace
+
+bool ProcessEventHook::TryIndex(Engine& engine, int index) {
+    void* sample = engine.AnyObject();
+    if (!sample) return false;
+
+    auto** vtable = *reinterpret_cast<void***>(sample);
+    if (!IsReadable(&vtable[index], sizeof(void*))) return false;
+    void* target = vtable[index];
+    if (!IsReadable(target, 16)) return false;
+
+    g_validCalls = 0;
+    g_invalidCalls = 0;
+
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&ProcessEventDetour),
+                      reinterpret_cast<void**>(&g_origProcessEvent)) != MH_OK) {
+        return false;
+    }
+    if (MH_EnableHook(target) != MH_OK) {
+        MH_RemoveHook(target);
+        return false;
+    }
+
+    // Observe. A correct candidate produces a steady stream of calls whose
+    // second argument validates as a UFunction.
+    Sleep(1500);
+
+    const uint64_t valid = g_validCalls;
+    const uint64_t invalid = g_invalidCalls;
+
+    // Accept only on a clear signal: enough proven calls, and overwhelmingly
+    // more valid than invalid. A slot that is called often with arguments that
+    // do not validate is a different virtual, not a noisy ProcessEvent.
+    const bool accept = valid >= kProofThreshold && valid > invalid * 4;
+    LogInfo("ue4: PE candidate %d -> %llu valid, %llu invalid %s", index, valid, invalid,
+            accept ? "ACCEPTED" : "(rejected)");
+
+    if (!accept) {
+        MH_DisableHook(target);
+        MH_RemoveHook(target);
+        g_origProcessEvent = nullptr;
+        return false;
+    }
+
+    vtableIndex_ = index;
+    verified_ = true;
+    return true;
+}
+
+bool ProcessEventHook::Install(Engine& engine) {
+    if (verified_) return true;
+    if (!engine.ready() || !engine.namesResolved()) {
+        LogError("ue4: ProcessEvent needs discovery and name resolution first");
+        return false;
+    }
+
+    g_engine = &engine;
+    g_hook = this;
+
+    LogInfo("ue4: searching vtable slots %d..%d for ProcessEvent",
+            kProcessEventCandidateFirst, kProcessEventCandidateLast);
+
+    for (int i = kProcessEventCandidateFirst; i <= kProcessEventCandidateLast; ++i) {
+        if (TryIndex(engine, i)) {
+            gameThreadId_ = GetCurrentThreadId();  // provisional; corrected on first call
+            LogInfo("ue4: ProcessEvent CONFIRMED at vtable index %d", i);
+            return true;
+        }
+    }
+
+    LogError("ue4: ProcessEvent not found in slots %d..%d",
+             kProcessEventCandidateFirst, kProcessEventCandidateLast);
+    return false;
+}
+
+void ProcessEventHook::Uninstall() {
+    // Deliberately left installed for the process lifetime -- see dllmain's
+    // note on removing trampolines out from under running threads.
+    verified_ = false;
+}
+
+void ProcessEventHook::RunOnGameThread(GameThreadTask task) {
+    std::lock_guard<std::mutex> lock(g_queueMutex);
+    g_queue.push_back(std::move(task));
+}
+
+ProcessEventHook& GetProcessEventHook() {
+    static ProcessEventHook instance;
+    return instance;
 }
 
 }  // namespace ue4
