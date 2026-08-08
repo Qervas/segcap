@@ -103,6 +103,60 @@ struct UObjectLayout {
     static constexpr size_t kOuterPrivate = 0x20;
 };
 
+// UE 4.25+ reflection layout.
+//
+// Properties moved from UProperty (a UObject) to FProperty (an FField) in 4.25,
+// so they live on UStruct::ChildProperties rather than UStruct::Children.
+//
+//   class UStruct : UField {
+//       UStruct* SuperStruct;       // +0x40
+//       UField*  Children;          // +0x48  (UFunction etc.)
+//       FField*  ChildProperties;   // +0x50  (FProperty chain)
+//       int32    PropertiesSize;    // +0x58
+//   };
+//   class FField {
+//       void*        vtable;        // +0x00
+//       FFieldClass* ClassPrivate;  // +0x08
+//       FFieldVariant Owner;        // +0x10  (16 bytes)
+//       FField*      Next;          // +0x20
+//       FName        NamePrivate;   // +0x28
+//   };
+//   class FProperty : FField {
+//       int32 ArrayDim;             // +0x38
+//       int32 ElementSize;          // +0x3C
+//       uint64 PropertyFlags;       // +0x40
+//       ...
+//       int32 Offset_Internal;      // +0x4C   <- what we are actually after
+//   };
+//
+// These describe the reflection system itself, which is fixed by engine version.
+// What they let us avoid is hardcoding where bRenderCustomDepth sits inside
+// UPrimitiveComponent -- that offset is looked up at runtime, and it is the part
+// that varies per game and per build.
+struct UStructLayout {
+    static constexpr size_t kSuperStruct = 0x40;
+    static constexpr size_t kChildProperties = 0x50;
+    static constexpr size_t kPropertiesSize = 0x58;
+};
+struct FFieldLayout {
+    static constexpr size_t kNext = 0x20;
+    static constexpr size_t kNamePrivate = 0x28;
+};
+struct FPropertyLayout {
+    static constexpr size_t kArrayDim = 0x38;
+    static constexpr size_t kElementSize = 0x3C;
+    static constexpr size_t kOffsetInternal = 0x4C;
+};
+
+// One reflected property: where it lives in an instance, and how big it is.
+struct PropertyInfo {
+    std::string name;
+    int32_t offset = -1;
+    int32_t size = 0;
+    int32_t arrayDim = 0;
+    bool valid() const { return offset >= 0; }
+};
+
 // A discovered object, flattened into something safe to hold across frames.
 // Raw UObject pointers are deliberately paired with their serial number: the
 // engine reuses slots after garbage collection, so a pointer alone is not an
@@ -151,6 +205,20 @@ public:
     // Address of any live UObject, for reading a vtable. Returns nullptr if
     // discovery has not run.
     void* AnyObject() const;
+
+    // Finds a UClass by name by scanning the object array.
+    void* FindClass(const char* className);
+
+    // Every reflected property on a class, including inherited ones (walks the
+    // SuperStruct chain). Used both to look properties up and to VERIFY the
+    // reflection layout: if the names come back recognisable, the offsets above
+    // are right for this build.
+    std::vector<PropertyInfo> ListProperties(void* uclass, bool includeInherited = true);
+
+    // Looks up a single property by name. Returns an invalid PropertyInfo if
+    // absent -- which is a real answer, not an error: it means this build does
+    // not have that property and we must not write to a guessed location.
+    PropertyInfo FindProperty(void* uclass, const char* propertyName);
 
     void* guObjectArray() const { return arrayAddress_; }
     bool namesResolved() const { return nameBlocks_ != nullptr; }

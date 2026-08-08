@@ -475,6 +475,68 @@ void* Engine::AnyObject() const {
     return nullptr;
 }
 
+void* Engine::FindClass(const char* className) {
+    if (!objects_ || !nameBlocks_) return nullptr;
+    for (int32_t i = 0; i < objects_->NumElements; ++i) {
+        ObjectRef ref;
+        if (!GetObject(i, ref)) continue;
+        if (ref.className != "Class") continue;   // must BE a UClass, not an instance
+        if (ref.name == className) return ref.object;
+    }
+    return nullptr;
+}
+
+std::vector<PropertyInfo> Engine::ListProperties(void* uclass, bool includeInherited) {
+    std::vector<PropertyInfo> out;
+    if (!uclass || !nameBlocks_) return out;
+
+    auto structPtr = reinterpret_cast<uintptr_t>(uclass);
+    for (int depth = 0; depth < 32 && structPtr; ++depth) {
+        if (!LooksLikeUObject(reinterpret_cast<void*>(structPtr))) break;
+
+        auto field = *reinterpret_cast<uintptr_t*>(structPtr + UStructLayout::kChildProperties);
+        // Bounded: a corrupt or misinterpreted Next pointer would otherwise spin
+        // forever, and we are walking memory whose layout is a hypothesis.
+        for (int n = 0; n < 4096 && field; ++n) {
+            if (!IsReadable(reinterpret_cast<void*>(field), 0x50)) break;
+
+            const auto nameIdx =
+                *reinterpret_cast<uint32_t*>(field + FFieldLayout::kNamePrivate);
+            const int32_t offset =
+                *reinterpret_cast<int32_t*>(field + FPropertyLayout::kOffsetInternal);
+            const int32_t size =
+                *reinterpret_cast<int32_t*>(field + FPropertyLayout::kElementSize);
+            const int32_t dim =
+                *reinterpret_cast<int32_t*>(field + FPropertyLayout::kArrayDim);
+
+            std::string name = NameToString(nameIdx);
+            // Sanity-bound the values. A property at offset 900000 or of size
+            // -3 means the layout hypothesis is wrong, and it is far better to
+            // stop than to hand back a plausible-looking address to write to.
+            if (!name.empty() && offset >= 0 && offset < 0x40000 && size > 0 && size <= 0x10000) {
+                PropertyInfo info;
+                info.name = std::move(name);
+                info.offset = offset;
+                info.size = size;
+                info.arrayDim = dim;
+                out.push_back(std::move(info));
+            }
+            field = *reinterpret_cast<uintptr_t*>(field + FFieldLayout::kNext);
+        }
+
+        if (!includeInherited) break;
+        structPtr = *reinterpret_cast<uintptr_t*>(structPtr + UStructLayout::kSuperStruct);
+    }
+    return out;
+}
+
+PropertyInfo Engine::FindProperty(void* uclass, const char* propertyName) {
+    for (const PropertyInfo& p : ListProperties(uclass, true)) {
+        if (p.name == propertyName) return p;
+    }
+    return PropertyInfo{};
+}
+
 bool Engine::Discover() {
     BuildReadableMap();
 

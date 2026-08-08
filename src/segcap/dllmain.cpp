@@ -126,6 +126,39 @@ DWORD WINAPI DiscoverThread(LPVOID) {
         // Everything above only reads. ProcessEvent is what makes writing safe:
         // UObject state belongs to the game thread, and our D3D hooks run on the
         // render thread.
+        // Reflection: find where bRenderCustomDepth actually lives, rather than
+        // hardcoding an offset. This is verified before it is used -- if the
+        // property names come back as recognisable UE4 names, the reflection
+        // layout is right for this build; if they come back as garbage, the
+        // sanity bounds in ListProperties will have discarded them and the
+        // lookup simply fails instead of handing back an address to write to.
+        void* primClass = g_engine.FindClass("PrimitiveComponent");
+        segcap::LogInfo("ue4: UPrimitiveComponent UClass = %p", primClass);
+
+        if (primClass) {
+            const auto props = g_engine.ListProperties(primClass, false);
+            segcap::LogInfo("ue4: %zu properties declared directly on UPrimitiveComponent",
+                            props.size());
+            int shown = 0;
+            for (const auto& p : props) {
+                if (shown++ >= 24) break;
+                segcap::LogInfo("ue4:     +0x%-5X size=%-5d %s", p.offset, p.size,
+                                p.name.c_str());
+            }
+
+            // The two we actually need.
+            for (const char* want : {"bRenderCustomDepth", "CustomDepthStencilValue",
+                                     "bVisible", "CustomDepthStencilWriteMask"}) {
+                const auto info = g_engine.FindProperty(primClass, want);
+                if (info.valid()) {
+                    segcap::LogInfo("ue4:  FOUND %-28s at +0x%X (size %d)", want,
+                                    info.offset, info.size);
+                } else {
+                    segcap::LogWarn("ue4:  MISSING %-28s -- will not write blind", want);
+                }
+            }
+        }
+
         auto& pe = segcap::ue4::GetProcessEventHook();
         if (pe.Install(g_engine)) {
             segcap::LogInfo("ue4: game-thread execution point ready (vtable %d)",
