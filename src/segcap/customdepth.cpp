@@ -186,95 +186,94 @@ bool CustomDepthMarker::WriteMarked(void* component, uint8_t stencilValue,
     return true;
 }
 
-int CustomDepthMarker::MarkPrimitives(ue4::Engine& engine, int limit, bool renderableOnly) {
+int CustomDepthMarker::CollectCandidates(ue4::Engine& engine, bool renderableOnly) {
     if (!resolved_) {
         LogError("customdepth: Resolve() must succeed first");
         return 0;
     }
 
-    // limit <= 0 means "mark everything", cycling slot ids 1..255.
-    //
-    // Marking a bounded first-N is the wrong experiment for a first proof. The
-    // first 64 renderable components by array index turned out to be a poor
-    // sample -- they may sit in unloaded sublevels, be unregistered with the
-    // scene, or simply be off-camera, in which case CustomDepth renders nothing
-    // no matter how correct the flag is. Marking everything removes visibility
-    // as a variable, so a still-empty mask points squarely at the pass being
-    // disabled or the elected target being the wrong buffer.
-    //
-    // Slot ids necessarily repeat past 255: the stencil channel is 8 bits and 0
-    // means unmarked. That is fine here because this run is a yes/no test of
-    // whether ANYTHING renders. Turning repeated slots back into distinct
-    // identities is task 9's problem, and the reason a per-frame sidecar table
-    // exists at all.
-    // Refresh the readable-memory map first. This is the SIXTH bug caused by
-    // that snapshot going stale: ReportSample and CountDerivedFrom both refresh,
-    // MarkPrimitives did not, so GetObject rejected most of the array and only
-    // 267 of ~29,000 renderable components were ever marked.
+    // Refresh the readable-memory map first. Sixth bug caused by that snapshot
+    // going stale: GetObject rejects most of the array without it.
     engine.RefreshMemoryMap();
 
-    const bool markAll = limit <= 0;
-    if (!markAll) limit = std::min(limit, 255);
-
-    // Bound the work per pass. This runs inside ProcessEvent on the game thread,
-    // and each mark issues two UFunction calls -- walking 29,000 objects in one
-    // go would stall the engine's dispatch and hitch the game, which is exactly
-    // the "not breaking the game" failure we are trying to avoid. Marking
-    // repeats every 30s as the level streams, so a bounded pass still converges.
-    constexpr int kMaxPerPass = 3000;
-
-    int assigned = 0;
-    int examined = 0;
+    // Walk the WHOLE array. This is read-only CPU work with no engine calls, so
+    // it does not need bounding -- and bounding it to 3000 per pass swept only
+    // 4% of ~350,000 slots, finding 16 primitives where a full sweep found 267.
+    // The low indices are almost all bootstrap objects (Class, Package,
+    // Function); renderable components live much further in.
+    int found = 0;
     const int32_t total = engine.NumObjects();
 
-    for (int32_t i = markResumeIndex_; i < total && (markAll || assigned < limit); ++i) {
-        // Resume where the previous pass stopped, so successive passes sweep the
-        // whole array rather than re-walking the same prefix each time.
-        markResumeIndex_ = i;
-        if (++examined > kMaxPerPass) break;
-
+    for (int32_t i = 0; i < total; ++i) {
         ue4::ObjectRef ref;
         if (!engine.GetObject(i, ref)) continue;
         if (renderableOnly && !IsRenderableComponentClass(ref.className)) continue;
         if (!renderableOnly && !engine.IsDerivedFrom(ref.object, "PrimitiveComponent")) continue;
 
-        // Skip class-default objects: they are templates, not things in the
-        // world, and marking them would affect every future instance.
+        // Class-default objects are templates, not things in the world; marking
+        // one would affect every future instance.
         if (ref.name.rfind("Default__", 0) == 0) continue;
 
-        // Already marked on a previous pass. Re-marking is cheap but would
-        // reassign a different slot to the same object every pass, which would
-        // make identities unstable across frames for no reason.
-        if (alreadyMarked_.count(ref.object)) continue;
+        {
+            std::lock_guard<std::mutex> lock(pendingMutex_);
+            if (alreadyMarked_.count(ref.object)) continue;
+            // Reserve immediately so a later collection pass cannot queue the
+            // same object twice while this batch is still pending.
+            alreadyMarked_.insert(ref.object);
+            pending_.push_back({ref.object, ref.index, ref.serialNumber,
+                                ref.className, ref.name});
+        }
+        ++found;
+    }
 
-        const uint8_t slot = static_cast<uint8_t>((assigned % 255) + 1);  // 0 = unmarked
+    LogInfo("customdepth: collected %d new candidates (%zu pending, %zu marked)",
+            found, pending_.size(), marked_.size());
+    return found;
+}
+
+int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
+    (void)engine;
+    if (!resolved_) return 0;
+
+    std::vector<Candidate> batch;
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        const size_t n = std::min(static_cast<size_t>(limit > 0 ? limit : 0), pending_.size());
+        batch.assign(pending_.end() - static_cast<ptrdiff_t>(n), pending_.end());
+        pending_.resize(pending_.size() - n);
+    }
+    if (batch.empty()) return 0;
+
+    int assigned = 0;
+    for (const Candidate& c : batch) {
+        // Slot ids cycle 1..255; 0 means unmarked. Repeats across more than 255
+        // objects are expected -- turning them back into distinct identities is
+        // task 9's job, via a per-frame sidecar table.
+        const uint8_t slot = static_cast<uint8_t>((nextSlot_++ % 255) + 1);
+
         MarkedPrimitive mp;
-        mp.component = ref.object;
-        mp.objectIndex = ref.index;
-        mp.serialNumber = ref.serialNumber;
-        mp.className = ref.className;
+        mp.component = c.component;
+        mp.objectIndex = c.index;
+        mp.serialNumber = c.serial;
+        mp.className = c.className;
         mp.stencilValue = slot;
 
-        if (!WriteMarked(ref.object, slot, mp)) continue;
+        if (!WriteMarked(c.component, slot, mp)) continue;
 
         marked_.push_back(mp);
         slotTable_[slot] = mp;
-        alreadyMarked_.insert(ref.object);
         ++assigned;
 
-        if (assigned <= 8) {
+        if (marked_.size() <= 6) {
             LogInfo("customdepth:   slot %3u -> %s (%s) idx=%d",
-                    slot, ref.name.c_str(), ref.className.c_str(), ref.index);
+                    slot, c.name.c_str(), c.className.c_str(), c.index);
         }
     }
 
-    LogInfo("customdepth: marked %d primitives "
-            "(attempted %llu, verified %llu, rejected %llu)",
-            assigned, writesAttempted_, writesVerified_, writesRejected_);
-    LogInfo("customdepth: engine setter flipped the bit on %llu/%llu -- %s",
-            setterEffective_, writesAttempted_,
-            setterEffective_ > 0 ? "the UFunction calls ARE taking effect"
-                                 : "the UFunction calls are doing NOTHING");
+    LogInfo("customdepth: marked %d this batch; %zu total, %zu still pending "
+            "(setter effective on %llu/%llu)",
+            assigned, marked_.size(), pending_.size(),
+            setterEffective_, writesAttempted_);
     return assigned;
 }
 

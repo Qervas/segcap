@@ -218,21 +218,8 @@ DWORD WINAPI DiscoverThread(LPVOID) {
             // accident on a run intended as read-only.
             if (g_markCustomDepth) {
                 segcap::LogInfo("customdepth: MARK MODE ENABLED");
-                pe.RunOnGameThread([](segcap::ue4::Engine& e) {
-                    if (!g_marker.Resolve(e)) return;
-                    // Mark EVERYTHING (limit <= 0), slots cycling 1..255.
-                    //
-                    // The first attempt marked 64 by array index and produced an
-                    // empty mask. Those 64 may simply not have been on screen,
-                    // which would make the result meaningless rather than
-                    // informative. Marking everything removes visibility as a
-                    // variable: if the mask is STILL empty, the cause is the
-                    // pass being disabled or the elected buffer being wrong, and
-                    // those are the hypotheses worth spending time on.
-                    const int n = g_marker.MarkPrimitives(e, 0, true);
-                    segcap::LogInfo("customdepth: %d primitives now render into "
-                                    "CustomDepth with stencil ids 1..%d", n, n);
-                });
+                // Resolve on the game thread, then collect off it.
+                pe.RunOnGameThread([](segcap::ue4::Engine& e) { g_marker.Resolve(e); });
             }
         }
     }
@@ -253,8 +240,19 @@ DWORD WINAPI DiscoverThread(LPVOID) {
         g_engine.ReportSample(label);
 
         if (g_markCustomDepth && segcap::ue4::GetProcessEventHook().verified()) {
-            segcap::ue4::GetProcessEventHook().RunOnGameThread(
-                [](segcap::ue4::Engine& e) { g_marker.MarkPrimitives(e, 0, true); });
+            // Collect here, on the discovery thread: it walks ~350,000 slots and
+            // is read-only, so it must not run inside ProcessEvent.
+            g_marker.CollectCandidates(g_engine, true);
+
+            // Then drain in bounded batches on the game thread. Each mark issues
+            // two UFunction calls inside the engine's dispatch, so a large batch
+            // would hitch the game. Several batches per interval converge
+            // quickly without any single one being expensive.
+            for (int b = 0; b < 12; ++b) {
+                segcap::ue4::GetProcessEventHook().RunOnGameThread(
+                    [](segcap::ue4::Engine& e) { g_marker.MarkBatch(e, 250); });
+                Sleep(250);
+            }
         }
     }
     if (g_engine.namesResolved()) g_engine.CountDerivedFrom("PrimitiveComponent");

@@ -24,6 +24,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -52,14 +53,28 @@ public:
 
     bool ready() const { return resolved_; }
 
-    // Marks up to `limit` primitives, assigning stencil values from 1 upward.
-    // Runs on the game thread -- caller must already be there.
+    // Walks the whole object array and records renderable primitives that are
+    // not yet marked. Safe to call from ANY thread -- it only reads.
+    //
+    // Split from marking deliberately. The array walk is cheap CPU work over
+    // ~350,000 slots; the expensive part is the two UFunction calls per match,
+    // which must happen on the game thread. An earlier version bounded the WALK
+    // at 3000 entries per pass, which swept only 4% of the array -- and the low
+    // indices are almost all engine bootstrap objects (Class, Package,
+    // Function), so it found 16 primitives where a full sweep found 267.
     //
     // `renderableOnly` skips collision volumes and editor gizmos. Stray has
     // ~2235 BoxComponents, 577 CapsuleComponents, 613 ArrowComponents and 480
     // BillboardComponents that render nothing at all; marking them would spend
     // stencil slots on objects that produce no pixels, and there are only 255.
-    int MarkPrimitives(ue4::Engine& engine, int limit, bool renderableOnly = true);
+    int CollectCandidates(ue4::Engine& engine, bool renderableOnly = true);
+
+    // Marks up to `limit` pending candidates. MUST run on the game thread.
+    // Bounded because each mark issues two UFunction calls inside ProcessEvent,
+    // and a large batch would stall the engine's dispatch.
+    int MarkBatch(ue4::Engine& engine, int limit);
+
+    size_t pendingCount() const { return pending_.size(); }
 
     // Restores every marked primitive to its recorded original bytes.
     int RestoreAll();
@@ -92,10 +107,20 @@ private:
     // would reassign a different slot to the same object, making identities
     // unstable across frames for no reason.
     std::unordered_set<void*> alreadyMarked_;
-    // Where the next bounded pass resumes. Each pass is capped so it cannot
-    // stall the game thread, and successive passes sweep the whole array rather
-    // than re-walking the same prefix.
-    int32_t markResumeIndex_ = 0;
+
+    // Candidates found by CollectCandidates, waiting to be marked on the game
+    // thread. Guarded because collection runs off-thread from marking.
+    struct Candidate {
+        void* component;
+        int32_t index;
+        int32_t serial;
+        std::string className;
+        std::string name;
+    };
+    std::vector<Candidate> pending_;
+    std::mutex pendingMutex_;
+    // Monotonic slot counter. Wraps at 255 by design -- see MarkBatch.
+    uint32_t nextSlot_ = 0;
 
     uint64_t writesAttempted_ = 0;
     uint64_t writesVerified_ = 0;
