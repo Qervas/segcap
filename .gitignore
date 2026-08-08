@@ -24,3 +24,6 @@ recordings/
 .vscode/
 *.user
 Thumbs.db
+
+# Mask dumps
+*.pgm

@@ -52,6 +52,7 @@ set_target_properties(injector PROPERTIES
 add_library(segcap SHARED
   src/segcap/dllmain.cpp
   src/segcap/hooks.cpp
+  src/segcap/readback.cpp
 )
 target_link_libraries(segcap PRIVATE minhook d3d12 dxgi)
 set_target_properties(segcap PROPERTIES

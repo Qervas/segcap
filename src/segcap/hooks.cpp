@@ -500,21 +500,86 @@ std::vector<TargetFingerprint> Hooks::SnapshotTargets() {
     return out;
 }
 
+// Writes the stencil plane as a binary PGM. Chosen because it is trivially
+// readable by any validator without a decoder, and because a mask is exactly a
+// single-channel 8-bit image -- which is also a reminder that the channel is 8
+// bits and therefore holds a per-frame slot, not an identity.
+void Hooks::OnMaskReady(const MaskFrame& frame) {
+    // A handful of frames is enough to validate; dumping every frame would
+    // write gigabytes and stall on disk I/O from the render thread.
+    if (masksDumped_ >= 3) return;
+
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, _TRUNCATE, L"segcap_mask_%llu.pgm", frame.frameIndex);
+
+    std::FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"wb") != 0 || !f) return;
+
+    std::fprintf(f, "P5\n%u %u\n255\n", frame.width, frame.height);
+    // Row by row using rowPitch, not width: the readback pitch is padded to 256
+    // bytes, so treating it as tightly packed would shear the image.
+    for (uint32_t y = 0; y < frame.height; ++y) {
+        std::fwrite(frame.data + static_cast<size_t>(y) * frame.rowPitch, 1, frame.width, f);
+    }
+    std::fclose(f);
+
+    // Report the distinct values present: for the fixture these must be exactly
+    // {0} plus 1..16, which is the whole point of having known ground truth.
+    bool seen[256] = {};
+    for (uint32_t y = 0; y < frame.height; ++y) {
+        const uint8_t* row = frame.data + static_cast<size_t>(y) * frame.rowPitch;
+        for (uint32_t x = 0; x < frame.width; ++x) seen[row[x]] = true;
+    }
+    char values[512] = {};
+    size_t used = 0;
+    for (int v = 0; v < 256 && used < sizeof(values) - 8; ++v) {
+        if (!seen[v]) continue;
+        used += static_cast<size_t>(
+            _snprintf_s(values + used, sizeof(values) - used, _TRUNCATE, "%d ", v));
+    }
+    LogInfo("mask frame %llu dumped (%ux%u pitch=%u); distinct stencil values: %s",
+            frame.frameIndex, frame.width, frame.height, frame.rowPitch, values);
+    ++masksDumped_;
+}
+
 void Hooks::OnPresent() {
     ++frameIndex_;
 
-    // Report periodically rather than every frame: this runs on the render
-    // thread, and the log flushes each line.
-    if (frameIndex_ % 300 != 1) {
+    // Readback runs every frame; only the logging is periodic. Draining first
+    // means a copy issued on frame N is collected here on frame N+2 or later,
+    // which is what keeps the render thread off the GPU's critical path.
+    readback_.Drain([this](const MaskFrame& f) { OnMaskReady(f); });
+
+    // Election runs every frame too. It is cheap (a handful of targets) and the
+    // elected target can legitimately change -- resolution changes, or a pass
+    // that only appears in some frames. Electing only on logging frames would
+    // mean reading a stale or never-set target for 299 frames out of 300.
+    const std::vector<TargetFingerprint> snapshot = SnapshotTargets();
+    const std::vector<ElectionScore> ranked = ScoreTargets(snapshot);
+    ID3D12Resource* const winner =
+        (!ranked.empty() && ranked.front().score > 0) ? ranked.front().resource : nullptr;
+    const bool electionChanged = (winner != electedTarget_);
+    electedTarget_ = winner;
+
+    if (electedTarget_ && device_ && queue_) {
+        if (readback_.Prepare(device_, electedTarget_)) {
+            readback_.Enqueue(queue_, electedTarget_, StateOf(electedTarget_), frameIndex_);
+        }
+    }
+
+    // Log periodically, but always on an election change: a target switching
+    // mid-session is exactly the event worth seeing in the log.
+    if (frameIndex_ % 300 != 1 && !electionChanged) {
         std::lock_guard<std::mutex> lock(mutex_);
         targets_.clear();
         bindOrdinal_ = 0;
         return;
     }
 
-    std::vector<TargetFingerprint> snapshot = SnapshotTargets();
     LogInfo("--- frame %llu: %zu distinct targets observed, %llu descriptor misses ---",
             frameIndex_, snapshot.size(), descriptorMisses_);
+    LogInfo("    readback submitted=%llu delivered=%llu dropped=%llu",
+            readback_.submitted(), readback_.delivered(), readback_.dropped());
 
     for (const TargetFingerprint& t : snapshot) {
         // Only depth-stencil-capable targets matter for the mask route; logging
@@ -528,7 +593,6 @@ void Hooks::OnPresent() {
 
     // The full score table is logged, not just the winner. A wrong election is
     // only debuggable if the runner-up and the reason it lost are visible.
-    const std::vector<ElectionScore> ranked = ScoreTargets(snapshot);
     LogInfo("  election:");
     for (const ElectionScore& e : ranked) {
         LogInfo("    %+5d %p  %s", e.score, static_cast<void*>(e.resource), e.reason);

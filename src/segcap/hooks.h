@@ -29,6 +29,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "readback.h"
+
 namespace segcap {
 
 // A render target or depth target observed being bound, described only by
@@ -132,6 +134,7 @@ private:
     void OnPresent();
     void NoteBind(ID3D12Resource* res, bool asDepth);
     void NoteClear(ID3D12Resource* res);
+    void OnMaskReady(const MaskFrame& frame);
 
     // ---- originals -------------------------------------------------------
     using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, UINT, UINT);
@@ -184,6 +187,10 @@ private:
     // we were injected. A high number means our picture of the frame is
     // incomplete and any election decision is suspect.
     uint64_t descriptorMisses_ = 0;
+
+    Readback readback_;
+    ID3D12Resource* electedTarget_ = nullptr;
+    uint32_t masksDumped_ = 0;
 };
 
 }  // namespace segcap

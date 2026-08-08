@@ -30,10 +30,13 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -58,6 +61,10 @@ struct Options {
     UINT frames = 0;   // 0 = until the window is closed
     UINT width = 1280;
     UINT height = 720;
+    // Vsync is on by default so the window looks normal, but it caps frame rate
+    // and would mask any cost the capture layer adds. Timing runs must disable
+    // it, otherwise "no measurable overhead" only means "both were 60fps".
+    bool vsync = true;
 };
 
 void ThrowIfFailed(HRESULT hr, const char* what) {
@@ -450,6 +457,13 @@ private:
     void MainLoop() {
         MSG msg = {};
         UINT rendered = 0;
+
+        LARGE_INTEGER freq = {}, prev = {};
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&prev);
+        std::vector<double> frameMs;
+        if (opt_.frames) frameMs.reserve(opt_.frames);
+
         while (msg.message != WM_QUIT) {
             if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
                 TranslateMessage(&msg);
@@ -458,12 +472,39 @@ private:
             }
             RenderFrame();
             ++rendered;
-            if (opt_.frames && rendered >= opt_.frames) {
-                std::printf("[testapp] rendered %u frames, exiting\n", rendered);
-                std::fflush(stdout);
-                break;
-            }
+
+            LARGE_INTEGER now = {};
+            QueryPerformanceCounter(&now);
+            frameMs.push_back(1000.0 * static_cast<double>(now.QuadPart - prev.QuadPart) /
+                              static_cast<double>(freq.QuadPart));
+            prev = now;
+
+            if (opt_.frames && rendered >= opt_.frames) break;
         }
+
+        ReportTiming(frameMs);
+    }
+
+    // Reports percentiles, not just the mean. A capture layer that stalls the
+    // render thread every Nth frame can leave the mean almost untouched while
+    // producing visible hitching -- p99 and max are where that shows up.
+    static void ReportTiming(std::vector<double> ms) {
+        if (ms.size() < 20) {
+            std::printf("[testapp] too few frames for timing\n");
+            return;
+        }
+        // Discard the first frames: device warm-up and shader compilation are
+        // not what we are measuring.
+        ms.erase(ms.begin(), ms.begin() + 10);
+        std::sort(ms.begin(), ms.end());
+
+        double sum = 0.0;
+        for (double v : ms) sum += v;
+        const auto pct = [&](double p) { return ms[static_cast<size_t>(p * (ms.size() - 1))]; };
+
+        std::printf("[testapp] frames=%zu mean=%.3fms p50=%.3f p95=%.3f p99=%.3f max=%.3f\n",
+                    ms.size(), sum / ms.size(), pct(0.50), pct(0.95), pct(0.99), ms.back());
+        std::fflush(stdout);
     }
 
     void RenderFrame() {
@@ -574,7 +615,7 @@ private:
         ID3D12CommandList* lists[] = {cmdList_.Get()};
         queue_->ExecuteCommandLists(1, lists);
 
-        ThrowIfFailed(swapChain_->Present(1, 0), "Present");
+        ThrowIfFailed(swapChain_->Present(opt_.vsync ? 1 : 0, 0), "Present");
         MoveToNextFrame();
     }
 
@@ -650,6 +691,7 @@ int main(int argc, char** argv) {
         if (a == "--frames") opt.frames = next();
         else if (a == "--width") opt.width = next();
         else if (a == "--height") opt.height = next();
+        else if (a == "--novsync") opt.vsync = false;
         else if (a == "--help") {
             std::printf("usage: %s [--frames N] [--width W] [--height H]\n",
                         argv[0]);
