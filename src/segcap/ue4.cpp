@@ -2,6 +2,10 @@
 
 #include <psapi.h>
 
+#include <algorithm>
+#include <cstring>
+#include <utility>
+
 #include "log.h"
 
 namespace segcap {
@@ -228,16 +232,112 @@ bool Engine::GetObject(int32_t index, ObjectRef& out) const {
     return true;
 }
 
-std::string Engine::NameToString(uint32_t /*comparisonIndex*/) const {
-    // Deliberately unimplemented for now rather than guessed at. FName storage
-    // changed shape in 4.23 (TNameEntryArray -> FNamePool) and the block/offset
-    // encoding differs again by minor version. Returning a fabricated string
-    // here would produce a mask stream whose labels look right and are wrong,
-    // which is worse than having no labels.
-    //
-    // Object discovery does not depend on this; names are needed for the sidecar
-    // table, and are the next piece of work.
-    return std::string();
+// Decodes an FNameEntry at `entry` into text. Returns false if the header does
+// not describe a plausible name, which is also how candidate validation works.
+static bool DecodeNameEntry(const uint8_t* entry, std::string& out) {
+    if (!IsReadable(entry, 2)) return false;
+    const uint16_t header = *reinterpret_cast<const uint16_t*>(entry);
+    const uint32_t len = header >> kNameLenShift;
+    const bool wide = (header & 1) != 0;
+
+    // FName length is capped at 1024 by the engine; a header claiming more is
+    // not a name.
+    if (len == 0 || len > 1024) return false;
+
+    const size_t bytes = wide ? len * 2 : len;
+    if (!IsReadable(entry + 2, bytes)) return false;
+
+    out.clear();
+    out.reserve(len);
+    if (wide) {
+        const auto* w = reinterpret_cast<const wchar_t*>(entry + 2);
+        for (uint32_t i = 0; i < len; ++i) out.push_back(static_cast<char>(w[i] & 0x7F));
+    } else {
+        const auto* a = reinterpret_cast<const char*>(entry + 2);
+        for (uint32_t i = 0; i < len; ++i) {
+            const char c = a[i];
+            // Names are identifiers and paths; a control byte means we are not
+            // looking at a name.
+            if (static_cast<unsigned char>(c) < 0x20) return false;
+            out.push_back(c);
+        }
+    }
+    return true;
+}
+
+bool Engine::FindNamePool() {
+    // The signature here is unusually strong: FName id 0 is always NAME_None,
+    // which lives at block 0 offset 0. So we look for a pointer whose target
+    // decodes to a 4-character narrow name spelling exactly "None". Random data
+    // passing that is vanishingly unlikely, and unlike a byte-pattern signature
+    // it is a property of the engine's semantics rather than of one build.
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(moduleBase_);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(moduleBase_ + dos->e_lfanew);
+    auto* section = IMAGE_FIRST_SECTION(nt);
+
+    const ULONGLONG started = GetTickCount64();
+
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        const bool writable = (section->Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+        const bool executable = (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+        if (!writable || executable) continue;
+
+        const uintptr_t begin = moduleBase_ + section->VirtualAddress;
+        const uintptr_t end = begin + section->Misc.VirtualSize - sizeof(void*);
+
+        for (uintptr_t addr = begin; addr < end; addr += sizeof(void*)) {
+            if (!IsReadable(reinterpret_cast<void*>(addr), sizeof(void*))) continue;
+            auto* block0 = *reinterpret_cast<uint8_t**>(addr);
+            if (!IsReadable(block0, 8)) continue;
+
+            std::string name;
+            if (!DecodeNameEntry(block0, name)) continue;
+            if (name != "None") continue;
+
+            // Corroborate before accepting: the next few blocks should also be
+            // readable pointers holding decodable names. A lone "None" could be
+            // a coincidence; a whole table of names is not.
+            auto** blocks = reinterpret_cast<uint8_t**>(addr);
+            int corroborated = 0;
+            for (int b = 1; b < 6; ++b) {
+                if (!IsReadable(&blocks[b], sizeof(void*))) break;
+                if (!IsReadable(blocks[b], 8)) break;
+                std::string probe;
+                if (DecodeNameEntry(blocks[b], probe)) ++corroborated;
+            }
+            if (corroborated < 2) continue;
+
+            nameBlocks_ = blocks;
+            LogInfo("ue4: FOUND FName blocks at %p (FNamePool ~%p) after %llums",
+                    static_cast<void*>(blocks),
+                    reinterpret_cast<void*>(addr - kNameBlocksOffsetInPool),
+                    GetTickCount64() - started);
+            LogInfo("ue4:   block0[0]=\"%s\", %d further blocks corroborated",
+                    name.c_str(), corroborated);
+            return true;
+        }
+    }
+
+    LogError("ue4: FNamePool not found (%llums)", GetTickCount64() - started);
+    return false;
+}
+
+std::string Engine::NameToString(uint32_t comparisonIndex) const {
+    if (!nameBlocks_) return std::string();
+
+    const uint32_t block = comparisonIndex >> kNameBlockOffsetBits;
+    const uint32_t offset = comparisonIndex & kNameBlockOffsetMask;
+    if (block >= 8192) return std::string();
+
+    if (!IsReadable(&nameBlocks_[block], sizeof(void*))) return std::string();
+    const uint8_t* base = nameBlocks_[block];
+    if (!base) return std::string();
+
+    std::string out;
+    if (!DecodeNameEntry(base + static_cast<size_t>(offset) * kNameEntryStride, out)) {
+        return std::string();
+    }
+    return out;
 }
 
 bool Engine::Discover() {
@@ -280,17 +380,47 @@ bool Engine::Discover() {
 
     if (!FindObjectArray()) return false;
 
-    // Report a sample so the discovery can be sanity-checked by eye rather than
-    // trusted. Names are empty until FName resolution lands; class pointers and
-    // indices are still meaningful.
+    // Name resolution is not fatal if it fails: object discovery still works,
+    // and the failure is far more useful reported than papered over.
+    if (!FindNamePool()) {
+        LogWarn("ue4: continuing without name resolution");
+    }
+
+    // Report a sample so discovery can be checked by eye rather than trusted.
     int reported = 0;
-    for (int32_t i = 0; i < objects_->NumElements && reported < 8; ++i) {
+    for (int32_t i = 0; i < objects_->NumElements && reported < 16; ++i) {
         ObjectRef ref;
         if (!GetObject(i, ref)) continue;
-        LogInfo("ue4:   [%d] obj=%p serial=%d nameIdx=%u", ref.index, ref.object,
-                ref.serialNumber, ref.nameIndex);
+        LogInfo("ue4:   [%d] %s  (class %s)  serial=%d", ref.index,
+                ref.name.empty() ? "<unresolved>" : ref.name.c_str(),
+                ref.className.empty() ? "?" : ref.className.c_str(), ref.serialNumber);
         ++reported;
     }
+
+    // Class histogram over a sample: a far better correctness check than any
+    // single name. If the discovery were wrong we would see garbage, not a
+    // plausible distribution of Unreal class names.
+    if (nameBlocks_) {
+        std::vector<std::pair<std::string, int>> counts;
+        const int32_t stride = objects_->NumElements > 20000 ? objects_->NumElements / 20000 : 1;
+        for (int32_t i = 0; i < objects_->NumElements; i += stride) {
+            ObjectRef ref;
+            if (!GetObject(i, ref) || ref.className.empty()) continue;
+            bool found = false;
+            for (auto& c : counts) {
+                if (c.first == ref.className) { ++c.second; found = true; break; }
+            }
+            if (!found && counts.size() < 512) counts.emplace_back(ref.className, 1);
+        }
+        std::sort(counts.begin(), counts.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        LogInfo("ue4: most common classes in a sample of %d objects:",
+                objects_->NumElements / stride);
+        for (size_t i = 0; i < counts.size() && i < 12; ++i) {
+            LogInfo("ue4:   %6d  %s", counts[i].second, counts[i].first.c_str());
+        }
+    }
+
     LogInfo("ue4: discovery complete, %d live objects", NumObjects());
     return true;
 }

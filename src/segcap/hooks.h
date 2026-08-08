@@ -55,6 +55,12 @@ struct TargetFingerprint {
     // buffers that existed for 25 seconds and scored identically on every
     // per-frame signal.
     uint32_t framesSeen = 0;
+    // Frame index this target was last observed in. Election is made from
+    // accumulated evidence, not from one frame's observations: a target that
+    // simply is not bound or cleared during a given frame must not vanish from
+    // consideration, or candidates take turns disappearing and the election
+    // flaps between them.
+    uint64_t lastSeenFrame = 0;
 };
 
 // Result of scoring one candidate. The reason string exists so that a wrong
@@ -185,9 +191,12 @@ private:
     std::mutex mutex_;
     std::unordered_map<SIZE_T, ID3D12Resource*> descriptorToResource_;
     std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> resourceState_;
+    // Observations for the frame currently being built. Cleared every Present.
     std::unordered_map<ID3D12Resource*, TargetFingerprint> targets_;
-    // Survives the per-frame clear of targets_, so persistence can be scored.
-    std::unordered_map<ID3D12Resource*, uint32_t> framesSeen_;
+    // Accumulated evidence across the session. This is what the election reads.
+    // Entries not seen for a long time are pruned so destroyed resources cannot
+    // win forever on stale persistence.
+    std::unordered_map<ID3D12Resource*, TargetFingerprint> evidence_;
 
     ID3D12Device* device_ = nullptr;
     ID3D12CommandQueue* queue_ = nullptr;

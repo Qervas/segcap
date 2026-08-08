@@ -43,6 +43,27 @@ namespace ue4 {
 // strong invariant for validating a candidate array.
 constexpr int32_t kElementsPerChunk = 64 * 1024;
 
+// FName storage, UE 4.23+ (FNamePool). An FNameEntryId encodes a block index in
+// the high bits and a byte offset in the low bits.
+//
+//   class FNameEntryAllocator {
+//       FRWLock Lock;              // +0x00, SRWLOCK is 8 bytes
+//       uint32  CurrentBlock;      // +0x08
+//       uint32  CurrentByteCursor; // +0x0C
+//       uint8*  Blocks[8192];      // +0x10   <- what we search for
+//   };
+//
+// Entries are aligned to 2 bytes, so the offset field is scaled by the stride.
+constexpr uint32_t kNameBlockOffsetBits = 16;
+constexpr uint32_t kNameBlockOffsetMask = (1u << kNameBlockOffsetBits) - 1;
+constexpr uint32_t kNameEntryStride = 2;
+constexpr size_t kNameBlocksOffsetInPool = 0x10;
+
+// struct FNameEntryHeader { uint16 bIsWide:1; uint16 LowercaseProbeHash:5;
+//                           uint16 Len:10; };
+// MSVC packs bitfields LSB-first, so Len occupies the top 10 bits.
+constexpr uint32_t kNameLenShift = 6;
+
 // struct FUObjectItem { UObject* Object; int32 Flags; int32 ClusterRootIndex;
 //                       int32 SerialNumber; /* 4 bytes padding */ };
 struct FUObjectItem {

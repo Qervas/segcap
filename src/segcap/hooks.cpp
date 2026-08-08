@@ -539,19 +539,52 @@ void Hooks::NoteClear(ID3D12Resource* res) {
     ++t.clearCount;
 }
 
+// Folds this frame's observations into the accumulated evidence and returns the
+// evidence, not the frame.
+//
+// Electing from a single frame was the cause of residual flapping even after
+// persistence and incumbency were added: a candidate not bound or cleared in a
+// given frame is simply absent from that frame's map, so it cannot be elected
+// no matter how good it is. Two candidates alternating their absence trade the
+// election back and forth. Accumulated evidence removes the whole failure mode.
 std::vector<TargetFingerprint> Hooks::SnapshotTargets() {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<TargetFingerprint> out;
-    out.reserve(targets_.size());
+
     for (auto& kv : targets_) {
-        // Accumulate lifetime observation count before handing the snapshot to
-        // the scorer. Only depth-stencil candidates are worth tracking; counting
-        // every colour target would grow this map without bound.
-        if (HasStencilPlane(kv.second.format)) {
-            kv.second.framesSeen = ++framesSeen_[kv.first];
+        const TargetFingerprint& fresh = kv.second;
+        TargetFingerprint& acc = evidence_[kv.first];
+        if (acc.resource == nullptr) {
+            acc = fresh;
+            acc.framesSeen = 0;
+        } else {
+            // Carry the latest per-frame counts forward; the scoring thresholds
+            // are expressed per frame, so accumulating them would misclassify a
+            // long-lived CustomDepth pass as the most-bound target.
+            acc.bindCount = fresh.bindCount;
+            acc.clearCount = fresh.clearCount;
+            acc.firstBindOrdinal = fresh.firstBindOrdinal;
+            acc.everBoundAsDepth = acc.everBoundAsDepth || fresh.everBoundAsDepth;
         }
-        out.push_back(kv.second);
+        ++acc.framesSeen;
+        acc.lastSeenFrame = frameIndex_;
     }
+
+    // Prune resources that have gone quiet. Without this, a destroyed
+    // loading-screen buffer would keep winning on accumulated persistence long
+    // after it stopped existing -- and its pointer could be reused by an
+    // unrelated allocation.
+    constexpr uint64_t kStaleAfterFrames = 600;
+    for (auto it = evidence_.begin(); it != evidence_.end();) {
+        if (frameIndex_ > it->second.lastSeenFrame + kStaleAfterFrames) {
+            it = evidence_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    std::vector<TargetFingerprint> out;
+    out.reserve(evidence_.size());
+    for (const auto& kv : evidence_) out.push_back(kv.second);
     return out;
 }
 
