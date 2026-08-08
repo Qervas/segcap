@@ -166,4 +166,9 @@ def main():
     print("\nwrote %s" % out_path)
 
 
-main()
+# Guarded so other tools can import palette() and read_pgm() without this
+# running its argument parser -- make_demo.py imports both, and an unguarded
+# main() made it fail with "unrecognized arguments" from a completely different
+# script's parser.
+if __name__ == "__main__":
+    main()
