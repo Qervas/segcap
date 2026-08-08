@@ -149,7 +149,8 @@ private:
                                                          UINT numRects,
                                                          const D3D12_RECT* rects);
 
-    void OnPresent();
+    void OnPresent(IDXGISwapChain3* swapChain);
+    void OnColourReady(const MaskFrame& frame);
     void NoteBind(ID3D12Resource* res, bool asDepth);
     void NoteClear(ID3D12Resource* res);
     void OnMaskReady(const MaskFrame& frame);
@@ -212,6 +213,12 @@ private:
     uint64_t descriptorMisses_ = 0;
 
     Readback readback_;
+    // A second ring for the colour backbuffer. Captured in the SAME Present call
+    // as the mask and stamped with the same frame index, so the two streams
+    // share a frame grid by construction -- no timestamp matching, no
+    // resampling, and no way for them to drift apart.
+    Readback colourRing_;
+    uint32_t colourDumped_ = 0;
     ID3D12Resource* electedTarget_ = nullptr;
     uint32_t masksDumped_ = 0;
     // Counted separately so a few baseline (all-zero) captures for the task-11

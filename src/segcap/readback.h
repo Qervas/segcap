@@ -40,6 +40,8 @@ struct MaskFrame {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t rowPitch = 0;
+    uint32_t bytesPerPixel = 1;   // 1 for a stencil plane, 4 for a colour target
+    uint32_t format = 0;          // DXGI_FORMAT, so callers can decode correctly
     const uint8_t* data = nullptr;
 };
 
@@ -52,7 +54,14 @@ public:
     // Prepares ring resources for a specific target. Safe to call repeatedly;
     // reinitialises if the target or its dimensions changed (resolution change
     // in the host would otherwise silently produce garbage).
-    bool Prepare(ID3D12Device* device, ID3D12Resource* target);
+    //
+    // `planeSlice` selects the subresource: 1 for the stencil plane of a
+    // depth-stencil resource, 0 for a plain colour target such as the
+    // backbuffer. Parameterised because the same ring machinery serves both --
+    // and capturing the colour frame in the SAME Present call as the mask is
+    // what keeps them on one frame grid by construction, rather than requiring
+    // timestamp matching afterwards.
+    bool Prepare(ID3D12Device* device, ID3D12Resource* target, uint32_t planeSlice = 1);
 
     // Records and submits a copy of the current stencil plane. Returns false if
     // no ring slot is free, which means the GPU is more than kRingDepth frames
@@ -90,6 +99,7 @@ private:
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint_ = {};
     uint32_t width_ = 0;
     uint32_t height_ = 0;
+    uint32_t planeSlice_ = 1;
     uint64_t requiredSize_ = 0;
 
     uint64_t nextFenceValue_ = 1;

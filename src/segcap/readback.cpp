@@ -21,11 +21,12 @@ void SafeRelease(T*& p) {
 
 }  // namespace
 
-bool Readback::Prepare(ID3D12Device* device, ID3D12Resource* target) {
+bool Readback::Prepare(ID3D12Device* device, ID3D12Resource* target, uint32_t planeSlice) {
     if (!device || !target) return false;
 
     const D3D12_RESOURCE_DESC desc = target->GetDesc();
-    if (preparedFor_ == target && width_ == desc.Width && height_ == desc.Height) {
+    if (preparedFor_ == target && width_ == desc.Width && height_ == desc.Height &&
+        planeSlice_ == planeSlice) {
         return true;  // already set up for exactly this target
     }
 
@@ -33,6 +34,7 @@ bool Readback::Prepare(ID3D12Device* device, ID3D12Resource* target) {
     ReleaseResources();
     device_ = device;
     preparedFor_ = target;
+    planeSlice_ = planeSlice;
     width_ = static_cast<uint32_t>(desc.Width);
     height_ = desc.Height;
 
@@ -42,7 +44,7 @@ bool Readback::Prepare(ID3D12Device* device, ID3D12Resource* target) {
     // getting either wrong yields a sheared or garbage mask.
     UINT numRows = 0;
     UINT64 rowSizeBytes = 0;
-    device->GetCopyableFootprints(&desc, kStencilPlaneSubresource, 1, 0, &footprint_,
+    device->GetCopyableFootprints(&desc, planeSlice, 1, 0, &footprint_,
                                   &numRows, &rowSizeBytes, &requiredSize_);
 
     LogInfo("readback: target %ux%u, stencil plane footprint fmt=%d pitch=%u rows=%u bytes=%llu",
@@ -137,7 +139,7 @@ bool Readback::Enqueue(ID3D12CommandQueue* queue, ID3D12Resource* target,
     D3D12_TEXTURE_COPY_LOCATION src = {};
     src.pResource = target;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.SubresourceIndex = kStencilPlaneSubresource;
+    src.SubresourceIndex = planeSlice_;
 
     D3D12_TEXTURE_COPY_LOCATION dst = {};
     dst.pResource = s.buffer;
@@ -192,6 +194,11 @@ void Readback::Drain(const MaskCallback& onMask) {
             frame.width = width_;
             frame.height = height_;
             frame.rowPitch = footprint_.Footprint.RowPitch;
+            frame.format = static_cast<uint32_t>(footprint_.Footprint.Format);
+            // R8_UINT stencil planes are 1 byte; a colour backbuffer is 4.
+            frame.bytesPerPixel =
+                (footprint_.Footprint.Format == DXGI_FORMAT_R8_UINT ||
+                 footprint_.Footprint.Format == DXGI_FORMAT_R8_TYPELESS) ? 1u : 4u;
             frame.data = static_cast<const uint8_t*>(mapped);
             if (onMask) onMask(frame);
             ++delivered_;

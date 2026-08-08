@@ -370,7 +370,7 @@ HRESULT STDMETHODCALLTYPE Hooks::Present_(IDXGISwapChain3* self, UINT sync, UINT
                     FormatName(desc.BufferDesc.Format));
         }
     }
-    h.OnPresent();
+    h.OnPresent(self);
     return h.origPresent_(self, sync, flags);
 }
 
@@ -702,7 +702,57 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     ++masksDumped_;
 }
 
-void Hooks::OnPresent() {
+// Writes the colour backbuffer as a binary PPM (P6).
+//
+// PPM rather than PNG because the DLL has no image encoder and adding one to
+// code that runs inside someone else's process is not worth it. The validator
+// converts. Frames are named by the same monotonic index as the masks, which is
+// what lets a mask and its frame be paired by filename alone.
+void Hooks::OnColourReady(const MaskFrame& frame) {
+    if (!recording_ || colourDumped_ >= 6) return;
+    ++colourDumped_;
+
+    wchar_t dllPath[MAX_PATH] = {};
+    GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), dllPath, MAX_PATH);
+    std::wstring dir(dllPath);
+    const size_t slash = dir.find_last_of(L"\\/");
+    dir = (slash == std::wstring::npos) ? L"." : dir.substr(0, slash);
+
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, _TRUNCATE, L"%ls\\segcap_frame_%llu.ppm", dir.c_str(),
+                 frame.frameIndex);
+
+    std::FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"wb") != 0 || !f) return;
+    std::fprintf(f, "P6\n%u %u\n255\n", frame.width, frame.height);
+
+    std::vector<uint8_t> row(static_cast<size_t>(frame.width) * 3);
+    for (uint32_t y = 0; y < frame.height; ++y) {
+        const uint8_t* src = frame.data + static_cast<size_t>(y) * frame.rowPitch;
+        for (uint32_t x = 0; x < frame.width; ++x) {
+            const uint32_t px = *reinterpret_cast<const uint32_t*>(src + x * 4);
+            if (frame.format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+                // 10 bits per channel packed into 32; shift down to 8. Stray
+                // renders to an HDR10 backbuffer, so a naive byte read would
+                // give channel-swapped garbage.
+                row[x * 3 + 0] = static_cast<uint8_t>(((px >> 0) & 0x3FF) >> 2);
+                row[x * 3 + 1] = static_cast<uint8_t>(((px >> 10) & 0x3FF) >> 2);
+                row[x * 3 + 2] = static_cast<uint8_t>(((px >> 20) & 0x3FF) >> 2);
+            } else {
+                // Assume 8-bit BGRA/RGBA.
+                row[x * 3 + 0] = static_cast<uint8_t>((px >> 16) & 0xFF);
+                row[x * 3 + 1] = static_cast<uint8_t>((px >> 8) & 0xFF);
+                row[x * 3 + 2] = static_cast<uint8_t>((px >> 0) & 0xFF);
+            }
+        }
+        std::fwrite(row.data(), 1, row.size(), f);
+    }
+    std::fclose(f);
+    LogInfo("colour frame %llu dumped (%ux%u fmt=%u)", frame.frameIndex, frame.width,
+            frame.height, frame.format);
+}
+
+void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     ++frameIndex_;
 
     // Readback runs every frame; only the logging is periodic. Draining first
@@ -726,9 +776,26 @@ void Hooks::OnPresent() {
     // title, where a wrong shadowed state would show up as a GPU hang rather
     // than an error message. Observe first, then act.
     if (!censusOnly_ && electedTarget_ && device_ && queue_) {
-        if (readback_.Prepare(device_, electedTarget_)) {
+        if (readback_.Prepare(device_, electedTarget_, 1 /*stencil plane*/)) {
             readback_.Enqueue(queue_, electedTarget_, StateOf(electedTarget_), frameIndex_);
         }
+
+        // Colour backbuffer, same frame, same index. Capturing both here is the
+        // whole reason the streams cannot drift: there is no separate video
+        // recorder with its own clock to reconcile afterwards.
+        if (swapChain) {
+            ID3D12Resource* back = nullptr;
+            const UINT idx = swapChain->GetCurrentBackBufferIndex();
+            if (SUCCEEDED(swapChain->GetBuffer(idx, IID_PPV_ARGS(&back))) && back) {
+                if (colourRing_.Prepare(device_, back, 0 /*colour, not a plane*/)) {
+                    // At Present time the game has transitioned the backbuffer to
+                    // PRESENT (0). Use the shadowed state rather than assuming.
+                    colourRing_.Enqueue(queue_, back, StateOf(back), frameIndex_);
+                }
+                back->Release();
+            }
+        }
+        colourRing_.Drain([this](const MaskFrame& f) { OnColourReady(f); });
     }
 
     // Log periodically, but always on an election change: a target switching
