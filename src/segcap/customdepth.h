@@ -30,6 +30,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "identity.h"
 #include "ue4.h"
 
 namespace segcap {
@@ -76,6 +77,13 @@ public:
 
     size_t pendingCount() const { return pending_.size(); }
 
+    // Thread-safe snapshot of the current slot table, for emitting alongside a
+    // captured mask. Marking runs on the game thread; mask dumps happen on the
+    // render thread, so the table cannot simply be read across.
+    FrameSidecar SnapshotSidecar(uint64_t frameIndex, uint32_t w, uint32_t h) const;
+
+    IdentityRegistry& identity() { return identity_; }
+
     // Restores every marked primitive to its recorded original bytes.
     int RestoreAll();
 
@@ -118,9 +126,16 @@ private:
         std::string name;
     };
     std::vector<Candidate> pending_;
-    std::mutex pendingMutex_;
-    // Monotonic slot counter. Wraps at 255 by design -- see MarkBatch.
-    uint32_t nextSlot_ = 0;
+    mutable std::mutex pendingMutex_;
+
+    // Slots are LEASED through the registry rather than handed out by a counter.
+    // A counter gives every object a different number each pass and reuses
+    // numbers with no record of what they meant -- the mask becomes undecodable.
+    // The registry keeps (pointer, serial) -> stable id, so a repeated slot is
+    // still resolvable through the frame's sidecar.
+    IdentityRegistry identity_;
+    mutable std::mutex identityMutex_;
+    uint64_t markPass_ = 0;
 
     uint64_t writesAttempted_ = 0;
     uint64_t writesVerified_ = 0;
@@ -130,5 +145,13 @@ private:
     // which need entirely different fixes.
     uint64_t setterEffective_ = 0;
 };
+
+// The process-wide marker instance, defined in dllmain.cpp.
+//
+// Declared here rather than with a block-scope `extern` at the use site: a
+// block-scope extern resolves against the GLOBAL namespace, so it silently
+// referred to ::GetMarker and failed at link time with a mangled name that took
+// a moment to read.
+CustomDepthMarker& GetMarker();
 
 }  // namespace segcap

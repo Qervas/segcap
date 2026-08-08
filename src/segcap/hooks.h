@@ -151,6 +151,7 @@ private:
 
     void OnPresent(IDXGISwapChain3* swapChain);
     void OnColourReady(const MaskFrame& frame);
+    void WriteSidecar(const MaskFrame& frame) const;
     void NoteBind(ID3D12Resource* res, bool asDepth);
     void NoteClear(ID3D12Resource* res);
     void OnMaskReady(const MaskFrame& frame);

@@ -10,6 +10,7 @@
 // just to find where our own DLL lives.
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
+#include "customdepth.h"
 #include "log.h"
 
 namespace segcap {
@@ -699,6 +700,11 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     }
     LogInfo("mask frame %llu dumped (%ux%u pitch=%u); distinct stencil values: %s",
             frame.frameIndex, frame.width, frame.height, frame.rowPitch, values);
+
+    // The sidecar is what makes the mask decodable. Written for every dumped
+    // mask, never separately, so a mask file cannot exist without the table
+    // that says what its slot numbers mean.
+    WriteSidecar(frame);
     ++masksDumped_;
 }
 
@@ -750,6 +756,47 @@ void Hooks::OnColourReady(const MaskFrame& frame) {
     std::fclose(f);
     LogInfo("colour frame %llu dumped (%ux%u fmt=%u)", frame.frameIndex, frame.width,
             frame.height, frame.format);
+}
+
+// Writes the slot -> object table for one frame, as JSON next to the mask.
+//
+// A mask alone is ambiguous: the stencil channel is 8 bits, so slot 42 in one
+// frame and slot 42 in another can be different objects. The sidecar is what
+// resolves it, and it is emitted with EVERY mask so the two cannot become
+// separated. A mask file without its sidecar is undecodable, and the format
+// should make that impossible to forget rather than merely documented.
+void Hooks::WriteSidecar(const MaskFrame& frame) const {
+    const FrameSidecar sc = GetMarker().SnapshotSidecar(frame.frameIndex, frame.width,
+                                                        frame.height);
+
+    wchar_t dllPath[MAX_PATH] = {};
+    GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), dllPath, MAX_PATH);
+    std::wstring dir(dllPath);
+    const size_t slash = dir.find_last_of(L"\\/");
+    dir = (slash == std::wstring::npos) ? L"." : dir.substr(0, slash);
+
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, _TRUNCATE, L"%ls\\segcap_mask_%llu.json", dir.c_str(),
+                 frame.frameIndex);
+
+    std::FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+
+    std::fprintf(f, "{\n");
+    std::fprintf(f, "  \"frameIndex\": %llu,\n", sc.frameIndex);
+    std::fprintf(f, "  \"width\": %u,\n", sc.width);
+    std::fprintf(f, "  \"height\": %u,\n", sc.height);
+    std::fprintf(f, "  \"bindings\": [\n");
+    for (size_t i = 0; i < sc.bindings.size(); ++i) {
+        const SlotBinding& b = sc.bindings[i];
+        std::fprintf(f,
+                     "    {\"slot\": %u, \"stableId\": %llu, \"className\": \"%s\", "
+                     "\"objectName\": \"%s\", \"serial\": %d}%s\n",
+                     b.slot, b.stableId, b.className.c_str(), b.objectName.c_str(),
+                     b.serialNumber, (i + 1 < sc.bindings.size()) ? "," : "");
+    }
+    std::fprintf(f, "  ]\n}\n");
+    std::fclose(f);
 }
 
 void Hooks::OnPresent(IDXGISwapChain3* swapChain) {

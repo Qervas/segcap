@@ -244,12 +244,29 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
     }
     if (batch.empty()) return 0;
 
+    ++markPass_;
     int assigned = 0;
+    int refused = 0;
+
     for (const Candidate& c : batch) {
-        // Slot ids cycle 1..255; 0 means unmarked. Repeats across more than 255
-        // objects are expected -- turning them back into distinct identities is
-        // task 9's job, via a per-frame sidecar table.
-        const uint8_t slot = static_cast<uint8_t>((nextSlot_++ % 255) + 1);
+        // Lease a slot through the registry rather than handing out a counter.
+        //
+        // The registry assigns a stable 64-bit id keyed on (pointer, serial) and
+        // leases one of the 255 stencil slots to it, evicting LRU when they run
+        // out -- but never evicting something seen this pass. A counter would
+        // give the same object a different number every pass and reuse numbers
+        // with no record of what they meant, making the mask undecodable.
+        uint8_t slot = 0;
+        {
+            std::lock_guard<std::mutex> lock(identityMutex_);
+            slot = identity_.LeaseSlot(c.component, c.serial, c.className, c.name, markPass_);
+        }
+        if (slot == 0) {
+            // All 255 slots are held by objects seen this pass. Refusing is
+            // correct: stealing one would thrash two labels and ruin both.
+            ++refused;
+            continue;
+        }
 
         MarkedPrimitive mp;
         mp.component = c.component;
@@ -270,11 +287,18 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
         }
     }
 
-    LogInfo("customdepth: marked %d this batch; %zu total, %zu still pending "
-            "(setter effective on %llu/%llu)",
-            assigned, marked_.size(), pending_.size(),
-            setterEffective_, writesAttempted_);
+    std::lock_guard<std::mutex> lock(identityMutex_);
+    LogInfo("customdepth: marked %d this batch (%d refused, all slots busy); "
+            "%zu live slots, %llu identities, %llu evictions, %llu recycle-collisions",
+            assigned, refused, identity_.liveSlots(), identity_.totalIdentities(),
+            identity_.evictions(), identity_.recycleCollisions());
     return assigned;
+}
+
+FrameSidecar CustomDepthMarker::SnapshotSidecar(uint64_t frameIndex, uint32_t w,
+                                                uint32_t h) const {
+    std::lock_guard<std::mutex> lock(identityMutex_);
+    return identity_.BuildSidecar(frameIndex, w, h);
 }
 
 int CustomDepthMarker::RestoreAll() {

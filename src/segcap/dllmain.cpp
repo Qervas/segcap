@@ -104,6 +104,14 @@ DWORD WINAPI InitThread(LPVOID) {
 segcap::ue4::Engine g_engine;
 segcap::CustomDepthMarker g_marker;
 
+}  // namespace
+
+// Accessor so hooks.cpp can snapshot the slot table when dumping a mask,
+// without either file including the other's translation unit.
+namespace segcap { CustomDepthMarker& GetMarker() { return g_marker; } }
+
+namespace {
+
 DWORD WINAPI DiscoverThread(LPVOID) {
     for (int attempt = 1; attempt <= 40; ++attempt) {
         Sleep(2000);
