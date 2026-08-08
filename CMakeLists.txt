@@ -73,11 +73,22 @@ add_library(segcap SHARED
   src/segcap/readback.cpp
   src/segcap/ue4.cpp
   src/segcap/customdepth.cpp
+  src/segcap/identity.cpp
 )
 target_link_libraries(segcap PRIVATE minhook d3d12 dxgi psapi)
 set_target_properties(segcap PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# ---------------------------------------------------------------------------
+# tests -- run without the game, so the subtle logic is asserted rather than
+# eyeballed. Identity corruption is invisible at runtime: it produces a mask
+# that looks fine and mislabels an object.
+# ---------------------------------------------------------------------------
+add_executable(test_identity src/tests/test_identity.cpp src/segcap/identity.cpp)
+set_target_properties(test_identity PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
 # ---------------------------------------------------------------------------
