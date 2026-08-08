@@ -123,15 +123,26 @@ $inj | Wait-Process -Timeout 60 -ErrorAction SilentlyContinue
 Get-Content "$env:TEMP\auto_inject.txt" -ErrorAction SilentlyContinue |
     ForEach-Object { Write-Host "[inject] $_" }
 
-# --- 4. get past the menu ----------------------------------------------------
+# --- 4. drive the game with a virtual gamepad --------------------------------
+#
+# SendInput was tried first and Stray ignored it -- proven, not assumed: after
+# four scan-code Enter taps the engine's object array stayed at the menu's
+# 173,598 slots instead of growing to the ~320,000 an in-level session shows.
+#
+# ViGEm presents a controller through a kernel bus driver, so the game cannot
+# tell it from real hardware. The pad exists only while vpad.exe runs, so it is
+# started as a background process alongside the game rather than before it.
 if (-not $NoInput) {
-    Write-Host "[auto] waiting for the main menu"
+    $vpad = Join-Path $root "build\bin\vpad.exe"
+    if (-not (Test-Path $vpad)) { throw "vpad.exe not built: $vpad" }
+
+    Write-Host "[auto] waiting for the game window"
     for ($i = 0; $i -lt 90; $i++) {
         $game.Refresh()
         if ($game.MainWindowHandle -ne 0) { break }
         Start-Sleep -Seconds 1
     }
-    Start-Sleep -Seconds 25   # let the menu finish animating in
+    Start-Sleep -Seconds 20   # let the menu finish animating in
 
     if ($game.MainWindowHandle -ne 0) {
         [Win32Input]::ShowWindow($game.MainWindowHandle, 9) | Out-Null   # SW_RESTORE
@@ -139,25 +150,14 @@ if (-not $NoInput) {
         Start-Sleep -Seconds 2
     }
 
-    # Stray's path into gameplay is three Enter presses, confirmed from the
-    # actual screens:
-    #
-    #   main menu  ->  SELECT SAVE (slot 1 pre-highlighted)  ->  SLOT 1
-    #   (CONTINUE pre-highlighted)  ->  in game
-    #
-    # Both screens show "ENTER Select" in the prompt bar. An earlier version sent
-    # Enter/Space/Enter; the Space was almost certainly what derailed it, since
-    # nothing in this flow uses Space.
-    #
-    # A fourth Enter is harmless if we are already in gameplay, and covers the
-    # case where a save slot is empty and the flow is one screen shorter.
-    Tap 0x1C "Enter (main menu)"
-    Start-Sleep -Seconds 3
-    Tap 0x1C "Enter (select save)"
-    Start-Sleep -Seconds 3
-    Tap 0x1C "Enter (continue)"
-    Start-Sleep -Seconds 3
-    Tap 0x1C "Enter (spare)"
+    # Menu, then patrol for the remaining time. Patrol matters beyond getting
+    # in-level: a static camera yields thousands of near-identical frames, which
+    # is close to worthless as segmentation training data.
+    $patrolFor = [Math]::Max(20, $Seconds - 20)
+    Write-Host "[auto] handing control to vpad (menu, then $patrolFor s patrol)"
+    $padProc = Start-Process -FilePath $vpad `
+        -ArgumentList "--menu --patrol $patrolFor" `
+        -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\vpad_out.txt"
 }
 
 # --- 5. idle in gameplay -----------------------------------------------------
@@ -174,9 +174,25 @@ while ((Get-Date) -lt $deadline) {
 }
 
 # --- 6. collect --------------------------------------------------------------
+if ($padProc -and -not $padProc.HasExited) {
+    Stop-Process -Id $padProc.Id -Force -ErrorAction SilentlyContinue
+}
+Get-Content "$env:TEMP\vpad_out.txt" -ErrorAction SilentlyContinue |
+    Select-Object -Last 6 | ForEach-Object { Write-Host "[vpad] $_" }
+
 $snapshot = Join-Path $root "build\bin\segcap_auto.log"
 Copy-Item $log $snapshot -Force -ErrorAction SilentlyContinue
 Write-Host "[auto] log copied to $snapshot"
+
+# The decisive check for whether we actually got in-level: the object array
+# grows from ~173k (menu) to ~320k once the level streams in. This is the same
+# signal that proved SendInput was failing.
+$slots = Select-String -Path $snapshot -Pattern "array has (\d+) slots" -ErrorAction SilentlyContinue |
+    ForEach-Object { [int]$_.Matches.Groups[1].Value } | Sort-Object -Descending | Select-Object -First 1
+if ($slots) {
+    $verdict = if ($slots -gt 250000) { "IN-LEVEL (gamepad worked)" } else { "still at menu" }
+    Write-Host "[auto] peak object-array slots: $slots  -> $verdict"
+}
 
 if (-not $NoKill) {
     Get-Process -Name "Stray*" -ErrorAction SilentlyContinue | Stop-Process -Force
