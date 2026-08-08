@@ -340,6 +340,80 @@ std::string Engine::NameToString(uint32_t comparisonIndex) const {
     return out;
 }
 
+void Engine::ReportSample(const char* label) {
+    if (!objects_) return;
+
+    // Rejection counters, because "340 of 21699 resolved" is a symptom and not
+    // a diagnosis. Knowing WHICH check rejected an entry is the difference
+    // between "the array is mostly empty" and "my validation is too strict".
+    int nullChunk = 0, unreadableChunk = 0, nullObject = 0, failedValidation = 0, ok = 0;
+
+    std::vector<std::pair<std::string, int>> counts;
+    const int32_t total = objects_->NumElements;
+    const int32_t stride = total > 20000 ? total / 20000 : 1;
+    int sampled = 0;
+
+    for (int32_t i = 0; i < total; i += stride) {
+        ++sampled;
+        const int32_t chunkIndex = i / kElementsPerChunk;
+        const int32_t withinChunk = i % kElementsPerChunk;
+        if (chunkIndex >= objects_->NumChunks) { ++nullChunk; continue; }
+
+        FUObjectItem* chunk = objects_->Objects[chunkIndex];
+        if (!chunk) { ++nullChunk; continue; }
+        if (!IsReadable(&chunk[withinChunk], sizeof(FUObjectItem))) { ++unreadableChunk; continue; }
+
+        void* obj = chunk[withinChunk].Object;
+        if (!obj) { ++nullObject; continue; }
+        if (!LooksLikeUObject(obj)) { ++failedValidation; continue; }
+        ++ok;
+
+        ObjectRef ref;
+        if (!GetObject(i, ref) || ref.className.empty()) continue;
+        bool found = false;
+        for (auto& c : counts) {
+            if (c.first == ref.className) { ++c.second; found = true; break; }
+        }
+        if (!found && counts.size() < 512) counts.emplace_back(ref.className, 1);
+    }
+
+    std::sort(counts.begin(), counts.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    LogInfo("ue4: [%s] array has %d slots; sampled %d (every %d)", label, total, sampled, stride);
+    LogInfo("ue4:   resolved=%d  nullObject=%d  failedValidation=%d  nullChunk=%d  unreadable=%d",
+            ok, nullObject, failedValidation, nullChunk, unreadableChunk);
+    for (size_t i = 0; i < counts.size() && i < 14; ++i) {
+        LogInfo("ue4:     %6d  %s", counts[i].second, counts[i].first.c_str());
+    }
+}
+
+int Engine::CountDerivedFrom(const char* target) {
+    if (!objects_ || !nameBlocks_) return 0;
+    int matches = 0;
+    const int32_t total = objects_->NumElements;
+
+    for (int32_t i = 0; i < total; ++i) {
+        ObjectRef ref;
+        if (!GetObject(i, ref)) continue;
+
+        // Walk the UClass superclass chain. UStruct::SuperStruct sits at 0x40 in
+        // UE4 x64 shipping; if that offset is wrong the walk terminates
+        // immediately rather than misreporting, because the pointer will fail
+        // the UObject-shape test.
+        auto klass = *reinterpret_cast<uintptr_t*>(
+            reinterpret_cast<uint8_t*>(ref.object) + UObjectLayout::kClassPrivate);
+        for (int depth = 0; depth < 24 && klass; ++depth) {
+            if (!LooksLikeUObject(reinterpret_cast<void*>(klass))) break;
+            const auto nameIdx = *reinterpret_cast<uint32_t*>(
+                reinterpret_cast<uint8_t*>(klass) + UObjectLayout::kNamePrivate);
+            if (NameToString(nameIdx) == target) { ++matches; break; }
+            klass = *reinterpret_cast<uintptr_t*>(reinterpret_cast<uint8_t*>(klass) + 0x40);
+        }
+    }
+    return matches;
+}
+
 bool Engine::Discover() {
     BuildReadableMap();
 
@@ -386,42 +460,7 @@ bool Engine::Discover() {
         LogWarn("ue4: continuing without name resolution");
     }
 
-    // Report a sample so discovery can be checked by eye rather than trusted.
-    int reported = 0;
-    for (int32_t i = 0; i < objects_->NumElements && reported < 16; ++i) {
-        ObjectRef ref;
-        if (!GetObject(i, ref)) continue;
-        LogInfo("ue4:   [%d] %s  (class %s)  serial=%d", ref.index,
-                ref.name.empty() ? "<unresolved>" : ref.name.c_str(),
-                ref.className.empty() ? "?" : ref.className.c_str(), ref.serialNumber);
-        ++reported;
-    }
-
-    // Class histogram over a sample: a far better correctness check than any
-    // single name. If the discovery were wrong we would see garbage, not a
-    // plausible distribution of Unreal class names.
-    if (nameBlocks_) {
-        std::vector<std::pair<std::string, int>> counts;
-        const int32_t stride = objects_->NumElements > 20000 ? objects_->NumElements / 20000 : 1;
-        for (int32_t i = 0; i < objects_->NumElements; i += stride) {
-            ObjectRef ref;
-            if (!GetObject(i, ref) || ref.className.empty()) continue;
-            bool found = false;
-            for (auto& c : counts) {
-                if (c.first == ref.className) { ++c.second; found = true; break; }
-            }
-            if (!found && counts.size() < 512) counts.emplace_back(ref.className, 1);
-        }
-        std::sort(counts.begin(), counts.end(),
-                  [](const auto& a, const auto& b) { return a.second > b.second; });
-        LogInfo("ue4: most common classes in a sample of %d objects:",
-                objects_->NumElements / stride);
-        for (size_t i = 0; i < counts.size() && i < 12; ++i) {
-            LogInfo("ue4:   %6d  %s", counts[i].second, counts[i].first.c_str());
-        }
-    }
-
-    LogInfo("ue4: discovery complete, %d live objects", NumObjects());
+    LogInfo("ue4: discovery complete, %d slots in the array", NumObjects());
     return true;
 }
 

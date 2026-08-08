@@ -131,7 +131,19 @@ public:
     // Resolves an FName comparison index to text.
     std::string NameToString(uint32_t comparisonIndex) const;
 
+    // Walks the array and logs a class histogram plus rejection counts.
+    // Callable repeatedly: the discovered addresses are stable, but the array
+    // contents are not -- at engine startup it holds only bootstrap classes and
+    // packages, and gameplay actors appear later.
+    void ReportSample(const char* label);
+
+    // Counts objects whose class chain reaches the named class. This is how we
+    // find candidates for CustomDepth: bRenderCustomDepth lives on
+    // UPrimitiveComponent, so anything derived from it can be marked.
+    int CountDerivedFrom(const char* className);
+
     void* guObjectArray() const { return arrayAddress_; }
+    bool namesResolved() const { return nameBlocks_ != nullptr; }
 
 private:
     bool FindObjectArray();

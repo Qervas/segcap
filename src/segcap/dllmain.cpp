@@ -81,19 +81,51 @@ DWORD WINAPI InitThread(LPVOID) {
 // not delay hook installation; and GUObjectArray is not populated at process
 // start, so an early scan would correctly find nothing and we would wrongly
 // conclude the technique does not work.
+// The discovered engine. Static, NOT a temporary.
+//
+// An earlier version wrote `segcap::ue4::Engine().Discover()`, which constructs
+// a temporary, discovers the addresses into it, and destroys it on the next
+// semicolon. Discovery "succeeded" and every address was thrown away.
+segcap::ue4::Engine g_engine;
+
 DWORD WINAPI DiscoverThread(LPVOID) {
-    // Stray took 7.5s to create its D3D device; the object array is populated
-    // around the same time. Retry rather than pick a magic delay.
     for (int attempt = 1; attempt <= 40; ++attempt) {
         Sleep(2000);
         segcap::LogInfo("ue4: discovery attempt %d", attempt);
-        if (segcap::ue4::Engine().Discover()) {
+        if (g_engine.Discover()) {
             segcap::LogInfo("ue4: discovery succeeded on attempt %d", attempt);
-            return 0;
+            break;
+        }
+        if (attempt == 40) {
+            segcap::LogError("ue4: discovery failed after 40 attempts");
+            return 1;
         }
     }
-    segcap::LogError("ue4: discovery failed after 40 attempts");
-    return 1;
+
+    // Re-sample periodically. Discovery lands within ~2s, but Stray does not
+    // create its D3D device until 7.5s and the level loads later still -- so an
+    // immediate sample sees only the engine's bootstrap objects (class
+    // definitions and packages) and no gameplay actors. The array's ADDRESS is
+    // stable; its CONTENTS are not, and the interesting contents arrive late.
+    const int kIntervals[] = {5, 10, 20, 40, 60, 90, 120};
+    int elapsed = 0;
+    for (int stage : kIntervals) {
+        Sleep((stage - elapsed) * 1000);
+        elapsed = stage;
+        char label[32];
+        _snprintf_s(label, sizeof(label), _TRUNCATE, "t+%ds", stage);
+        g_engine.ReportSample(label);
+    }
+
+    // Once the level is up, count what we can actually mark for CustomDepth.
+    // bRenderCustomDepth lives on UPrimitiveComponent, so its descendants are
+    // the candidate set for task 8.
+    if (g_engine.namesResolved()) {
+        segcap::LogInfo("ue4: PrimitiveComponent descendants: %d",
+                        g_engine.CountDerivedFrom("PrimitiveComponent"));
+        segcap::LogInfo("ue4: Actor descendants: %d", g_engine.CountDerivedFrom("Actor"));
+    }
+    return 0;
 }
 
 }  // namespace
