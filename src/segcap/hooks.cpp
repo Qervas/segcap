@@ -619,14 +619,48 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
         }
     }
 
-    // A few empty frames are still worth having as a baseline for the A/B
-    // comparison in task 11, but they must not consume the content budget.
-    if (!hasContent) {
+    // ---- recording gate ----------------------------------------------------
+    //
+    // Only record while actually in gameplay. Menus, loading screens and fades
+    // contain no labelled objects, so capturing them would pad the dataset with
+    // frames that teach nothing -- and for a dataset pipeline that is worse than
+    // capturing less.
+    //
+    // The gate keys on mask content rather than trying to infer "is this a menu"
+    // from engine state, because content is exactly the property that makes a
+    // frame worth keeping. Hysteresis both ways: a camera can briefly face an
+    // unmarked wall without ending a session, and a stray marked object visible
+    // behind a menu should not start one.
+    constexpr uint32_t kFramesToStart = 3;
+    constexpr uint32_t kFramesToStop = 30;
+
+    if (hasContent) {
+        ++consecutiveContent_;
+        consecutiveEmpty_ = 0;
+        if (!recording_ && consecutiveContent_ >= kFramesToStart) {
+            recording_ = true;
+            recordingStartedFrame_ = frame.frameIndex;
+            LogInfo("RECORDING STARTED at frame %llu (mask has content)", frame.frameIndex);
+        }
+    } else {
+        ++consecutiveEmpty_;
+        consecutiveContent_ = 0;
+        if (recording_ && consecutiveEmpty_ >= kFramesToStop) {
+            recording_ = false;
+            LogInfo("RECORDING STOPPED at frame %llu (%llu frames captured over %llu)",
+                    frame.frameIndex, recordedFrames_,
+                    frame.frameIndex - recordingStartedFrame_);
+        }
+    }
+
+    if (!recording_) {
+        ++skippedFrames_;
+        // One baseline empty capture is still useful for the task-11 A/B diff.
         if (emptyMasksDumped_ >= 1) return;
         ++emptyMasksDumped_;
-    } else if (masksDumped_ >= 4) {
-        return;
     } else {
+        ++recordedFrames_;
+        if (masksDumped_ >= 6) return;
         ++masksDumped_;
     }
 
@@ -710,6 +744,8 @@ void Hooks::OnPresent() {
             frameIndex_, snapshot.size(), descriptorMisses_);
     LogInfo("    readback submitted=%llu delivered=%llu dropped=%llu",
             readback_.submitted(), readback_.delivered(), readback_.dropped());
+    LogInfo("    recording=%s  captured=%llu  skipped(menu/empty)=%llu",
+            recording_ ? "YES" : "no", recordedFrames_, skippedFrames_);
 
     for (const TargetFingerprint& t : snapshot) {
         // Only depth-stencil-capable targets matter for the mask route; logging

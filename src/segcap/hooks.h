@@ -218,6 +218,25 @@ private:
     // A/B comparison cannot consume the budget reserved for frames that
     // actually contain mask content.
     uint32_t emptyMasksDumped_ = 0;
+
+    // ---- recording gate --------------------------------------------------
+    //
+    // Menus, loading screens and cutscene fades are worthless as segmentation
+    // training data -- they would pad the dataset with frames containing no
+    // labelled objects. Rather than trying to detect "is this a menu" from
+    // engine state, the gate keys on the thing that actually matters: whether
+    // this frame has mask content at all.
+    //
+    // Hysteresis in both directions. A single empty frame does not stop a
+    // recording (a camera can briefly face an unmarked wall), and a single
+    // content frame does not start one (a stray marked object visible behind a
+    // menu should not open a session).
+    bool recording_ = false;
+    uint32_t consecutiveContent_ = 0;
+    uint32_t consecutiveEmpty_ = 0;
+    uint64_t recordedFrames_ = 0;
+    uint64_t skippedFrames_ = 0;
+    uint64_t recordingStartedFrame_ = 0;
     // Set from SEGCAP_CENSUS_ONLY=1. Suppresses all GPU work so an unfamiliar
     // title can be observed before anything is submitted on its queue.
     bool censusOnly_ = false;

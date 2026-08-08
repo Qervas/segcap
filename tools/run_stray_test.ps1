@@ -66,6 +66,61 @@ public class Win32Input {
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr pid);
     [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint action, uint param, IntPtr v, uint winIni);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, IntPtr extra);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+
+    const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+    const uint MOUSEEVENTF_LEFTUP = 0x0004;
+
+    [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint flags);
+    const uint ES_CONTINUOUS = 0x80000000;
+    const uint ES_SYSTEM_REQUIRED = 0x00000001;
+    const uint ES_DISPLAY_REQUIRED = 0x00000002;
+
+    // Keep the display and system awake for the duration of a capture run.
+    //
+    // This is a hard requirement, not a nicety. A run failed with
+    // "foreground pid 0 = Idle" -- the System Idle Process, meaning NO window
+    // held the foreground because the display had slept. Windows will not focus
+    // a window on a sleeping or locked desktop and blocks injected input there,
+    // so an unattended session simply dies once the machine idles. For a dataset
+    // pipeline meant to run for hours unattended, that is the difference between
+    // working and not.
+    //
+    // Note this cannot defeat a LOCKED session (Win+L or a lock-on-resume
+    // policy) -- nothing in user space can. Preventing idle sleep is what is
+    // available.
+    public static void KeepAwake(bool on) {
+        SetThreadExecutionState(on
+            ? (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+            : ES_CONTINUOUS);
+    }
+
+    // Clicking a window focuses it at the OS level regardless of how the app
+    // handles input. AttachThreadInput alone proved unreliable -- one run
+    // reported focused=True and the next False with no change in between, and a
+    // failed focus silently sinks the whole session: gamepad ignored, stuck at
+    // the menu, ProcessEvent never confirms, no masks.
+    //
+    // The click lands in the top-left region rather than dead centre: Stray's
+    // menus put interactive elements centrally, and a stray click there could
+    // activate something. A corner is inert.
+    public static void ClickToFocus(IntPtr hWnd) {
+        RECT r;
+        if (!GetWindowRect(hWnd, out r)) return;
+        int x = r.Left + Math.Max(8, (r.Right - r.Left) / 12);
+        int y = r.Top + Math.Max(8, (r.Bottom - r.Top) / 12);
+        SetCursorPos(x, y);
+        System.Threading.Thread.Sleep(80);
+        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, IntPtr.Zero);
+        System.Threading.Thread.Sleep(40);
+        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
+        System.Threading.Thread.Sleep(200);
+    }
 
     const uint SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001;
     const uint SPIF_SENDCHANGE = 0x02;
@@ -82,8 +137,28 @@ public class Win32Input {
     // Needed because an unattended dataset run cannot rely on a human clicking
     // the window: the virtual gamepad delivers input correctly, but an unfocused
     // window ignores it.
-    public static bool ForceForeground(IntPtr hWnd) {
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+
+    // Returns the PID owning the current foreground window.
+    public static uint ForegroundPid() {
+        uint pid;
+        GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+        return pid;
+    }
+
+    // Verification is by PROCESS, not window handle.
+    //
+    // An earlier version required GetForegroundWindow() == MainWindowHandle and
+    // reported focused=False on runs where the game was plainly in front. A
+    // fullscreen D3D12 title often has a different HWND in the foreground than
+    // the one .NET reports as MainWindowHandle -- so the check was wrong, not
+    // the focus. Comparing owning PIDs asks the question we actually care
+    // about: is the game the active application?
+    public static bool ForceForeground(IntPtr hWnd, uint targetPid) {
         if (hWnd == IntPtr.Zero) return false;
+        if (ForegroundPid() == targetPid) return true;   // already there
+
         SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, IntPtr.Zero, SPIF_SENDCHANGE);
 
         uint fgThread = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
@@ -95,10 +170,10 @@ public class Win32Input {
 
         ShowWindow(hWnd, 9);          // SW_RESTORE
         BringWindowToTop(hWnd);
-        bool ok = SetForegroundWindow(hWnd);
+        SetForegroundWindow(hWnd);
 
         if (attached) AttachThreadInput(myThread, fgThread, false);
-        return ok && GetForegroundWindow() == hWnd;
+        return ForegroundPid() == targetPid;
     }
 
     const uint KEYEVENTF_KEYUP = 0x0002;
@@ -130,6 +205,12 @@ function Tap([ushort]$scan, [string]$name) {
 }
 
 # --- 0. clean slate ----------------------------------------------------------
+# Keep the machine awake first. A previous run died with "foreground pid 0 =
+# Idle": the display had slept, so no window held the foreground and nothing
+# could be focused or receive input.
+[Win32Input]::KeepAwake($true)
+Write-Host "[auto] display/system sleep suppressed for this run"
+
 Get-Process -Name "Stray*" -ErrorAction SilentlyContinue | ForEach-Object {
     Write-Host "[auto] closing existing $($_.ProcessName) ($($_.Id))"
     Stop-Process -Id $_.Id -Force
@@ -187,14 +268,30 @@ if (-not $NoInput) {
     # Focus, verified rather than assumed. An unfocused window silently ignores
     # gamepad input, which previously required a human to click the window --
     # exactly what an unattended dataset run cannot depend on.
+    # Focus, verified rather than assumed, escalating if the polite method fails.
+    # A failed focus silently sinks the entire session -- gamepad ignored, stuck
+    # at the menu, ProcessEvent never confirms, no masks -- so it is worth
+    # several attempts and a fallback.
     $focused = $false
-    for ($i = 0; $i -lt 15; $i++) {
+    for ($i = 0; $i -lt 25; $i++) {
         $game.Refresh()
         if ($game.MainWindowHandle -eq 0) { Start-Sleep -Seconds 1; continue }
-        if ([Win32Input]::ForceForeground($game.MainWindowHandle)) { $focused = $true; break }
+
+        if ([Win32Input]::ForceForeground($game.MainWindowHandle, [uint32]$game.Id)) {
+            $focused = $true; break
+        }
+        # Escalate: a real click focuses at the OS level whatever the app does.
+        if ($i -ge 3) {
+            [Win32Input]::ClickToFocus($game.MainWindowHandle)
+            if ([Win32Input]::ForceForeground($game.MainWindowHandle, [uint32]$game.Id)) {
+                $focused = $true; break
+            }
+        }
         Start-Sleep -Seconds 1
     }
-    Write-Host "[auto] window focused: $focused"
+    $fgPid = [Win32Input]::ForegroundPid()
+    $fgName = (Get-Process -Id $fgPid -ErrorAction SilentlyContinue).ProcessName
+    Write-Host "[auto] window focused: $focused  (foreground pid $fgPid = $fgName, game pid $($game.Id))"
     if (-not $focused) {
         Write-Host "[auto] WARNING: could not take focus; gamepad input will be ignored"
     }
@@ -252,6 +349,9 @@ if (-not $NoKill) {
     Get-Process -Name "Stray*" -ErrorAction SilentlyContinue | Stop-Process -Force
     Write-Host "[auto] game closed"
 }
+
+# Release the sleep suppression, so we do not leave the machine unable to idle.
+[Win32Input]::KeepAwake($false)
 
 Write-Host ""
 Write-Host "=== ProcessEvent result ==="
