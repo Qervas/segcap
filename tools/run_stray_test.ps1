@@ -1,0 +1,175 @@
+<#
+.SYNOPSIS
+  Launch Stray, inject segcap, get past the menu, idle in gameplay, collect the log.
+
+.DESCRIPTION
+  Removes the human from the test loop. Three of the four steps automate cleanly:
+
+    launch      steam://rungameid/1332010 -- no clicking, Steam's own URL protocol
+    inject      the injector's --watch mode already handles this
+    collect     the log is shared-read, so it can be copied while the game runs
+
+  Only menu navigation is uncertain. Games that read raw input usually still see
+  SendInput, because it injects into the same queue raw input reads from -- but
+  titles that filter LLMHF_INJECTED will ignore it. If that happens, the script
+  says so plainly instead of silently timing out, and a human presses one key.
+
+  What makes this viable at all: ProcessEvent fires constantly from the engine's
+  own dispatch -- animation, AI, timers. The cat does not need to move. We only
+  need to get past the menu and then idle.
+
+.PARAMETER Seconds
+  How long to stay in gameplay after the menu. Default 220 -- long enough for the
+  t+120s sample plus the ~30s ProcessEvent candidate search.
+
+.PARAMETER NoKill
+  Leave the game running at the end instead of closing it.
+
+.PARAMETER NoInput
+  Skip menu navigation entirely; useful to check whether SendInput is the thing
+  that is failing.
+#>
+param(
+    [int]$Seconds = 220,
+    [switch]$NoKill,
+    [switch]$NoInput
+)
+
+$ErrorActionPreference = "Stop"
+$root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$dll = Join-Path $root "build\bin\segcap.dll"
+$injector = Join-Path $root "build\bin\injector.exe"
+$log = Join-Path $root "build\bin\segcap.log"
+
+if (-not (Test-Path $dll)) { throw "segcap.dll not built: $dll" }
+
+# --- SendInput P/Invoke ------------------------------------------------------
+# SendKeys is not used: it posts messages, which games reading raw input ignore.
+# SendInput injects at the system level, into the same queue raw input drains.
+if (-not ("Win32Input" -as [type])) {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32Input {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags;
+                               public uint time; public IntPtr dwExtraInfo; }
+    [StructLayout(LayoutKind.Explicit, Size=40)]
+    public struct INPUT { [FieldOffset(0)] public uint type; [FieldOffset(8)] public KEYBDINPUT ki; }
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern uint SendInput(uint n, INPUT[] pInputs, int cbSize);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    const uint KEYEVENTF_KEYUP = 0x0002;
+    const uint KEYEVENTF_SCANCODE = 0x0008;
+
+    // Scan codes, not virtual keys. Many games read scan codes directly from
+    // raw input and never look at the VK field.
+    public static void TapScan(ushort scan, int holdMs) {
+        INPUT[] down = new INPUT[1];
+        down[0].type = 1;
+        down[0].ki.wScan = scan;
+        down[0].ki.dwFlags = KEYEVENTF_SCANCODE;
+        SendInput(1, down, Marshal.SizeOf(typeof(INPUT)));
+        System.Threading.Thread.Sleep(holdMs);
+        INPUT[] up = new INPUT[1];
+        up[0].type = 1;
+        up[0].ki.wScan = scan;
+        up[0].ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+        SendInput(1, up, Marshal.SizeOf(typeof(INPUT)));
+    }
+}
+"@
+}
+
+function Tap([ushort]$scan, [string]$name) {
+    Write-Host "[auto]   tap $name"
+    [Win32Input]::TapScan($scan, 60)
+    Start-Sleep -Milliseconds 700
+}
+
+# --- 0. clean slate ----------------------------------------------------------
+Get-Process -Name "Stray*" -ErrorAction SilentlyContinue | ForEach-Object {
+    Write-Host "[auto] closing existing $($_.ProcessName) ($($_.Id))"
+    Stop-Process -Id $_.Id -Force
+}
+Start-Sleep -Seconds 3
+Remove-Item $log -ErrorAction SilentlyContinue
+
+# --- 1. arm the injector BEFORE launching ------------------------------------
+# Injecting at process start is what keeps descriptor misses at zero; views
+# created before we arrive cannot be recovered.
+Write-Host "[auto] arming injector"
+$inj = Start-Process -FilePath $injector `
+    -ArgumentList "--dll `"$dll`" --watch Stray-Win64-Shipping.exe --wait 300" `
+    -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\auto_inject.txt"
+
+# --- 2. launch via Steam's URL protocol --------------------------------------
+Write-Host "[auto] launching steam://rungameid/1332010"
+Start-Process "steam://rungameid/1332010"
+
+# --- 3. wait for the renderer process ----------------------------------------
+$game = $null
+for ($i = 0; $i -lt 120; $i++) {
+    $game = Get-Process -Name "Stray-Win64-Shipping" -ErrorAction SilentlyContinue
+    if ($game) { break }
+    Start-Sleep -Seconds 1
+}
+if (-not $game) { throw "Stray never started" }
+Write-Host "[auto] game up as pid $($game.Id)"
+
+$inj | Wait-Process -Timeout 60 -ErrorAction SilentlyContinue
+Get-Content "$env:TEMP\auto_inject.txt" -ErrorAction SilentlyContinue |
+    ForEach-Object { Write-Host "[inject] $_" }
+
+# --- 4. get past the menu ----------------------------------------------------
+if (-not $NoInput) {
+    Write-Host "[auto] waiting for the main menu"
+    for ($i = 0; $i -lt 90; $i++) {
+        $game.Refresh()
+        if ($game.MainWindowHandle -ne 0) { break }
+        Start-Sleep -Seconds 1
+    }
+    Start-Sleep -Seconds 25   # let the menu finish animating in
+
+    if ($game.MainWindowHandle -ne 0) {
+        [Win32Input]::ShowWindow($game.MainWindowHandle, 9) | Out-Null   # SW_RESTORE
+        [Win32Input]::SetForegroundWindow($game.MainWindowHandle) | Out-Null
+        Start-Sleep -Seconds 2
+    }
+
+    # Enter, then Space, then Enter again. Stray's menus vary by whether a save
+    # exists, so a short sequence of confirmations is more robust than one key.
+    Tap 0x1C "Enter"
+    Tap 0x39 "Space"
+    Tap 0x1C "Enter"
+}
+
+# --- 5. idle in gameplay -----------------------------------------------------
+Write-Host "[auto] idling $Seconds s (ProcessEvent fires without player input)"
+$deadline = (Get-Date).AddSeconds($Seconds)
+while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 10
+    if (-not (Get-Process -Id $game.Id -ErrorAction SilentlyContinue)) {
+        Write-Host "[auto] !! game exited early -- possible crash, check the log"
+        break
+    }
+    $done = Select-String -Path $log -Pattern "ProcessEvent CONFIRMED|not found in slots" -ErrorAction SilentlyContinue
+    if ($done) { Write-Host "[auto] ProcessEvent search finished early"; break }
+}
+
+# --- 6. collect --------------------------------------------------------------
+$snapshot = Join-Path $root "build\bin\segcap_auto.log"
+Copy-Item $log $snapshot -Force -ErrorAction SilentlyContinue
+Write-Host "[auto] log copied to $snapshot"
+
+if (-not $NoKill) {
+    Get-Process -Name "Stray*" -ErrorAction SilentlyContinue | Stop-Process -Force
+    Write-Host "[auto] game closed"
+}
+
+Write-Host ""
+Write-Host "=== ProcessEvent result ==="
+Select-String -Path $snapshot -Pattern "PE candidate|CONFIRMED|not found in slots|game thread" -ErrorAction SilentlyContinue |
+    ForEach-Object { $_.Line }
