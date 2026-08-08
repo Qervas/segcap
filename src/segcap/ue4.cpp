@@ -477,11 +477,43 @@ void* Engine::AnyObject() const {
 
 void* Engine::FindClass(const char* className) {
     if (!objects_ || !nameBlocks_) return nullptr;
+
+    void* stub = nullptr;
+    int matches = 0;
+
     for (int32_t i = 0; i < objects_->NumElements; ++i) {
         ObjectRef ref;
         if (!GetObject(i, ref)) continue;
         if (ref.className != "Class") continue;   // must BE a UClass, not an instance
-        if (ref.name == className) return ref.object;
+        if (ref.name != className) continue;
+        ++matches;
+
+        // The name is not enough. Stray's object array contains a UClass named
+        // "PrimitiveComponent" whose Children AND ChildProperties are both null
+        // -- structurally coherent (its inheritance depth is correct) but
+        // unpopulated. Returning it produced "0 properties declared" and sent
+        // me looking for a layout bug that did not exist.
+        //
+        // A real native class has a property chain. Require one.
+        const auto base = reinterpret_cast<uintptr_t>(ref.object);
+        const auto children = *reinterpret_cast<uintptr_t*>(base + 0x48);
+        const auto childProps =
+            *reinterpret_cast<uintptr_t*>(base + UStructLayout::kChildProperties);
+        if (!children && !childProps) {
+            if (!stub) stub = ref.object;
+            continue;
+        }
+        if (matches > 1) {
+            LogInfo("ue4: FindClass(%s): skipped %d stub(s) with null chains",
+                    className, matches - 1);
+        }
+        return ref.object;
+    }
+
+    if (stub) {
+        LogWarn("ue4: FindClass(%s): only found %d candidate(s), all with null "
+                "property chains -- returning nothing rather than a stub",
+                className, matches);
     }
     return nullptr;
 }
@@ -519,6 +551,24 @@ std::vector<PropertyInfo> Engine::ListProperties(void* uclass, bool includeInher
                 info.offset = offset;
                 info.size = size;
                 info.arrayDim = dim;
+
+                // Identify the property kind from FFieldClass::Name rather than
+                // any hardcoded type tag.
+                const auto fieldClass =
+                    *reinterpret_cast<uintptr_t*>(field + kFFieldClassPrivate);
+                if (IsReadable(reinterpret_cast<void*>(fieldClass), 8)) {
+                    info.type = NameToString(*reinterpret_cast<uint32_t*>(fieldClass));
+                }
+
+                if (info.type == "BoolProperty" &&
+                    IsReadable(reinterpret_cast<void*>(field + FBoolPropertyLayout::kFieldMask), 1)) {
+                    info.isBool = true;
+                    info.byteOffset =
+                        *reinterpret_cast<uint8_t*>(field + FBoolPropertyLayout::kByteOffset);
+                    info.fieldMask =
+                        *reinterpret_cast<uint8_t*>(field + FBoolPropertyLayout::kFieldMask);
+                }
+
                 out.push_back(std::move(info));
             }
             field = *reinterpret_cast<uintptr_t*>(field + FFieldLayout::kNext);
@@ -528,6 +578,48 @@ std::vector<PropertyInfo> Engine::ListProperties(void* uclass, bool includeInher
         structPtr = *reinterpret_cast<uintptr_t*>(structPtr + UStructLayout::kSuperStruct);
     }
     return out;
+}
+
+void Engine::DumpStructLayout(void* ustruct, const char* label) {
+    if (!ustruct || !nameBlocks_) return;
+    auto base = reinterpret_cast<uintptr_t>(ustruct);
+    LogInfo("ue4: --- layout probe: %s @ %p ---", label, ustruct);
+
+    // Print EVERY qword, including ones neither interpretation decodes. An
+    // earlier version only printed successful decodes, which meant a null
+    // pointer and a present-but-misinterpreted pointer looked identical -- the
+    // same class of filter-hides-the-evidence mistake this probe exists to
+    // avoid. "Children is null" and "Children decodes wrong" need completely
+    // different fixes.
+    for (size_t off = 0; off < 0x120; off += 8) {
+        if (!IsReadable(reinterpret_cast<void*>(base + off), 8)) {
+            LogInfo("ue4:   +0x%03zX  <unreadable>", off);
+            continue;
+        }
+        const auto value = *reinterpret_cast<uintptr_t*>(base + off);
+        if (value == 0) continue;   // null is the one uninformative case
+
+        const bool ptr = IsReadable(reinterpret_cast<void*>(value), 0x40);
+        std::string asUObject, asFField;
+
+        // (a) UObject (pre-4.25 UProperty is one): FName at +0x18.
+        if (ptr && LooksLikeUObject(reinterpret_cast<void*>(value))) {
+            asUObject = NameToString(
+                *reinterpret_cast<uint32_t*>(value + UObjectLayout::kNamePrivate));
+        }
+        // (b) FField (4.25+ FProperty): FName at +0x28, NOT a UObject.
+        if (ptr) {
+            const std::string s =
+                NameToString(*reinterpret_cast<uint32_t*>(value + 0x28));
+            if (!s.empty() && s.size() < 64) asFField = s;
+        }
+
+        LogInfo("ue4:   +0x%03zX = %016llX %s U:\"%s\" F:\"%s\"", off,
+                static_cast<unsigned long long>(value), ptr ? "ptr" : "   ",
+                asUObject.empty() ? "-" : asUObject.c_str(),
+                asFField.empty() ? "-" : asFField.c_str());
+    }
+    LogInfo("ue4: --- end probe ---");
 }
 
 PropertyInfo Engine::FindProperty(void* uclass, const char* propertyName) {

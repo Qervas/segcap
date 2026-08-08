@@ -148,13 +148,48 @@ struct FPropertyLayout {
     static constexpr size_t kOffsetInternal = 0x4C;
 };
 
-// One reflected property: where it lives in an instance, and how big it is.
+// FBoolProperty extends FProperty with the bit layout of a packed bool:
+//
+//   class FBoolProperty : public FProperty {
+//       uint8 FieldSize;    // +0x78
+//       uint8 ByteOffset;   // +0x79
+//       uint8 ByteMask;     // +0x7A
+//       uint8 FieldMask;    // +0x7B
+//   };
+//
+// This matters enormously. Stray's UPrimitiveComponent packs seven bools into
+// the single byte at +0x212, and bRenderCustomDepth shares its byte at +0x216
+// with others. Writing 1 to the whole byte would silently flip neighbouring
+// flags -- bUseAsOccluder, bSelectable, occlusion and visibility bits -- which
+// is exactly the "did you change what the player sees" failure the brief asks
+// about, and it would have looked like it worked.
+struct FBoolPropertyLayout {
+    static constexpr size_t kFieldSize = 0x78;
+    static constexpr size_t kByteOffset = 0x79;
+    static constexpr size_t kByteMask = 0x7A;
+    static constexpr size_t kFieldMask = 0x7B;
+};
+
+// FFieldClass::Name sits at +0x00, which is how a property's kind is
+// identified without hardcoding any type tag.
+constexpr size_t kFFieldClassPrivate = 0x08;
+
+// One reflected property: where it lives in an instance, how big it is, and --
+// for packed bools -- which bit inside the byte.
 struct PropertyInfo {
     std::string name;
+    std::string type;          // FFieldClass name, e.g. "BoolProperty"
     int32_t offset = -1;
     int32_t size = 0;
     int32_t arrayDim = 0;
+    bool isBool = false;
+    uint8_t byteOffset = 0;    // added to offset for the containing byte
+    uint8_t fieldMask = 0xFF;  // which bit(s) within that byte
+
     bool valid() const { return offset >= 0; }
+    // True when this bool occupies a whole byte rather than one bit of a
+    // shared one. Writing a packed bool with a plain byte store is a bug.
+    bool isPackedBit() const { return isBool && fieldMask != 0xFF; }
 };
 
 // A discovered object, flattened into something safe to hold across frames.
@@ -219,6 +254,17 @@ public:
     // absent -- which is a real answer, not an error: it means this build does
     // not have that property and we must not write to a guessed location.
     PropertyInfo FindProperty(void* uclass, const char* propertyName);
+
+    // Dumps the raw qwords of a UStruct and tries to interpret each as a
+    // pointer to something named, under BOTH the pre-4.25 (UProperty, a UObject
+    // with FName at +0x18) and post-4.25 (FProperty, an FField with FName at
+    // +0x28) layouts.
+    //
+    // Exists because guessing the layout once already failed. Rather than guess
+    // again, this shows which offset actually holds the property chain and which
+    // interpretation decodes it -- the same "interrogate, do not assume" move
+    // that fixed the RenderDoc analysis earlier in this project.
+    void DumpStructLayout(void* ustruct, const char* label);
 
     void* guObjectArray() const { return arrayAddress_; }
     bool namesResolved() const { return nameBlocks_ != nullptr; }

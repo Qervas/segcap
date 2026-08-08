@@ -117,6 +117,35 @@ DWORD WINAPI DiscoverThread(LPVOID) {
         segcap::LogInfo("ue4: UPrimitiveComponent UClass = %p", primClass);
 
         if (primClass) {
+            // Probe the actual layout before trusting any assumed offset.
+            g_engine.DumpStructLayout(primClass, "UPrimitiveComponent (via FindClass)");
+
+            // The layout probe showed SuperStruct and PropertiesSize exactly
+            // where UE 4.25+ puts them, but Children AND ChildProperties both
+            // null -- impossible for a native class with dozens of UPROPERTYs.
+            //
+            // Hypothesis: FindClass returned a different UClass object than the
+            // one live instances actually point to. Test it by taking the class
+            // straight off a real StaticMeshComponent and comparing. If the
+            // pointers differ, the name lookup is finding a stub.
+            void* instance = nullptr;
+            void* instanceClass = nullptr;
+            for (int32_t i = 0; i < g_engine.NumObjects(); ++i) {
+                segcap::ue4::ObjectRef ref;
+                if (!g_engine.GetObject(i, ref)) continue;
+                if (ref.className != "StaticMeshComponent") continue;
+                instance = ref.object;
+                instanceClass = *reinterpret_cast<void**>(
+                    reinterpret_cast<uint8_t*>(ref.object) +
+                    segcap::ue4::UObjectLayout::kClassPrivate);
+                break;
+            }
+            segcap::LogInfo("ue4: sample StaticMeshComponent instance=%p class=%p",
+                            instance, instanceClass);
+            if (instanceClass) {
+                g_engine.DumpStructLayout(instanceClass, "UStaticMeshComponent (via instance)");
+            }
+
             const auto props = g_engine.ListProperties(primClass, false);
             segcap::LogInfo("ue4: %zu properties declared directly on UPrimitiveComponent",
                             props.size());
@@ -132,11 +161,20 @@ DWORD WINAPI DiscoverThread(LPVOID) {
             for (const char* want : {"bRenderCustomDepth", "CustomDepthStencilValue",
                                      "bVisible", "CustomDepthStencilWriteMask"}) {
                 const auto info = g_engine.FindProperty(primClass, want);
-                if (info.valid()) {
-                    segcap::LogInfo("ue4:  FOUND %-28s at +0x%X (size %d)", want,
-                                    info.offset, info.size);
-                } else {
+                if (!info.valid()) {
                     segcap::LogWarn("ue4:  MISSING %-28s -- will not write blind", want);
+                    continue;
+                }
+                if (info.isPackedBit()) {
+                    // Report the exact byte and bit. Writing the whole byte here
+                    // would clobber the other bools sharing it.
+                    segcap::LogInfo("ue4:  FOUND %-28s [%s] byte +0x%X mask 0x%02X"
+                                    "  <- PACKED BIT, read-modify-write only",
+                                    want, info.type.c_str(),
+                                    info.offset + info.byteOffset, info.fieldMask);
+                } else {
+                    segcap::LogInfo("ue4:  FOUND %-28s [%s] at +0x%X (size %d)", want,
+                                    info.type.c_str(), info.offset, info.size);
                 }
             }
         }
