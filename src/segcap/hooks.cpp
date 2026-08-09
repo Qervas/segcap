@@ -66,6 +66,17 @@ constexpr int kClearDSVSlot = 47;            // ID3D12GraphicsCommandList::Clear
 
 void** VTableOf(void* obj) { return *reinterpret_cast<void***>(obj); }
 
+// Never returns "other".
+//
+// It used to, and that hid evidence for the third time in this project. On
+// inZOI, 800 of the observed render targets printed as "other" -- a single
+// bucket covering every format this switch did not happen to list. Nanite's
+// visibility buffer is an R32G32_UINT render target, so the one question worth
+// asking of a UE5 census ("is the Nanite route available here?") was
+// unanswerable from a log that had already thrown the answer away.
+//
+// Unknown formats now print their numeric DXGI_FORMAT, which is always enough
+// to look up. A name I did not anticipate is not the same as no name.
 const char* FormatName(DXGI_FORMAT f) {
     switch (f) {
         case DXGI_FORMAT_R24G8_TYPELESS: return "R24G8_TYPELESS";
@@ -77,8 +88,29 @@ const char* FormatName(DXGI_FORMAT f) {
         case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
         case DXGI_FORMAT_R16G16B16A16_FLOAT: return "R16G16B16A16_FLOAT";
         case DXGI_FORMAT_R11G11B10_FLOAT: return "R11G11B10_FLOAT";
-        default: return "other";
+        // Integer formats matter specifically: UE writes per-object and
+        // per-cluster ids into UINT targets, so these are the candidates for an
+        // id source that needs no engine mutation at all.
+        case DXGI_FORMAT_R32G32_UINT: return "R32G32_UINT";
+        case DXGI_FORMAT_R32_UINT: return "R32_UINT";
+        case DXGI_FORMAT_R16G16_UINT: return "R16G16_UINT";
+        case DXGI_FORMAT_R16_UINT: return "R16_UINT";
+        case DXGI_FORMAT_R8_UINT: return "R8_UINT";
+        case DXGI_FORMAT_R8G8_UNORM: return "R8G8_UNORM";
+        case DXGI_FORMAT_R8_UNORM: return "R8_UNORM";
+        case DXGI_FORMAT_R16G16_FLOAT: return "R16G16_FLOAT";
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: return "R32G32B32A32_FLOAT";
+        case DXGI_FORMAT_R32_FLOAT: return "R32_FLOAT";
+        default: break;
     }
+    // Thread-safe enough for logging: a small ring of buffers so several
+    // formats can appear in one log line without clobbering each other.
+    static thread_local char buf[4][24];
+    static thread_local int which = 0;
+    which = (which + 1) & 3;
+    _snprintf_s(buf[which], sizeof(buf[which]), _TRUNCATE, "DXGI_FMT_%d",
+                static_cast<int>(f));
+    return buf[which];
 }
 
 // Milliseconds since the Unix epoch, from the system wall clock.
