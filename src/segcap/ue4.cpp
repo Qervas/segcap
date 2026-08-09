@@ -6,8 +6,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <utility>
+#include <vector>
 
 #include "log.h"
 
@@ -23,10 +26,45 @@ struct ReadableRange {
     uintptr_t begin;
     uintptr_t end;
 };
-std::vector<ReadableRange> g_readable;
+
+// The map is SHARED ACROSS THREADS and must be published atomically.
+//
+// It is read by IsReadable from the game thread (every marking write), the
+// discovery thread (millions of times during a structural scan) and the render
+// thread; it is rebuilt by whichever thread calls RefreshMemoryMap.
+//
+// The original version was a bare std::vector rebuilt in place:
+//
+//     g_readable.clear();            // readers are mid binary-search here
+//     ...
+//     g_readable.push_back(...);     // and it reallocates under them
+//
+// That is a straightforward data race and it did exactly what one would expect
+// -- the process died 63ms after two threads called RefreshMemoryMap in quick
+// succession, mid-walk, with no error logged. It had been latent for the whole
+// project because only one thread refreshed the map; adding continuous marking
+// gave it a second writer and a constant stream of game-thread readers, and it
+// began crashing within 80 seconds.
+//
+// Published as an immutable snapshot behind a shared_mutex: readers take a
+// shared lock (two atomics, and they do not contend with each other), the
+// writer builds a complete new vector off to the side and swaps it in under an
+// exclusive lock held for the duration of a move. A reader therefore never
+// observes a partially built map.
+std::shared_mutex g_readableMutex;
+std::shared_ptr<const std::vector<ReadableRange>> g_readable =
+    std::make_shared<const std::vector<ReadableRange>>();
+
+std::shared_ptr<const std::vector<ReadableRange>> ReadableSnapshot() {
+    std::shared_lock<std::shared_mutex> lock(g_readableMutex);
+    return g_readable;
+}
 
 void BuildReadableMap() {
-    g_readable.clear();
+    // Built into a local, so readers keep using the previous complete map for
+    // the whole of the (slow) VirtualQuery walk rather than seeing an empty one.
+    auto built = std::make_shared<std::vector<ReadableRange>>();
+
     SYSTEM_INFO si = {};
     GetSystemInfo(&si);
 
@@ -44,16 +82,22 @@ void BuildReadableMap() {
 
         if (committed && readable && !guarded) {
             const auto base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-            if (!g_readable.empty() && g_readable.back().end == base) {
-                g_readable.back().end = base + mbi.RegionSize;  // coalesce
+            if (!built->empty() && built->back().end == base) {
+                built->back().end = base + mbi.RegionSize;  // coalesce
             } else {
-                g_readable.push_back({base, base + mbi.RegionSize});
+                built->push_back({base, base + mbi.RegionSize});
             }
         }
         addr = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
         if (mbi.RegionSize == 0) break;
     }
-    LogInfo("ue4: %zu readable regions mapped", g_readable.size());
+
+    const size_t n = built->size();
+    {
+        std::unique_lock<std::shared_mutex> lock(g_readableMutex);
+        g_readable = std::move(built);
+    }
+    LogInfo("ue4: %zu readable regions mapped", n);
 }
 
 }  // namespace
@@ -64,20 +108,26 @@ bool IsReadable(const void* p, size_t bytes) {
     // Reject obviously bogus low addresses before searching.
     if (a < 0x10000) return false;
 
+    // Take one snapshot and search THAT. Holding a shared_ptr for the duration
+    // of the search means a concurrent RefreshMemoryMap can swap in a new map
+    // without the vector under this search ever being freed or resized.
+    const auto snap = ReadableSnapshot();
+    const std::vector<ReadableRange>& regions = *snap;
+
     // Binary search, not a linear walk. Discovery performs millions of
     // dereference checks; at a few thousand regions a linear scan turns this
     // into tens of billions of comparisons and the thread appears to hang.
-    size_t lo = 0, hi = g_readable.size();
+    size_t lo = 0, hi = regions.size();
     while (lo < hi) {
         const size_t mid = lo + (hi - lo) / 2;
-        if (g_readable[mid].end <= a) {
+        if (regions[mid].end <= a) {
             lo = mid + 1;
         } else {
             hi = mid;
         }
     }
-    return lo < g_readable.size() && a >= g_readable[lo].begin &&
-           a + bytes <= g_readable[lo].end;
+    return lo < regions.size() && a >= regions[lo].begin &&
+           a + bytes <= regions[lo].end;
 }
 
 bool Engine::LooksLikeUObject(void* obj) const {

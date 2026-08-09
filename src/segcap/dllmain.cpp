@@ -278,11 +278,13 @@ DWORD WINAPI DiscoverThread(LPVOID) {
         _snprintf_s(label, sizeof(label), _TRUNCATE, "t+%ds", stage);
         g_engine.ReportSample(label);
 
-        if (g_markCustomDepth && segcap::ue4::GetProcessEventHook().verified()) {
-            // Collect here, on the discovery thread: it walks ~350,000 slots and
-            // is read-only, so it must not run inside ProcessEvent.
-            g_marker.CollectCandidates(g_engine, true);
-        }
+        // Candidate collection deliberately does NOT happen here any more.
+        //
+        // It used to run on this thread as well as on the marking thread, so
+        // two threads walked the object array and rebuilt the shared readable-
+        // memory map concurrently. The map is now published safely, but the
+        // duplication was also just waste: a full walk of ~350,000 slots twice
+        // over, to produce the same pool. The marking loop owns collection.
     }
     if (g_engine.namesResolved()) g_engine.CountDerivedFrom("PrimitiveComponent");
     return 0;

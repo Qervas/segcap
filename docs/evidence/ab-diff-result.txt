@@ -31,3 +31,45 @@ The noise floor is not a formality. With a completely static camera, 12.2% of
 pixels still differ between two captures because Stray uses temporal AA and
 jitters the sample pattern every frame. Against a threshold of zero this test
 would report a visual change on every comparison regardless of what we did.
+
+## 8. Container format
+
+`tools/pack.py` bundles a session into one self-describing `.segcap` file:
+masks, colour frames and sidecars, indexed by frame, with the index at the end
+so any frame can be seeked without scanning.
+
+Compression lives in the tool, not in the DLL. The capture path runs inside a
+shipped game on the thread that presents frames, and everything on it has been
+kept to the minimum that cannot be done later. Linking a compressor into that
+path would add third-party code to the game's address space and CPU time to its
+present loop, to save disk that is not scarce. Compression is a pure function of
+bytes already written, so it belongs outside.
+
+zlib by default (Python stdlib, so the container reads anywhere with no install).
+The codec is recorded per record, so adding zstd later does not break existing
+files.
+
+Measured on a 75-frame 1280x720 session:
+
+| | raw | packed | ratio |
+|---|---|---|---|
+| masks | 69.1 MB | 0.7 MB | **104.6x** |
+| colour frames | 207.4 MB | 115.5 MB | 1.8x |
+| sidecars | 1.3 MB | 0.1 MB | 11.9x |
+| total | 277.8 MB | 116.3 MB | 2.4x |
+
+The two are reported separately on purpose. Masks are 8-bit indexed images with
+large flat regions -- close to the best case for a dictionary coder. Colour
+frames are photographic and barely compress. A single "2.4x" average would hide
+both facts and imply the format does something for colour that it does not.
+
+`--verify` decompresses every record and byte-compares it against the file it
+came from. 225/225 identical. A compression bug that corrupted one frame in a
+thousand would otherwise surface as a mysteriously bad training example months
+later, and "lossless" is a claim worth testing rather than assuming.
+
+The packer also **refuses** to build a container in which any mask lacks its
+sidecar. An 8-bit slot number means nothing alone -- slot 42 is a different
+object in different frames -- so a mask without its table is undecodable, not
+merely inconvenient. That is a property worth enforcing in code rather than
+documenting and hoping.
