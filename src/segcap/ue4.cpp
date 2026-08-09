@@ -584,14 +584,20 @@ std::vector<PropertyInfo> Engine::ListProperties(void* uclass, bool includeInher
         for (int n = 0; n < 4096 && field; ++n) {
             if (!IsReadable(reinterpret_cast<void*>(field), 0x50)) break;
 
+            // Offsets come from the CALIBRATED layout, not the constants. UE5
+            // shifted FField back 8 bytes relative to 4.25-4.27, and every
+            // FProperty field after the header moves with it -- so the same
+            // delta is applied to ArrayDim / ElementSize / OffsetInternal.
+            // On UE4 the shift is zero and this is identical to what it was.
+            const int shift = fieldShift();
             const auto nameIdx =
-                *reinterpret_cast<uint32_t*>(field + FFieldLayout::kNamePrivate);
+                *reinterpret_cast<uint32_t*>(field + fieldNameOffset_);
             const int32_t offset =
-                *reinterpret_cast<int32_t*>(field + FPropertyLayout::kOffsetInternal);
+                *reinterpret_cast<int32_t*>(field + FPropertyLayout::kOffsetInternal - shift);
             const int32_t size =
-                *reinterpret_cast<int32_t*>(field + FPropertyLayout::kElementSize);
+                *reinterpret_cast<int32_t*>(field + FPropertyLayout::kElementSize - shift);
             const int32_t dim =
-                *reinterpret_cast<int32_t*>(field + FPropertyLayout::kArrayDim);
+                *reinterpret_cast<int32_t*>(field + FPropertyLayout::kArrayDim - shift);
 
             std::string name = NameToString(nameIdx);
             // Sanity-bound the values. A property at offset 900000 or of size
@@ -613,17 +619,18 @@ std::vector<PropertyInfo> Engine::ListProperties(void* uclass, bool includeInher
                 }
 
                 if (info.type == "BoolProperty" &&
-                    IsReadable(reinterpret_cast<void*>(field + FBoolPropertyLayout::kFieldMask), 1)) {
+                    IsReadable(reinterpret_cast<void*>(
+                                   field + FBoolPropertyLayout::kFieldMask - shift), 1)) {
                     info.isBool = true;
-                    info.byteOffset =
-                        *reinterpret_cast<uint8_t*>(field + FBoolPropertyLayout::kByteOffset);
-                    info.fieldMask =
-                        *reinterpret_cast<uint8_t*>(field + FBoolPropertyLayout::kFieldMask);
+                    info.byteOffset = *reinterpret_cast<uint8_t*>(
+                        field + FBoolPropertyLayout::kByteOffset - shift);
+                    info.fieldMask = *reinterpret_cast<uint8_t*>(
+                        field + FBoolPropertyLayout::kFieldMask - shift);
                 }
 
                 out.push_back(std::move(info));
             }
-            field = *reinterpret_cast<uintptr_t*>(field + FFieldLayout::kNext);
+            field = *reinterpret_cast<uintptr_t*>(field + fieldNextOffset_);
         }
 
         if (!includeInherited) break;
@@ -672,6 +679,119 @@ void Engine::DumpStructLayout(void* ustruct, const char* label) {
                 asFField.empty() ? "-" : asFField.c_str());
     }
     LogInfo("ue4: --- end probe ---");
+}
+
+bool Engine::CalibrateFieldLayout() {
+    if (fieldLayoutCalibrated_) return true;
+    if (!nameBlocks_) return false;
+
+    // Any class with a decent number of reflected properties will do. These are
+    // engine classes present in every UE game.
+    static const char* kProbeClasses[] = {
+        "PrimitiveComponent", "SceneComponent", "Actor", "ActorComponent",
+    };
+
+    struct Candidate { size_t name, next; int distinct; };
+    Candidate best{FFieldLayout::kNamePrivate, FFieldLayout::kNext, 0};
+
+    for (const char* clsName : kProbeClasses) {
+        void* uclass = FindClass(clsName);
+        if (!uclass) continue;
+        const auto base = reinterpret_cast<uintptr_t>(uclass);
+        if (!IsReadable(reinterpret_cast<void*>(base + UStructLayout::kChildProperties), 8)) {
+            continue;
+        }
+        const auto first =
+            *reinterpret_cast<uintptr_t*>(base + UStructLayout::kChildProperties);
+        if (!first || !IsReadable(reinterpret_cast<void*>(first), 0x80)) continue;
+
+        for (size_t nameOff = 0x10; nameOff <= 0x30; nameOff += 4) {
+            for (size_t nextOff = 0x10; nextOff <= 0x28; nextOff += 8) {
+                if (nameOff == nextOff) continue;
+                uintptr_t f = first;
+                std::vector<std::string> seen;
+                for (int link = 0; link < 12 && f; ++link) {
+                    if (!IsReadable(reinterpret_cast<void*>(f), 0x80)) break;
+                    const std::string s =
+                        NameToString(*reinterpret_cast<uint32_t*>(f + nameOff));
+                    if (s.empty() || s.size() > 48 || s == "None") break;
+                    seen.push_back(s);
+                    f = *reinterpret_cast<uintptr_t*>(f + nextOff);
+                }
+                // DISTINCT names, not merely decodable ones. A wrong offset can
+                // land on a field that happens to hold one valid FName and
+                // repeat it down the chain -- observed on inZOI at +0x14, which
+                // produced eight links all reading "NavAvoidanceMask".
+                std::sort(seen.begin(), seen.end());
+                seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+                const int distinct = static_cast<int>(seen.size());
+                if (distinct > best.distinct) best = {nameOff, nextOff, distinct};
+            }
+        }
+        if (best.distinct >= 6) break;   // convincing enough; stop probing
+    }
+
+    if (best.distinct < 3) {
+        LogWarn("ue4: field-layout calibration found nothing convincing "
+                "(best %d distinct names); keeping defaults name@+0x%02zX next@+0x%02zX",
+                best.distinct, fieldNameOffset_, fieldNextOffset_);
+        return false;
+    }
+
+    fieldNameOffset_ = best.name;
+    fieldNextOffset_ = best.next;
+    fieldLayoutCalibrated_ = true;
+    LogInfo("ue4: field layout calibrated: name@+0x%02zX next@+0x%02zX "
+            "(%d distinct names; shift %+d vs UE4.25-4.27)",
+            fieldNameOffset_, fieldNextOffset_, best.distinct, -fieldShift());
+    return true;
+}
+
+void Engine::ProbeFieldNameOffset(void* ustruct, const char* label) {
+    if (!ustruct || !nameBlocks_) return;
+    const auto base = reinterpret_cast<uintptr_t>(ustruct);
+
+    if (!IsReadable(reinterpret_cast<void*>(base + UStructLayout::kChildProperties), 8)) {
+        LogWarn("ue4: %s: ChildProperties slot unreadable", label);
+        return;
+    }
+    const auto first = *reinterpret_cast<uintptr_t*>(base + UStructLayout::kChildProperties);
+    if (!first || !IsReadable(reinterpret_cast<void*>(first), 0x80)) {
+        LogWarn("ue4: %s: ChildProperties is null or unreadable (%llX)", label,
+                static_cast<unsigned long long>(first));
+        return;
+    }
+
+    LogInfo("ue4: === FField name-offset probe: %s, first field @ %llX ===",
+            label, static_cast<unsigned long long>(first));
+
+    // Score each candidate offset by how many links of the chain decode to a
+    // plausible name. One lucky hit proves nothing -- a random uint32 can
+    // resolve to some name in a 200,000-entry pool. A run of names down the
+    // chain is what identifies the real field.
+    for (size_t nameOff = 0x00; nameOff <= 0x48; nameOff += 4) {
+        for (size_t nextOff = 0x18; nextOff <= 0x28; nextOff += 8) {
+            uintptr_t f = first;
+            int decoded = 0;
+            std::string sample;
+            for (int link = 0; link < 8 && f; ++link) {
+                if (!IsReadable(reinterpret_cast<void*>(f), 0x80)) break;
+                const std::string s =
+                    NameToString(*reinterpret_cast<uint32_t*>(f + nameOff));
+                // A real property name is short, non-empty, and not "None".
+                if (s.empty() || s.size() > 48 || s == "None") break;
+                ++decoded;
+                if (sample.size() < 60) sample += (sample.empty() ? "" : ", ") + s;
+                f = *reinterpret_cast<uintptr_t*>(f + nextOff);
+            }
+            if (decoded >= 3) {
+                LogInfo("ue4:   name@+0x%02zX next@+0x%02zX -> %d links: %s",
+                        nameOff, nextOff, decoded, sample.c_str());
+            }
+        }
+    }
+    LogInfo("ue4: === end name-offset probe (nothing above = chain does not "
+            "decode at any tried offset) ===");
 }
 
 void* Engine::FindFunction(void* uclass, const char* functionName) {

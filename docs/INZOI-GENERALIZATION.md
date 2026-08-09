@@ -22,7 +22,7 @@ Every run below is **census mode**: no marking, no GPU work on the game's queue.
 | `GUObjectArray` discovery | **yes** | found in 15 ms; 8,719 → 534,153 slots |
 | `FName` resolution | **yes** | `block0[0]="None"`, 5 blocks corroborated, names decode correctly |
 | Class identification | **yes** | 9,512 distinct classes, 99.8% resolve rate |
-| **Property reflection** | **NO** | every class returns **0 reflected properties** |
+| **Property reflection** | **yes, after a fix** | 0 properties → **153** on `UPrimitiveComponent`; see below |
 | ProcessEvent discovery | **NO — and it crashed the game** | see below |
 
 Two of the three layers carried over unchanged. The engine layer carried over
@@ -88,32 +88,89 @@ array yet at t=2s.
 
 ---
 
-## Where it stops: property reflection
+## Where it stopped, and how it was fixed
 
 ```
 introspect: 9512 DISTINCT CLASSES across 246284 objects
 introspect: --- PrimitiveComponent : 0 reflected properties ---
 introspect: --- SceneComponent : 0 reflected properties ---
-introspect: --- Actor : 0 reflected properties ---
 ```
 
-The classes are found. Walking their property chain returns nothing.
+The classes were found. Walking their property chain returned nothing. This was
+the real UE4→UE5 boundary, and everything downstream depended on it: property
+reflection is how `bRenderCustomDepth` is located as a packed bit, how
+`CustomDepthStencilValue` is written, and how the agent reads the pawn
+transform. No properties meant no marking and no perception.
 
-This is the real UE4→UE5 boundary for this project. The offsets in `ue4.cpp` —
-`UStruct::ChildProperties` at `+0x50`, `PropertiesSize` at `+0x58`, the
-`FField`/`FProperty` layout with its `FName` at `+0x28` — are UE 4.25–4.27
-values. UE5 moved them.
+### Step 1: dump the struct instead of guessing
 
-**Everything downstream depends on this.** Property reflection is how
-`bRenderCustomDepth` is located as a packed bit, how `CustomDepthStencilValue`
-is written, and how the agent reads the pawn transform. Without it there is no
-marking and no perception on UE5.
+`DumpStructLayout` prints each qword of a `UStruct` and tries to decode it under
+both the pre-4.25 and post-4.25 interpretations. Side by side with Stray:
 
-It is also the most tractable of the failures. `Engine::DumpStructLayout` was
-written for exactly this situation — it dumps a `UStruct`'s raw qwords and tries
-to interpret each under both the pre-4.25 and post-4.25 layouts, so the correct
-offset can be **read off** rather than guessed. That is a bounded piece of work,
-not a redesign.
+| offset | Stray (UE4) | inZOI (UE5) |
+|---|---|---|
+| `+0x40` | `SceneComponent` (SuperStruct) | `SceneComponent` — same |
+| `+0x48` | `WasRecentlyRendered` (Children) | `WasRecentlyRendered` — same |
+| `+0x50` | ptr → decodes `MinDrawDistance` | ptr → decodes **nothing** |
+
+So `ChildProperties` was at the same offset and was a valid pointer. The chain
+was there. What had moved was the layout *inside* `FField`.
+
+### Step 2: find the new offset by trying all of them
+
+`ProbeFieldNameOffset` walks every aligned offset in the first 0x48 bytes of the
+first field, follows the chain at several candidate `Next` offsets, and prints
+which combinations decode into readable names:
+
+```
+name@+0x14 next@+0x18 -> 8 links: NavAvoidanceMask, NavAvoidanceMask, NavAvoidanceMask...
+name@+0x20 next@+0x18 -> 8 links: MinDrawDistance, LDMaxDrawDistance,
+                                  CachedMaxDrawDistance, DepthPriorityGroup
+```
+
+The second row is the answer — those are the same four properties, in the same
+order, as Stray's UE4 dump. **UE5 shifted `FField` back 8 bytes:
+`NamePrivate` 0x28 → 0x20, `Next` 0x20 → 0x18.**
+
+The first row matters too. It decoded eight links, so a test that counted
+successful decodes would have accepted it — but every link is the *same name*.
+Printing the decoded sample rather than a count is what exposed it, and the
+calibration below scores on **distinct** names for that reason.
+
+### Step 3: calibrate at runtime, do not swap one constant for another
+
+`CalibrateFieldLayout()` runs once after discovery on every run. It tries the
+candidate offsets against classes known to have properties and keeps whichever
+yields the most distinct decoded names. The UE4 values remain the default, so a
+build where calibration cannot run behaves exactly as it did before. The same
+delta is applied to the `FProperty` fields that follow the header
+(`ArrayDim`, `ElementSize`, `OffsetInternal`, and the `FBoolProperty` bit
+fields), since the whole struct moved together.
+
+```
+ue4: field layout calibrated: name@+0x20 next@+0x18
+     (12 distinct names; shift -8 vs UE4.25-4.27)
+introspect: --- PrimitiveComponent : 153 reflected properties ---
+introspect:   +0x0271  1  BoolProperty  bRenderCustomDepth
+introspect:   +0x02A4  4  IntProperty   CustomDepthStencilValue
+```
+
+**Both marking properties are found on UE5**, at completely different offsets
+from Stray's (`+0x216` mask `0x40`, and `+0x220`) — located by name, which is
+the whole point of doing this by reflection.
+
+Verified not to regress UE4: a full Stray capture run after the change produced
+201 masks / 200 frames / 201 sidecars, resolved `bRenderCustomDepth` at the
+unchanged `+0x216 mask 0x40`, and passed label verification with 0 identities
+renamed.
+
+### What is still not done on inZOI
+
+Reflection works, so the route is open, but marking has not been attempted:
+`ProcessEvent` discovery still has no UE5 answer, and it is the game-thread
+execution point every write depends on. That is the next wall, and unlike this
+one it is genuinely dangerous — probing vtable slots is what killed the game
+earlier in this session.
 
 ---
 

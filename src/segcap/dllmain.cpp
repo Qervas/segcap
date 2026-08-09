@@ -44,6 +44,7 @@ std::vector<std::string> g_introspectClasses;
 // either has already cost this project a run.
 void Introspect(segcap::ue4::Engine& engine, const std::vector<std::string>& classes) {
     engine.RefreshMemoryMap();
+    engine.CalibrateFieldLayout();
 
     std::unordered_map<std::string, int> histogram;
     const int32_t total = engine.NumObjects();
@@ -76,6 +77,24 @@ void Introspect(segcap::ue4::Engine& engine, const std::vector<std::string>& cla
         for (const auto& p : props) {
             segcap::LogInfo("introspect:   +0x%04X %-4d %-22s %s",
                             p.offset, p.size, p.type.c_str(), p.name.c_str());
+        }
+
+        // Zero properties means the property CHAIN offsets are wrong for this
+        // engine build, not that the class has no fields. Dump the raw UStruct
+        // so the correct offset can be read off rather than guessed.
+        //
+        // This is the situation DumpStructLayout was written for: it prints
+        // each qword and tries to interpret it under BOTH the pre-4.25
+        // (UProperty: a UObject with its FName at +0x18) and post-4.25
+        // (FProperty: an FField with its FName at +0x28) layouts. Whichever
+        // one decodes into readable property names is the layout this build
+        // uses. Guessing the layout once already cost this project a day.
+        if (props.empty()) {
+            segcap::LogWarn("introspect: %s has 0 properties -- dumping raw UStruct "
+                            "to locate the property chain on this engine version",
+                            cls.c_str());
+            engine.DumpStructLayout(uclass, cls.c_str());
+            engine.ProbeFieldNameOffset(uclass, cls.c_str());
         }
     }
 }
@@ -234,6 +253,14 @@ DWORD WINAPI DiscoverThread(LPVOID) {
         segcap::LogInfo("ue4: discovery attempt %d", attempt);
         if (g_engine.Discover()) {
             segcap::LogInfo("ue4: discovery succeeded on attempt %d", attempt);
+            // Work out this build's FField layout immediately, before anything
+            // reads a property. It must run on EVERY run, not just census ones:
+            // it was originally called only from the introspection dump, which
+            // meant a real capture run on UE5 would have gone on using the
+            // UE4.25 offsets and found no properties at all -- the exact bug
+            // the calibration exists to fix, still present on the path that
+            // matters.
+            g_engine.CalibrateFieldLayout();
             break;
         }
         if (attempt == 40) {

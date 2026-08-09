@@ -276,6 +276,40 @@ public:
     // that fixed the RenderDoc analysis earlier in this project.
     void DumpStructLayout(void* ustruct, const char* label);
 
+    // Finds where the FName actually lives inside an FField, by trying every
+    // aligned offset and reporting which ones decode to readable names.
+    //
+    // Needed because FFieldLayout::kNamePrivate = 0x28 is a UE 4.25-4.27 value.
+    // On inZOI (UE5) the ChildProperties pointer at UStruct+0x50 is present and
+    // valid -- the chain is there -- but reading its name at +0x28 yields
+    // nothing, so every class reports zero properties. The offset moved.
+    //
+    // Rather than guess a new constant, walk the first 0x60 bytes of the field
+    // and print every offset whose uint32 resolves to a plausible FName. The
+    // right answer is the one that produces a run of real property names, and
+    // it can be read off instead of inferred. Same move as DumpStructLayout,
+    // one level further in.
+    void ProbeFieldNameOffset(void* ustruct, const char* label);
+
+    // Works out the FField layout for THIS engine build and remembers it.
+    //
+    // The constants in FFieldLayout are UE 4.25-4.27 values. UE5 shifted the
+    // struct back 8 bytes -- NamePrivate 0x28 -> 0x20, Next 0x20 -> 0x18 --
+    // measured on inZOI, where the property chain was present and valid at the
+    // usual UStruct+0x50 but decoded to nothing, so every class reported zero
+    // properties and the whole marking route was dead.
+    //
+    // Rather than swap one hardcoded set for another and break UE4, this tries
+    // the candidates against a class whose properties are known to exist and
+    // keeps whichever decodes a chain of DISTINCT names. Distinctness matters:
+    // one candidate offset decoded eight links that were all the same name,
+    // which a count-only test would have accepted.
+    bool CalibrateFieldLayout();
+    size_t fieldNameOffset() const { return fieldNameOffset_; }
+    size_t fieldNextOffset() const { return fieldNextOffset_; }
+    int fieldShift() const { return static_cast<int>(FFieldLayout::kNamePrivate) -
+                                    static_cast<int>(fieldNameOffset_); }
+
     void* guObjectArray() const { return arrayAddress_; }
     bool namesResolved() const { return nameBlocks_ != nullptr; }
 
@@ -299,6 +333,12 @@ private:
     FChunkedFixedUObjectArray* objects_ = nullptr;
     void* arrayAddress_ = nullptr;
     uint8_t** nameBlocks_ = nullptr;
+
+    // Calibrated at runtime; defaults are the UE4.25-4.27 values so a build
+    // where calibration cannot run behaves exactly as before.
+    size_t fieldNameOffset_ = FFieldLayout::kNamePrivate;
+    size_t fieldNextOffset_ = FFieldLayout::kNext;
+    bool fieldLayoutCalibrated_ = false;
 
     uintptr_t moduleBase_ = 0;
     size_t moduleSize_ = 0;
