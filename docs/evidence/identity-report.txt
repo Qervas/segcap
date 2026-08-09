@@ -1,31 +1,31 @@
-session: 300 frames, 4662 .. 6456
+session: 320 frames, 4512 .. 7000
 
 1. ambiguity within a frame
    one slot naming two objects in the same frame: 0
    -> PASS - every frame's mask is unambiguously decodable
 
 2. slot reuse (is the 8-bit constraint actually being exercised?)
-   distinct identities seen : 451
+   distinct identities seen : 448
    distinct slots used      : 255 of 255
-   slots that carried >1 identity over the session: 123
-   busiest slot: 5 carried 7 different objects
+   slots that carried >1 identity over the session: 118
+   busiest slot: 7 carried 6 different objects
    -> recycling is exercised, so point 3 is a real test
 
 3. identity survives slot loss
-   identities that disappeared and came back: 25
-   identities that held more than one slot   : 25
+   identities that disappeared and came back: 20
+   identities that held more than one slot   : 20
 
    examples -- same object, different pixel value at different times:
-      id 4     slots 4,5                HierarchicalInstancedStaticMesh (HierarchicalInstancedStaticMeshComponent)
-      id 5     slots 5,6                HierarchicalInstancedStaticMesh (HierarchicalInstancedStaticMeshComponent)
-      id 6     slots 6,7                HierarchicalInstancedStaticMesh (HierarchicalInstancedStaticMeshComponent)
-      id 7     slots 7,9                HierarchicalInstancedStaticMesh (HierarchicalInstancedStaticMeshComponent)
-      id 8     slots 8,10               HierarchicalInstancedStaticMesh (HierarchicalInstancedStaticMeshComponent)
-      id 9     slots 9,11               HierarchicalInstancedStaticMesh (HierarchicalInstancedStaticMeshComponent)
+      id 96    slots 92,148             SkeletalMeshComponent0 (SkeletalMeshComponent)
+      id 139   slots 135,153            StaticMeshComponent0 (StaticMeshComponent)
+      id 140   slots 136,161            StaticMeshComponent0 (StaticMeshComponent)
+      id 143   slots 139,162            StaticMeshComponent0 (StaticMeshComponent)
+      id 148   slots 144,163            StaticMeshComponent0 (StaticMeshComponent)
+      id 149   slots 145,164            StaticMeshComponent0 (StaticMeshComponent)
 
 4. do the pixels agree with the tables?
-   masks checked          : 300
-   distinct ids in pixels : 20749
+   masks checked          : 320
+   distinct ids in pixels : 17196
    ids with no binding    : 0 (0.00% of ids, 0.000% of labelled pixels)
 
    An unbound id is a labelled region nobody can decode. The known

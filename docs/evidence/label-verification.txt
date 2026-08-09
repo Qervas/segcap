@@ -1,28 +1,28 @@
-session: 300 frames with sidecars
+session: 320 frames with sidecars
 
 1. identity consistency  (does a stableId always name the same object?)
-   identities tracked        : 451
+   identities tracked        : 448
    identities that changed   : 0
    -> PASS
 
 2. spatial coherence  (is one id one connected object?)
-   regions measured          : 1625
-   largest blob / total      : median 0.997, mean 0.853
-      5th percentile         : 0.401
-     25th percentile         : 0.724
-   regions <50% one blob     : 157 (9.7%)
-   DITHERED (stipple) regions: 10 (0.6%)  <- UE4 dithered LOD/opacity
+   regions measured          : 1723
+   largest blob / total      : median 1.000, mean 0.882
+      5th percentile         : 0.385
+     25th percentile         : 0.877
+   regions <50% one blob     : 176 (10.2%)
+   DITHERED (stipple) regions: 4 (0.2%)  <- UE4 dithered LOD/opacity
 
    most fragmented (occlusion does this legitimately):
-      0.015  frame 5766   slot 144  SkeletalMesh                546 px,   154 raw pieces
-      0.016  frame 5622   slot 144  SkeletalMesh                433 px,   144 raw pieces  [dithered]
-      0.018  frame 5742   slot 144  SkeletalMesh                455 px,   147 raw pieces  [dithered]
-      0.018  frame 5646   slot 144  SkeletalMesh                443 px,   148 raw pieces  [dithered]
-      0.020  frame 5718   slot 144  SkeletalMesh                410 px,   140 raw pieces  [dithered]
+      0.041  frame 5829   slot 160  StaticMeshComponent0      36823 px,    41 raw pieces
+      0.065  frame 5628   slot 160  StaticMeshComponent0      24876 px,    39 raw pieces
+      0.083  frame 5412   slot 160  StaticMeshComponent0      12245 px,    87 raw pieces
+      0.085  frame 5592   slot 160  StaticMeshComponent0      19198 px,    32 raw pieces
+      0.098  frame 5448   slot 160  StaticMeshComponent0      11074 px,   183 raw pieces
 
 3. temporal coherence  (does an id stay on the same physical thing?)
-   object-transitions measured : 874
-   displacement / frame median : median 1.00x, 95th 2.55x, max 12.18x
+   object-transitions measured : 947
+   displacement / frame median : median 1.00x, 95th 2.50x, max 8.07x
    objects moving >8x the scene, with stable area: 0 (0.000%)
 
 verdict

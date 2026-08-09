@@ -38,9 +38,13 @@
                   first D3D call, so descriptor coverage is complete.
     -windowed     no exclusive/borderless mode switch, so no NULL-foreground
                   window, so focus is stable from the moment the window exists.
-    -ResX/-ResY   1280x720. Fewer pixels is not cosmetic: every mask is a
-                  full-frame GPU->CPU readback, and 720p is a quarter of the
-                  bandwidth of the 2560x1600 the game defaulted to.
+    -ResX/-ResY   1920x1080. Pixel count is not cosmetic here: every mask is a
+                  full-frame GPU->CPU readback plus a file write on the present
+                  thread, so it is bandwidth on the game's critical path. 720p
+                  was used while the pipeline was being debugged (a quarter of
+                  the 2560x1600 the game defaults to); 1080p is for the demo,
+                  and doubles the per-frame cost again. If a run starts
+                  hitching, this is the first thing to lower.
 
   Measured: window up at t=6s and foreground held continuously, versus 20s+ and
   four consecutive focus failures through Steam.
@@ -331,7 +335,7 @@ if ($AbTest) {
 # --- 1. suspended launch + inject + resume -----------------------------------
 # One call does all three. Injection lands before the process executes a single
 # instruction of its own, which is the only way descriptor coverage is complete.
-$gameArgs = "-dx12 -windowed -ResX=1280 -ResY=720 -nosplash"
+$gameArgs = "-dx12 -windowed -ResX=1920 -ResY=1080 -nosplash"
 Write-Host "[auto] launching suspended and injecting"
 Write-Host "[auto]   $gameExe $gameArgs"
 
