@@ -25,10 +25,13 @@
 
 #include <ViGEm/Client.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+
+#include "../shared/agent_state.h"
 
 #pragma comment(lib, "setupapi.lib")
 
@@ -174,19 +177,135 @@ void MenuSequence(int presses) {
     }
 }
 
-// Walks and looks around so captured frames differ from each other.
+// ---------------------------------------------------------------------------
+// Closed-loop patrol.
 //
-// The pattern deliberately mixes movement and camera rotation. For segmentation
-// training data, what matters is that objects appear at varied positions,
-// scales, and occlusions -- standing still and rotating produces far less
-// variety than moving through the space.
-void Patrol(int seconds) {
-    Log("patrol: %d seconds of movement for scene variety", seconds);
+// The open-loop patrol below generates camera variety and nothing else. It does
+// not know where it is, whether it moved, or that it has been walking into the
+// same wall for four minutes. That was enough to prove the capture pipeline and
+// it is not enough to collect a dataset: an unattended run that wedges in a
+// corner after ninety seconds produces thousands of near-identical frames,
+// which is worse than producing none, because it looks like data.
+//
+// What makes closing the loop cheap here is that the capture project already
+// built the sensor. segcap.dll reads the player pawn's world transform out of
+// the engine by reflection and publishes it in shared memory, so "am I stuck?"
+// is a subtraction rather than a vision problem. Asking it from pixels would
+// mean fighting Stray's temporal AA, which changes 12% of pixels between two
+// frames of a completely static scene.
+//
+// Degrades cleanly: with no shared state -- segcap not injected, or no pawn
+// because we are at a menu -- this falls back to the open-loop pattern rather
+// than freezing.
+// ---------------------------------------------------------------------------
+
+struct StateReader {
+    HANDLE section = nullptr;
+    const segcap::AgentState* view = nullptr;
+
+    bool IsOpen() const { return view != nullptr; }
+
+    bool Open() {
+        if (view) return true;
+        section = OpenFileMappingA(FILE_MAP_READ, FALSE, segcap::kAgentStateName);
+        if (!section) return false;
+        view = static_cast<const segcap::AgentState*>(
+            MapViewOfFile(section, FILE_MAP_READ, 0, 0, sizeof(segcap::AgentState)));
+        if (!view) {
+            CloseHandle(section);
+            section = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    // Seqlock read: retry while the counter is odd (a write is in progress) or
+    // changed across the copy. Without this the agent could observe half of one
+    // position and half of the next, which as a stuck-detector input is worse
+    // than no reading at all -- it looks like motion.
+    bool Read(segcap::AgentState& out) const {
+        if (!view) return false;
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            const uint64_t before = view->seq;
+            if (before & 1ULL) continue;
+            MemoryBarrier();
+            out = *view;
+            MemoryBarrier();
+            if (view->seq == before) {
+                return out.magic == segcap::kAgentStateMagic;
+            }
+        }
+        return false;
+    }
+
+    void Close() {
+        if (view) { UnmapViewOfFile(view); view = nullptr; }
+        if (section) { CloseHandle(section); section = nullptr; }
+    }
+};
+
+// Escalating recovery. Cheap moves first, because they usually work.
+//
+// 0  back up          -- caught on a lip or a doorframe
+// 1  back + turn 90   -- facing a wall
+// 2  jump forward     -- a step or ledge the walk cannot climb (Stray's cat
+//                        jumps contextually, so A is the right button)
+// 3  turn ~180        -- the direction is a dead end; leave
+void Recover(int escalation) {
+    XUSB_REPORT r;
+    switch (escalation) {
+        case 0:
+            XUSB_REPORT_INIT(&r); r.sThumbLY = -22000;
+            Send(r); Sleep(700);
+            break;
+        case 1:
+            XUSB_REPORT_INIT(&r); r.sThumbLY = -18000; r.sThumbRX = 20000;
+            Send(r); Sleep(900);
+            break;
+        case 2:
+            XUSB_REPORT_INIT(&r); r.sThumbLY = 20000;
+            Send(r); Sleep(200);
+            r.wButtons = XUSB_GAMEPAD_A;
+            Send(r); Sleep(250);
+            r.wButtons = 0;
+            Send(r); Sleep(500);
+            break;
+        default:
+            XUSB_REPORT_INIT(&r); r.sThumbRX = 26000;
+            Send(r); Sleep(1200);
+            break;
+    }
+    Neutral();
+    Sleep(150);
+}
+
+// Patrol that reacts to whether it is actually moving.
+//
+// Policy, deliberately simple: walk the deterministic pattern, but measure
+// displacement between ticks. If the pawn has not moved while movement was
+// commanded, escalate through recovery behaviours -- back up, turn away, jump,
+// then turn further -- and resume. Escalation matters because the cheap fix
+// works most of the time and the expensive one is needed rarely; always doing
+// the expensive one would waste most of the session.
+//
+// The reader is opened LAZILY and retried, not once at startup. segcap cannot
+// publish until ProcessEvent is verified and the engine layer has resolved,
+// which measured at t+49.9s on Stray -- while vpad starts at t+7s. Opening once
+// meant the shared section did not exist yet, so the agent fell back to
+// open-loop for the entire run and said it was doing so exactly once, 40
+// seconds before the state it wanted became available.
+void Patrol(int seconds, StateReader& reader) {
+    Log("patrol: %d seconds", seconds);
     const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(seconds) * 1000;
+    ULONGLONG nextOpenAttempt = 0;
+    bool announced = false;
 
     // Deterministic, not random: a reproducible traversal means two capture runs
     // over the same level are comparable, which matters when validating that a
-    // change to the capture layer did not change the data.
+    // change to the capture layer did not change the data. The pattern mixes
+    // movement with camera rotation because objects need to appear at varied
+    // positions, scales and occlusions -- rotating on the spot produces far
+    // less variety than moving through the space.
     static const struct { SHORT lx, ly, rx; int ms; const char* what; } kSteps[] = {
         {     0,  24000,     0, 2500, "forward" },
         {     0,  24000,  9000, 2000, "forward + look right" },
@@ -198,11 +317,26 @@ void Patrol(int seconds) {
         {     0, -18000,     0, 1500, "back up" },
         {     0,      0,-16000, 1500, "turn back" },
     };
+    const size_t kStepCount = sizeof(kSteps) / sizeof(kSteps[0]);
 
-    size_t i = 0;
+    // 40 uu over a tick is a slow walk; below that with movement commanded means
+    // something is in the way. Stray's cat moves ~300 uu/s, so this is generous
+    // rather than trigger-happy -- a false "stuck" costs a pointless recovery,
+    // and being too eager to declare it would shred the traversal.
+    constexpr float kMovedThresholdUU = 40.0f;
+    constexpr int kStuckTicksToAct = 6;        // ~600ms of no progress
+
+    size_t stepIdx = 0;
+    int stuckTicks = 0;
+    int recoveries = 0;
+    int escalation = 0;
+    bool haveLast = false;
+    float lastX = 0, lastY = 0, lastZ = 0;
+    ULONGLONG lastSampleMs = 0;
+
     while (GetTickCount64() < deadline) {
-        const auto& s = kSteps[i % (sizeof(kSteps) / sizeof(kSteps[0]))];
-        ++i;
+        const auto& s = kSteps[stepIdx % kStepCount];
+        ++stepIdx;
 
         XUSB_REPORT r;
         XUSB_REPORT_INIT(&r);
@@ -210,23 +344,65 @@ void Patrol(int seconds) {
         r.sThumbLY = s.ly;
         r.sThumbRX = s.rx;
         Send(r);
-        Log("  %s", s.what);
 
-        // Re-send the held state at ~10Hz rather than sleeping on it.
-        //
-        // Two reasons. A real pad reports continuously, and some titles treat a
-        // silent gap as the pad going away. More importantly for the dataset:
-        // this gives the input log regular samples instead of one record every
-        // couple of seconds, so a frame can be joined to an action without
-        // extrapolating across a long hold.
         const ULONGLONG until = GetTickCount64() + static_cast<ULONGLONG>(s.ms);
         while (GetTickCount64() < until && GetTickCount64() < deadline) {
             Sleep(100);
-            Send(r);
+            Send(r);          // hold the state, and keep the input log sampled
+
+            // Keep trying to attach until segcap publishes.
+            if (!reader.IsOpen() && GetTickCount64() > nextOpenAttempt) {
+                nextOpenAttempt = GetTickCount64() + 2000;
+                if (reader.Open()) Log("  engine state attached -- closed loop active");
+            }
+            if (!reader.IsOpen()) {
+                if (!announced) {
+                    Log("  no engine state yet -- open loop until segcap publishes");
+                    announced = true;
+                }
+                continue;
+            }
+
+            segcap::AgentState st;
+            if (!reader.Read(st) || !st.hasPawn) {
+                // No pawn: menu, loading, or a cutscene. Not stuck -- just not
+                // in control. Reset so the first frames after regaining control
+                // are not immediately judged.
+                haveLast = false;
+                stuckTicks = 0;
+                continue;
+            }
+            if (st.timestampMs == lastSampleMs) continue;   // no new publish yet
+            lastSampleMs = st.timestampMs;
+
+            if (haveLast) {
+                const float dx = st.posX - lastX, dy = st.posY - lastY, dz = st.posZ - lastZ;
+                const float moved = std::sqrt(dx * dx + dy * dy + dz * dz);
+                const bool commandedMove = (s.lx != 0 || s.ly != 0);
+                if (commandedMove && moved < kMovedThresholdUU) {
+                    ++stuckTicks;
+                } else {
+                    stuckTicks = 0;
+                    escalation = 0;
+                }
+            }
+            lastX = st.posX; lastY = st.posY; lastZ = st.posZ;
+            haveLast = true;
+
+            if (stuckTicks >= kStuckTicksToAct) {
+                ++recoveries;
+                Log("  STUCK at (%.0f, %.0f, %.0f) -- recovery %d, escalation %d",
+                    lastX, lastY, lastZ, recoveries, escalation);
+                Recover(escalation);
+                escalation = (escalation + 1) % 4;
+                stuckTicks = 0;
+                haveLast = false;
+                break;                     // re-pick a step after recovering
+            }
         }
     }
     Neutral();
-    Log("patrol complete");
+    Log("patrol complete (%d recoveries)", recoveries);
 }
 
 void Usage(const char* exe) {
@@ -291,7 +467,13 @@ int main(int argc, char** argv) {
     }
 
     if (doMenu) MenuSequence(menuPresses);
-    if (patrolSeconds > 0) Patrol(patrolSeconds);
+
+    if (patrolSeconds > 0) {
+        StateReader reader;
+        reader.Open();                 // may fail; Patrol retries
+        Patrol(patrolSeconds, reader);
+        reader.Close();
+    }
 
     Neutral();
     Disconnect();

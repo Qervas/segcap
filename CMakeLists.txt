@@ -74,6 +74,7 @@ add_library(segcap SHARED
   src/segcap/ue4.cpp
   src/segcap/customdepth.cpp
   src/segcap/identity.cpp
+  src/segcap/perception.cpp
 )
 target_link_libraries(segcap PRIVATE minhook d3d12 dxgi psapi)
 set_target_properties(segcap PROPERTIES

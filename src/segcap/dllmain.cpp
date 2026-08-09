@@ -12,6 +12,7 @@
 #include "customdepth.h"
 #include "hooks.h"
 #include "log.h"
+#include "perception.h"
 #include "ue4.h"
 
 namespace {
@@ -333,6 +334,15 @@ DWORD WINAPI DiscoverThread(LPVOID) {
 // per second, a few milliseconds of game-thread time.
 DWORD WINAPI MarkLoopThread(LPVOID) {
     segcap::LogInfo("customdepth: continuous visibility-tracked marking started");
+
+    // Perception rides along on the same game-thread tick as marking.
+    //
+    // It reads the player pawn's transform so an external agent can tell
+    // whether it is actually moving. Deliberately on this thread and not a new
+    // one: it chases UObject pointers, which is only safe on the game thread,
+    // and RunOnGameThread already exists here.
+    segcap::GetPerception().StartPublishing();
+
     int tick = 0;
     for (;;) {
         Sleep(250);
@@ -340,6 +350,15 @@ DWORD WINAPI MarkLoopThread(LPVOID) {
 
         auto& pe = segcap::ue4::GetProcessEventHook();
         if (!pe.verified() || !g_marker.ready()) continue;
+
+        pe.RunOnGameThread([](segcap::ue4::Engine& e) {
+            auto& p = segcap::GetPerception();
+            if (!p.ready() && !p.Resolve(e)) return;
+            segcap::AgentState s = {};
+            p.Sample(e, s);          // hasPawn=0 is a normal answer, not a failure
+            s.liveSlots = static_cast<uint32_t>(g_marker.markedCount());
+            p.Publish(s);
+        });
 
         pe.RunOnGameThread([](segcap::ue4::Engine& e) { g_marker.RefreshVisibility(e, 120); });
         pe.RunOnGameThread([](segcap::ue4::Engine& e) { g_marker.MarkBatch(e, 300); });

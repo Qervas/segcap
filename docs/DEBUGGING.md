@@ -836,9 +836,67 @@ always move together and are always adjacent — would still pass. True ground
 truth needs intervention: unmark one primitive and confirm exactly its pixels
 vanish. That is a live-run test and is not built.
 
----
+### 7.15 Closing the loop: the pad had no idea whether it was moving
 
-## 8. What I would do differently
+The patrol was nine hardcoded steps on a cycle. Open loop. It did not know where
+it was, whether it had moved, or that it had been walking into the same wall for
+four minutes. That was enough to prove the capture pipeline and it is the wrong
+thing for a dataset collector: an unattended run that wedges in a corner after
+ninety seconds produces thousands of near-identical frames, which is worse than
+producing none, because it looks like data.
+
+What made closing it cheap is that the sensor already existed. The segmentation
+work had built `GUObjectArray` traversal, `FName` resolution and property lookup
+by name; asking those the question "where is the player" is the same machinery
+pointed somewhere else. Resolved entirely by name, no hardcoded offsets:
+
+```
+perception: Pawn +0x258  AcknowledgedPawn +0x2A8  RootComponent +0x138
+perception: RelativeLocation +0x11C  RelativeRotation +0x128
+```
+
+"Am I stuck?" from a screenshot is a hard problem against a game whose temporal
+AA changes 12% of pixels between two frames of a *static* scene. Given the pawn
+transform it is a subtraction.
+
+**Two things worth recording about the build.**
+
+*The shared block is a seqlock, not a plain struct.* The writer is the game
+thread, the reader is another process, and there is no lock between them. A torn
+read would hand the agent a position that never existed — half of last frame's
+coordinates and half of this frame's — which as a stuck-detector input is worse
+than no reading at all, because it looks like motion.
+
+*The first run silently did nothing.* vpad opened the shared section once at
+startup, failed, and fell back to open loop for the entire run:
+
+```
+t+7.0s   vpad starts, OpenFileMapping fails
+t+49.9s  segcap: publishing agent state
+```
+
+Perception cannot publish until ProcessEvent is verified and the engine layer
+has resolved. The agent announced the fallback exactly once, forty seconds
+before the thing it wanted appeared. Fixed by retrying the open every 2s and
+attaching mid-run — and it is the same shape as every timing bug in §7: a check
+performed once, at the wrong moment, reporting a true answer that stopped being
+true immediately afterwards.
+
+**Result.** 47 recoveries in a 260-second run, and the positions show real
+traversal rather than circling:
+
+```
+(-1682, 4432) -> (-771, 4210) -> (606, 4064) -> (1722, 4492) -> (8, 3376)
+```
+
+Distinct objects encountered per session went from **~450 to 1,317** — roughly
+2.9x — because the agent covers the level instead of one corridor. Within the
+captured 30-second window the gain is smaller (344 to 451), which is the capture
+budget, not the agent: the run explores for 260s and only 30s of it is
+photographed.
+
+Label quality is unchanged by any of it: 0 identities renamed, 0 objects moving
+against the scene, median region still 0.997 of one blob.
 
 1. **Verify on the fixture before the game, always.** The one crash would have
    been caught in 12 seconds by the 3-buffer fixture I already had.

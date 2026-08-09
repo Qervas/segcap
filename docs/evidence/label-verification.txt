@@ -1,35 +1,29 @@
 session: 300 frames with sidecars
 
 1. identity consistency  (does a stableId always name the same object?)
-   identities tracked        : 344
+   identities tracked        : 451
    identities that changed   : 0
    -> PASS
 
 2. spatial coherence  (is one id one connected object?)
-   regions measured          : 4236
-   largest blob / total      : median 1.000, mean 0.907
-      5th percentile         : 0.503
-     25th percentile         : 0.918
-   regions <50% one blob     : 204 (4.8%)
-   DITHERED (stipple) regions: 41 (1.0%)  <- UE4 dithered LOD/opacity
+   regions measured          : 1625
+   largest blob / total      : median 0.997, mean 0.853
+      5th percentile         : 0.401
+     25th percentile         : 0.724
+   regions <50% one blob     : 157 (9.7%)
+   DITHERED (stipple) regions: 10 (0.6%)  <- UE4 dithered LOD/opacity
 
    most fragmented (occlusion does this legitimately):
-      0.013  frame 5840   slot 136  Droid_Head                 4615 px,  4615 raw pieces  [dithered]
-      0.014  frame 5894   slot 136  Droid_Head                 4370 px,  4370 raw pieces  [dithered]
-      0.019  frame 5822   slot 136  Droid_Head                 4644 px,  4644 raw pieces  [dithered]
-      0.019  frame 5804   slot 136  Droid_Head                 4901 px,  4901 raw pieces  [dithered]
-      0.019  frame 6884   slot 30   CharacterMesh0             3583 px,  3555 raw pieces  [dithered]
+      0.015  frame 5766   slot 144  SkeletalMesh                546 px,   154 raw pieces
+      0.016  frame 5622   slot 144  SkeletalMesh                433 px,   144 raw pieces  [dithered]
+      0.018  frame 5742   slot 144  SkeletalMesh                455 px,   147 raw pieces  [dithered]
+      0.018  frame 5646   slot 144  SkeletalMesh                443 px,   148 raw pieces  [dithered]
+      0.020  frame 5718   slot 144  SkeletalMesh                410 px,   140 raw pieces  [dithered]
 
 3. temporal coherence  (does an id stay on the same physical thing?)
-   object-transitions measured : 3068
-   displacement / frame median : median 0.86x, 95th 2.96x, max 31.94x
-   objects moving >8x the scene, with stable area: 3 (0.098%)
-   ...of which the camera was turning hard for: 2
-
-   worst offenders:
-        25.0x  frames 6830->6848  id 185   ToyoSplineMeshComponen moved 0.183 diag  [right stick 0%]
-        12.2x  frames 6020->6038  id 190   StaticMeshComponent0   moved 0.799 diag  [right stick 49%]
-        11.3x  frames 5696->5714  id 161   NODE_AddSplineMeshComp moved 0.820 diag  [right stick 49%]
+   object-transitions measured : 874
+   displacement / frame median : median 1.00x, 95th 2.55x, max 12.18x
+   objects moving >8x the scene, with stable area: 0 (0.000%)
 
 verdict
 ----------------------------------------------------------------------
