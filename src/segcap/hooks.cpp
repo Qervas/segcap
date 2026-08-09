@@ -45,6 +45,13 @@ constexpr int kIncumbencyBonus = 40;
 constexpr uint32_t kMaxCaptures = 150;
 constexpr uint64_t kCaptureStride = 30;
 
+// A/B mode needs its budget spread across the WHOLE session, not the start of
+// it. Marking cannot begin until ProcessEvent is verified and the level has
+// loaded, which is ~8,000 frames in; at stride 30 the 150-frame budget was
+// exhausted by frame 4,500 and every captured frame was from before the
+// transition being measured. There was no "after" side at all.
+constexpr uint64_t kAbCaptureStride = 120;   // ~2s at 60fps -> ~300s of coverage
+
 constexpr int kCreateCommittedResourceSlot = 27; // ID3D12Device::CreateCommittedResource
 constexpr int kResourceBarrierSlot = 26;     // ID3D12GraphicsCommandList::ResourceBarrier
 constexpr int kOMSetRenderTargetsSlot = 46;  // ID3D12GraphicsCommandList::OMSetRenderTargets
@@ -820,11 +827,24 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
 // converts. Frames are named by the same monotonic index as the masks, which is
 // what lets a mask and its frame be paired by filename alone.
 void Hooks::OnColourReady(const MaskFrame& frame) {
-    if (!recording_ || colourDumped_ >= kMaxCaptures) return;
-    // Only keep colour frames whose mask was also kept. An unpaired frame is
-    // dead weight -- make_demo can only use indices that have both.
-    if (!maskKept_.count(frame.frameIndex)) return;
-    ++colourDumped_;
+    if (colourDumped_ >= kMaxCaptures) return;
+
+    // A/B mode captures colour UNCONDITIONALLY on a stride.
+    //
+    // The normal rule -- keep a colour frame only if its mask was kept -- is
+    // right for the dataset and useless for the A/B test, because the whole
+    // point of the "before" side is that there is no mask yet. Without this the
+    // baseline condition produces zero frames and there is nothing to compare.
+    if (abTest_) {
+        if ((frame.frameIndex % kAbCaptureStride) != 0) return;
+        ++colourDumped_;
+    } else {
+        if (!recording_) return;
+        // Only keep colour frames whose mask was also kept. An unpaired frame is
+        // dead weight -- make_demo can only use indices that have both.
+        if (!maskKept_.count(frame.frameIndex)) return;
+        ++colourDumped_;
+    }
 
     wchar_t dllPath[MAX_PATH] = {};
     GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), dllPath, MAX_PATH);

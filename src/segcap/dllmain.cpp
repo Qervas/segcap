@@ -69,6 +69,17 @@ DWORD WINAPI InitThread(LPVOID) {
         segcap::LogInfo("mark marker %ls: %s", mk.c_str(),
                         g_markCustomDepth ? "PRESENT -- WILL MUTATE GAME STATE"
                                           : "absent (read-only run)");
+
+        // A/B mode. Captures colour frames on a stride from the moment the
+        // elected target is live, irrespective of mask content, so the
+        // marking-off condition yields frames to compare against.
+        std::wstring ab(marker);
+        const size_t dot3 = ab.find_last_of(L'.');
+        if (dot3 != std::wstring::npos) ab = ab.substr(0, dot3);
+        ab += L".abtest";
+        const bool abtest = GetFileAttributesW(ab.c_str()) != INVALID_FILE_ATTRIBUTES;
+        segcap::Hooks::Get().SetAbTest(abtest);
+        if (abtest) segcap::LogInfo("A/B MODE: colour frames captured unconditionally");
     }
 
     // The host may not have created its device yet when we are injected at

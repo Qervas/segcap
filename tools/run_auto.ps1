@@ -59,7 +59,13 @@
 param(
     [int]$Seconds = 240,
     [switch]$NoKill,
-    [switch]$NoMark
+    [switch]$NoMark,
+    # A/B run: hold the camera still and capture colour frames unconditionally,
+    # so frames from before marking begins can be compared against frames from
+    # after it. Done as ONE run rather than two: across two sessions the cat's
+    # idle animation and the NPCs are at different phases, which shows up as a
+    # large pixel difference that has nothing to do with CustomDepth.
+    [switch]$AbTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -300,6 +306,14 @@ if ($NoMark) {
     Write-Host "[auto] marking ENABLED"
 }
 
+$abFile = Join-Path $root "build\bin\segcap.abtest"
+if ($AbTest) {
+    Set-Content -Path $abFile -Value "1" -NoNewline
+    Write-Host "[auto] A/B mode: colour frames captured unconditionally on a stride"
+} else {
+    Remove-Item $abFile -ErrorAction SilentlyContinue
+}
+
 # --- 1. suspended launch + inject + resume -----------------------------------
 # One call does all three. Injection lands before the process executes a single
 # instruction of its own, which is the only way descriptor coverage is complete.
@@ -379,11 +393,20 @@ Start-Sleep -Seconds 5
 # SendInput was tried and Stray ignored it -- proven by the object array staying
 # at the menu's slot count after four scan-code taps. ViGEm presents the pad
 # through a kernel bus driver, so the game cannot tell it from real hardware.
-$patrolFor = [Math]::Max(30, $Seconds - 40)
-Write-Host "[auto] vpad: menu, then ${patrolFor}s patrol"
 $padOut = Join-Path $env:TEMP "vpad_out.txt"
-$pad = Start-Process -FilePath $vpad -NoNewWindow -PassThru -RedirectStandardOutput $padOut `
-    -ArgumentList "--menu --menu-presses 8 --patrol $patrolFor"
+if ($AbTest) {
+    # Menu only, then nothing. A moving camera would swamp the measurement:
+    # the question is whether MARKING changed the image, so everything else
+    # must be held as still as the engine allows.
+    Write-Host "[auto] vpad: menu only (A/B run holds the camera still)"
+    $pad = Start-Process -FilePath $vpad -NoNewWindow -PassThru -RedirectStandardOutput $padOut `
+        -ArgumentList "--menu --menu-presses 8"
+} else {
+    $patrolFor = [Math]::Max(30, $Seconds - 40)
+    Write-Host "[auto] vpad: menu, then ${patrolFor}s patrol"
+    $pad = Start-Process -FilePath $vpad -NoNewWindow -PassThru -RedirectStandardOutput $padOut `
+        -ArgumentList "--menu --menu-presses 8 --patrol $patrolFor"
+}
 
 # --- 4. run, watching for the in-level transition ----------------------------
 # The object array grows from ~175k slots at the menu to ~320k+ once a level

@@ -91,6 +91,10 @@ public:
     // which was fixed when Steam created the process, so we cannot influence it.
     void SetCensusOnly(bool on) { censusOnly_ = on; }
 
+    // A/B mode: capture colour frames on a fixed stride regardless of whether a
+    // mask was kept, so the "marking off" condition produces frames at all.
+    void SetAbTest(bool on) { abTest_ = on; }
+
     // ---- state recovered from the game ----------------------------------
 
     ID3D12Device* device() const { return device_; }
@@ -272,6 +276,7 @@ private:
     // Set from SEGCAP_CENSUS_ONLY=1. Suppresses all GPU work so an unfamiliar
     // title can be observed before anything is submitted on its queue.
     bool censusOnly_ = false;
+    bool abTest_ = false;
 };
 
 }  // namespace segcap

@@ -1,0 +1,33 @@
+noise floor -- the game's own frame-to-frame variation
+------------------------------------------------------------------------------
+off vs off (baseline)        max=  1  mean= 0.043  p99=  1  differing=  112690 (12.228%)
+on vs on                     max=  2  mean= 0.043  p99=  1  differing=  111831 (12.134%)
+
+the actual question -- marking off vs marking on
+------------------------------------------------------------------------------
+off vs on                    max=  2  mean= 0.045  p99=  1  differing=  116801 (12.674%)
+
+verdict
+------------------------------------------------------------------------------
+noise floor (mean) : 0.043
+off-vs-on   (mean) : 0.045
+ratio              : 1.04x the noise floor
+
+PASS: enabling CustomDepth marking does not change the rendered image
+      beyond the game's own frame-to-frame variation.
+
+Method
+------
+Single run, static camera (menu navigation only, no patrol), A/B capture mode.
+Marking took effect at frame 8031; frames 7560/7680 are before it and 8280/8400
+after, all from the same session so animation phase, streaming state and TAA
+history are continuous across the comparison.
+
+Two separate runs were rejected as a design: across sessions the cat's idle
+animation and the NPCs sit at different phases, which produces a large pixel
+difference that has nothing to do with CustomDepth.
+
+The noise floor is not a formality. With a completely static camera, 12.2% of
+pixels still differ between two captures because Stray uses temporal AA and
+jitters the sample pattern every frame. Against a threshold of zero this test
+would report a visual change on every comparison regardless of what we did.
