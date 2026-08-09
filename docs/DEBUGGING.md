@@ -898,6 +898,64 @@ photographed.
 Label quality is unchanged by any of it: 0 identities renamed, 0 objects moving
 against the scene, median region still 0.997 of one blob.
 
+### 7.16 My screenshots were cropping the evidence, and I read that as absence
+
+**Symptom.** inZOI's character would not move under any input. Camera worked,
+character did not. I inspected screenshot after screenshot, checked all four
+corners for game-speed controls, found none, and concluded the game was sitting
+in an edit view with no simulation running.
+
+**What Frank did.** Sent his own screenshot, containing a whole HUD strip I had
+never seen: a clock reading `7:03 AM`, a transport bar with pause / play / ×2 /
+×3 / ×4, a Zoi portrait panel, and a money counter.
+
+> *"bro this is full screenshots. yours not complete, why?"*
+
+**Cause.** His capture was 1990×1244. Mine reported the window as 1463×914 — and
+the window is really **2560×1600**. The display runs at 175% scaling and my
+PowerShell capture process was **DPI-unaware**, so Windows handed it virtualised
+coordinates. `GetWindowRect` and `CopyFromScreen` disagreed about what a pixel
+was, and the result was a silently cropped image.
+
+Not a corrupt image. Not an error. A perfectly good-looking screenshot of 57% of
+the window, every single time, with the bottom strip — where the time controls
+live — outside the frame.
+
+**Fix.** `SetProcessDPIAware()` before any window or graphics call. The window
+immediately reported 2560×1600, the missing HUD appeared, and with it a control
+line I had never seen at all: `R — Toggle Top View / Shoulder View`.
+
+**Why this belongs here.** It is §2.1, §2.3, §7.3 and §7.12 again, in a new
+place: *the instrument could not observe the thing it was being used to judge,
+and its silence read as a finding.* I spent several exchanges reasoning about why
+a life sim would have no time controls, when the honest answer was that I had
+never seen the bottom of the screen.
+
+Generalises past DPI: **when a capture is the evidence, verify the capture covers
+what you think it covers.** One comparison against a known-good screenshot would
+have caught it instantly — and the person holding a known-good screenshot was
+sitting right there.
+
+**What it unblocked.** With the full HUD visible, the rest fell out in three
+steps:
+
+```
+Y (radial)         reveals a legend the HUD does not otherwise show:
+                     D-pad L/R   Change Game Speed
+                     LT / RT     Switch Zoi
+click ▶ transport  the sim was PAUSED. The d-pad only enters widget
+                   navigation and cannot operate the transport bar, so
+                   this genuinely needs a mouse click.
+L stick            the Zoi walks.
+```
+
+Result: `Street (Editable)` → `North Beach (Editable)`, clock 7:04 → 7:21, Zoi
+mid-stride. Character control on inZOI, driven entirely by automation.
+
+---
+
+## 8. What I would do differently
+
 1. **Verify on the fixture before the game, always.** The one crash would have
    been caught in 12 seconds by the 3-buffer fixture I already had.
 2. **Never let a probe filter its own evidence.** Absent and misread must be
