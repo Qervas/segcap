@@ -96,6 +96,23 @@ public:
     // mask was kept, so the "marking off" condition produces frames at all.
     void SetAbTest(bool on) { abTest_ = on; }
 
+    // ID-buffer probe: read back a scene-resolution INTEGER render target and
+    // report what is in it.
+    //
+    // This is the second route to per-object identity, and the reason it
+    // matters is that it needs no engine mutation at all. On UE5 the
+    // CustomDepth route is blocked behind a ProcessEvent search that has no
+    // safe answer yet, but the readback path already works there -- so if the
+    // engine is already writing per-pixel ids into a buffer for its own
+    // purposes, reading it sidesteps the blocker entirely.
+    //
+    // The census found exactly one candidate shape on inZOI: R32_UINT at the
+    // scene's 1280x800, bound once per frame. Whether it holds object ids,
+    // material ids, or something else is not inferable from its format and
+    // size, which is what this probe exists to settle.
+    void SetProbeIdBuffer(bool on) { probeIdBuffer_ = on; }
+    bool probeIdBuffer() const { return probeIdBuffer_; }
+
     // Capture profile, read from marker files at startup.
     //
     // These are a genuine trade-off rather than a tuning knob, which is why
@@ -182,6 +199,7 @@ private:
     void NoteBind(ID3D12Resource* res, bool asDepth);
     void NoteClear(ID3D12Resource* res);
     void OnMaskReady(const MaskFrame& frame);
+    void OnIdBufferReady(const MaskFrame& frame);
 
     // ---- originals -------------------------------------------------------
     using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, UINT, UINT);
@@ -302,6 +320,10 @@ private:
     // title can be observed before anything is submitted on its queue.
     bool censusOnly_ = false;
     bool abTest_ = false;
+    bool probeIdBuffer_ = false;
+    Readback idRing_;
+    ID3D12Resource* idTarget_ = nullptr;
+    uint32_t idDumped_ = 0;
     uint32_t maxCaptures_ = 150;
     uint64_t captureStride_ = 60;
 };

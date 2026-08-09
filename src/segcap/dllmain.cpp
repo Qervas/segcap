@@ -157,6 +157,18 @@ DWORD WINAPI InitThread(LPVOID) {
         segcap::Hooks::Get().SetAbTest(abtest);
         if (abtest) segcap::LogInfo("A/B MODE: colour frames captured unconditionally");
 
+        // Probe a scene-resolution integer target -- the mutation-free route to
+        // per-pixel identity. Read-only: it copies a buffer the game already
+        // writes and never touches UObject state.
+        std::wstring idb(marker);
+        const size_t dot5 = idb.find_last_of(L'.');
+        if (dot5 != std::wstring::npos) idb = idb.substr(0, dot5);
+        idb += L".idbuf";
+        if (GetFileAttributesW(idb.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            segcap::Hooks::Get().SetProbeIdBuffer(true);
+            segcap::LogInfo("ID-BUFFER PROBE enabled (read-only)");
+        }
+
         // Optional capture profile. Each file holds a single integer.
         auto readInt = [&](const wchar_t* ext) -> unsigned long {
             std::wstring q(marker);
@@ -368,9 +380,16 @@ DWORD WINAPI DiscoverThread(LPVOID) {
     //
     // The mode was doing most of what it promised, which is exactly why nobody
     // noticed it was not doing all of it.
-    if (segcap::Hooks::Get().censusOnly()) {
-        segcap::LogInfo("census mode: skipping ProcessEvent discovery "
-                        "(probing vtable slots is not a read-only act)");
+    // The id-buffer probe needs GPU reads (so it is not census mode) but must
+    // NOT go looking for ProcessEvent. That search hooks arbitrary UObject
+    // vtable slots and calls them, and on UE5 it killed inZOI outright -- which
+    // is precisely the blocker the id-buffer route exists to go around. Running
+    // it here would reintroduce the crash while trying to avoid needing it.
+    if (segcap::Hooks::Get().censusOnly() || segcap::Hooks::Get().probeIdBuffer()) {
+        segcap::LogInfo("%s: skipping ProcessEvent discovery "
+                        "(probing vtable slots is not a read-only act)",
+                        segcap::Hooks::Get().censusOnly() ? "census mode"
+                                                          : "id-buffer probe");
         // Still do everything that IS read-only -- sampling and introspection
         // are the whole point of a census run.
         if (g_engine.namesResolved()) {

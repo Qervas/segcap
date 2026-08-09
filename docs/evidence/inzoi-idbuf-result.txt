@@ -1,0 +1,12 @@
+idbuf: probing integer target 0000015A7AC18B30
+idbuf frame 349: 1280x800 fmt=42 -- 1 DISTINCT VALUES over 1024000 pixels
+idbuf   0x00000000   1024000 px  100.00%
+idbuf: wrote C:\Users\djmax\Desktop\lab\tasks\build\bin\segcap_idbuf_349.pgm
+idbuf frame 350: 1280x800 fmt=42 -- 2 DISTINCT VALUES over 1024000 pixels
+idbuf   0x00000000    927246 px  90.55%
+idbuf   0x00100401     96754 px   9.45%
+idbuf: wrote C:\Users\djmax\Desktop\lab\tasks\build\bin\segcap_idbuf_350.pgm
+idbuf frame 351: 1280x800 fmt=42 -- 2 DISTINCT VALUES over 1024000 pixels
+idbuf   0x00000000    927724 px  90.60%
+idbuf   0x00100401     96276 px   9.40%
+idbuf: wrote C:\Users\djmax\Desktop\lab\tasks\build\bin\segcap_idbuf_351.pgm

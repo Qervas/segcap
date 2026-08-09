@@ -919,6 +919,80 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     WriteSidecar(frame);
 }
 
+// Reports what is actually inside a scene-resolution integer render target.
+//
+// The question this answers is not "does a buffer exist" -- the census already
+// said yes -- but "does it contain per-object identity". Three signals separate
+// the plausible answers, and none of them require knowing UE's internals:
+//
+//   how many distinct values      a handful  -> material or shading class
+//                                 hundreds+  -> per-object or per-cluster ids
+//   how the top values cluster    contiguous regions -> spatial objects
+//                                 scattered          -> not per-object
+//   whether 0 dominates           a mostly-empty buffer is a mask of something
+//                                 specific, not a general id buffer
+//
+// A PGM is written alongside, colouring by value hash, because a histogram
+// cannot show whether the regions line up with objects and a picture can.
+void Hooks::OnIdBufferReady(const MaskFrame& frame) {
+    if (idDumped_ >= 6) return;
+    if (frame.bytesPerPixel != 4) {
+        LogWarn("idbuf: expected 4 bytes/pixel, got %u", frame.bytesPerPixel);
+        return;
+    }
+    ++idDumped_;
+
+    std::unordered_map<uint32_t, uint32_t> hist;
+    hist.reserve(4096);
+    for (uint32_t y = 0; y < frame.height; ++y) {
+        const auto* row =
+            reinterpret_cast<const uint32_t*>(frame.data + static_cast<size_t>(y) * frame.rowPitch);
+        for (uint32_t x = 0; x < frame.width; ++x) ++hist[row[x]];
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> top(hist.begin(), hist.end());
+    std::sort(top.begin(), top.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    const size_t total = static_cast<size_t>(frame.width) * frame.height;
+    LogInfo("idbuf frame %llu: %ux%u fmt=%u -- %zu DISTINCT VALUES over %zu pixels",
+            frame.frameIndex, frame.width, frame.height, frame.format, hist.size(), total);
+    for (size_t i = 0; i < top.size() && i < 12; ++i) {
+        LogInfo("idbuf   0x%08X  %8u px  %5.2f%%", top[i].first, top[i].second,
+                100.0 * top[i].second / static_cast<double>(total));
+    }
+
+    // Visualise by hashing the value into a byte. Distinct ids become distinct
+    // greys; a buffer with four values looks like four flat regions and a
+    // per-object buffer looks like the scene.
+    wchar_t dllPath[MAX_PATH] = {};
+    GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), dllPath, MAX_PATH);
+    std::wstring dir(dllPath);
+    const size_t slash = dir.find_last_of(L"\\/");
+    dir = (slash == std::wstring::npos) ? L"." : dir.substr(0, slash);
+
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, _TRUNCATE, L"%ls\\segcap_idbuf_%llu.pgm", dir.c_str(), frame.frameIndex);
+    std::FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"wb") != 0 || !f) return;
+    std::fprintf(f, "P5\n%u %u\n255\n", frame.width, frame.height);
+    std::vector<uint8_t> row(frame.width);
+    for (uint32_t y = 0; y < frame.height; ++y) {
+        const auto* src =
+            reinterpret_cast<const uint32_t*>(frame.data + static_cast<size_t>(y) * frame.rowPitch);
+        for (uint32_t x = 0; x < frame.width; ++x) {
+            const uint32_t v = src[x];
+            // Cheap avalanche so neighbouring ids get far-apart greys.
+            uint32_t h = v * 2654435761u;
+            h ^= h >> 16;
+            row[x] = v == 0 ? 0 : static_cast<uint8_t>(16 + (h % 240));
+        }
+        std::fwrite(row.data(), 1, row.size(), f);
+    }
+    std::fclose(f);
+    LogInfo("idbuf: wrote %ls", path);
+}
+
 // Writes the colour backbuffer as a binary PPM (P6).
 //
 // PPM rather than PNG because the DLL has no image encoder and adding one to
@@ -1097,6 +1171,34 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
         electedProducedContent_ = false;
     }
     electedTarget_ = winner;
+
+    // ---- id-buffer probe -----------------------------------------------------
+    //
+    // Its own gate, deliberately NOT nested under the CustomDepth election.
+    // This is a different question about a different buffer, and on a title
+    // where no CustomDepth candidate is ever elected -- which is exactly the
+    // situation that makes this route interesting -- nesting it would mean the
+    // probe silently never runs.
+    if (probeIdBuffer_ && device_ && queue_ && idDumped_ < 6) {
+        if (!idTarget_) {
+            uint64_t bestArea = 0;
+            for (const TargetFingerprint& t : snapshot) {
+                if (!IsIntegerFormat(t.format)) continue;
+                // Scene-scale, not thumbnail. Nanite's culling and hierarchy
+                // buffers are integer targets too, and are 32x32 to 224x128.
+                if (backbufferWidth_ && t.width < backbufferWidth_ / 4) continue;
+                const uint64_t area = t.width * static_cast<uint64_t>(t.height);
+                if (area > bestArea) { bestArea = area; idTarget_ = t.resource; }
+            }
+            if (idTarget_) {
+                LogInfo("idbuf: probing integer target %p", static_cast<void*>(idTarget_));
+            }
+        }
+        if (idTarget_ && idRing_.Prepare(device_, idTarget_, 0 /*colour plane*/)) {
+            idRing_.Enqueue(queue_, idTarget_, StateOf(idTarget_), frameIndex_);
+        }
+        idRing_.Drain([this](const MaskFrame& f) { OnIdBufferReady(f); });
+    }
 
     // Census-only mode issues no GPU work at all: no copy, no barriers, nothing
     // submitted on the game's queue. Used for first contact with an unfamiliar
