@@ -130,6 +130,77 @@ void TestIdentitySurvivesSlotLoss() {
     Check(again == id, "the object resumes its original stable id after eviction");
 }
 
+void TestVoluntaryReleaseKeepsIdentity() {
+    std::printf("\nhanding a slot back voluntarily (object left the screen)\n");
+    segcap::IdentityRegistry reg;
+
+    // This covers ReleaseSlot, which is a DIFFERENT path from eviction and was
+    // added when marking became visibility-driven. Eviction is the registry
+    // deciding under pressure; release is the caller reporting that the
+    // renderer has stopped drawing the object. Only the eviction path was
+    // tested, and a live 75-frame session happened not to exercise release-and-
+    // return at all -- so this property was asserted in the design and
+    // demonstrated by nothing.
+    const uint64_t catId = reg.StableIdFor(Ptr(0xAAAA), 3, "SkeletalMeshComponent", "Cat");
+    const uint8_t catSlot = reg.LeaseSlot(Ptr(0xAAAA), 3, "SkeletalMeshComponent", "Cat", 1);
+    Check(catSlot != 0, "the object got a slot while visible");
+    Check(reg.liveSlots() == 1, "one slot live");
+
+    reg.ReleaseSlot(catSlot);
+    Check(reg.liveSlots() == 0, "releasing frees the slot for someone else");
+
+    // The binding must remain RESOLVABLE while the slot is unclaimed. The
+    // renderer can keep drawing the primitive into CustomDepth for a frame or
+    // two after the game thread unmarks it, and a mask pixel whose id is not in
+    // the table cannot be decoded at all.
+    {
+        const segcap::FrameSidecar trailing = reg.BuildSidecar(2, 1280, 720);
+        bool found = false;
+        for (const auto& b : trailing.bindings) {
+            if (b.slot == catSlot) found = (b.stableId == catId && b.released);
+        }
+        Check(found, "a released slot is still decodable, flagged released");
+    }
+
+    // Somebody else takes the freed slot. This is the case that would corrupt
+    // the mask if identity were carried by the slot number.
+    const uint8_t crateSlot =
+        reg.LeaseSlot(Ptr(0xBBBB), 7, "StaticMeshComponent", "Crate", 2);
+    Check(crateSlot == catSlot, "the freed slot is reissued to a different object");
+    Check(reg.StableIdFor(Ptr(0xBBBB), 7, "StaticMeshComponent", "Crate") != catId,
+          "the new occupant has its OWN identity, not the previous tenant's");
+
+    // The cat comes back. It must resume its original identity even though the
+    // slot it used to hold now belongs to something else, and even though it
+    // will be given a different pixel value than before.
+    const uint8_t catSlot2 = reg.LeaseSlot(Ptr(0xAAAA), 3, "SkeletalMeshComponent", "Cat", 3);
+    Check(catSlot2 != 0, "the returning object gets a slot again");
+    Check(catSlot2 != crateSlot, "not the one currently held by the crate");
+    Check(reg.StableIdFor(Ptr(0xAAAA), 3, "SkeletalMeshComponent", "Cat") == catId,
+          "the returning object resumes its ORIGINAL stable id under a new slot");
+    Check(reg.totalIdentities() == 2,
+          "two identities total -- the round trip did not invent a third");
+
+    // And the sidecar for the frame after the return must resolve both slots to
+    // the right objects, which is the whole point of emitting one per frame.
+    const segcap::FrameSidecar sc = reg.BuildSidecar(3, 1280, 720);
+    bool catOk = false, crateOk = false;
+    for (const auto& b : sc.bindings) {
+        if (b.slot == catSlot2) catOk = (b.stableId == catId && b.objectName == "Cat");
+        if (b.slot == crateSlot) crateOk = (b.objectName == "Crate");
+    }
+    Check(catOk && crateOk,
+          "the sidecar resolves the recycled slot and the returning object correctly");
+
+    // And the trailing binding must be GONE once the slot is reissued -- two
+    // entries for one slot is exactly the ambiguity the sidecar prevents.
+    int occurrences = 0;
+    for (const auto& b : sc.bindings) {
+        if (b.slot == crateSlot) ++occurrences;
+    }
+    Check(occurrences == 1, "a reissued slot appears exactly once, not twice");
+}
+
 void TestSidecarDecodesTheMask() {
     std::printf("\nthe sidecar is what makes a mask decodable\n");
     segcap::IdentityRegistry reg;
@@ -163,6 +234,7 @@ int main() {
     TestSlotExhaustionEvictsLeastRecentlyUsed();
     TestCurrentFrameObjectsAreNotEvicted();
     TestIdentitySurvivesSlotLoss();
+    TestVoluntaryReleaseKeepsIdentity();
     TestSidecarDecodesTheMask();
 
     std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL PASSED" : "FAILURES",

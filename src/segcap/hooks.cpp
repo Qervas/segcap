@@ -39,11 +39,15 @@ constexpr int kIncumbencyBonus = 40;
 // mask contained exactly one object. The data was not wrong, it was a
 // photograph of a transient.
 //
-// A stride of 30 gives two captures a second, so 150 of them span 75 seconds of
-// gameplay: long enough to cross rooms, change what is on screen, and show the
-// slot working set actually tracking the camera.
+// A stride of 60 gives one capture a second, so 150 of them span 150 seconds of
+// gameplay: long enough to cross rooms, change what is on screen, and -- the
+// reason it was raised from 30 -- long enough for objects to LEAVE the working
+// set and come back. At stride 30 the captured window was 37 seconds, over
+// which not one identity was released and re-acquired, so the analysis could
+// not demonstrate that identity survives slot loss. The mechanism was fine; the
+// observation window was too short to contain the event being claimed.
 constexpr uint32_t kMaxCaptures = 150;
-constexpr uint64_t kCaptureStride = 30;
+constexpr uint64_t kCaptureStride = 60;
 
 // A/B mode needs its budget spread across the WHOLE session, not the start of
 // it. Marking cannot begin until ProcessEvent is verified and the level has
@@ -951,11 +955,17 @@ void Hooks::WriteSidecar(const MaskFrame& frame) const {
     std::fprintf(f, "  \"bindings\": [\n");
     for (size_t i = 0; i < sc.bindings.size(); ++i) {
         const SlotBinding& b = sc.bindings[i];
+        // "released" marks a trailing binding: the object handed its slot back
+        // but its render proxy may not have caught up, so these pixels can
+        // still appear for a frame or two. A consumer that wants only current
+        // labels can filter on it; without it those pixels would simply be
+        // undecodable.
         std::fprintf(f,
                      "    {\"slot\": %u, \"stableId\": %llu, \"className\": \"%s\", "
-                     "\"objectName\": \"%s\", \"serial\": %d}%s\n",
+                     "\"objectName\": \"%s\", \"serial\": %d, \"released\": %s}%s\n",
                      b.slot, b.stableId, b.className.c_str(), b.objectName.c_str(),
-                     b.serialNumber, (i + 1 < sc.bindings.size()) ? "," : "");
+                     b.serialNumber, b.released ? "true" : "false",
+                     (i + 1 < sc.bindings.size()) ? "," : "");
     }
     std::fprintf(f, "  ]\n}\n");
     std::fclose(f);

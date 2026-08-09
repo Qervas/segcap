@@ -608,9 +608,75 @@ is free; rebuilding a 250-entry table per frame would not have been. History
 misses went from unmeasured to **1 in 76 frames**, and the remaining one is
 logged as a warning rather than silently trusted.
 
-Residual, honestly stated: a primitive unmarked mid-frame can still write its old
-stencil value for a frame or two while the render proxy rebuilds, so a small
-number of ids can outlive their binding. Not yet fixed.
+### 7.8b The residual, measured and then fixed
+
+The paragraph above originally ended "a small number of ids can outlive their
+binding. Not yet fixed." That was true and, as an estimate, wrong by an order of
+magnitude — because I had estimated it instead of measuring it.
+
+`tools/identity_report.py` cross-checks every mask's pixels against its sidecar.
+On a 37-second window it found 22 unbound ids, 0.27% of labelled pixels: small
+enough to justify the wave-through. On a 150-second window with real slot
+turnover it found **505 unbound ids, 3.17% of labelled pixels**. Same code, same
+defect; the short window simply did not contain enough of the event.
+
+Fix: `ReleaseSlot` moves the binding into a `recentlyReleased_` map instead of
+dropping it, and the sidecar emits those alongside the live ones flagged
+`"released": true`. The entry is removed the instant the slot is reissued, so
+the two maps stay disjoint and a slot can never appear twice. A consumer wanting
+only current labels filters on the flag; without it those pixels were simply
+undecodable.
+
+Re-measured on a fresh 150-second session: **0 unbound ids, 0.000% of labelled
+pixels**, across 3,476 distinct ids over 76 masks.
+
+The lesson is not "fix the residual". It is that "small enough to ignore" was a
+guess wearing the clothes of a measurement, and the number that justified it
+came from a window too short to contain the failure.
+
+### 7.8c The observation window was hiding the headline result too
+
+The same short window quietly undermined the project's central identity claim.
+
+`identity_report.py` checks three things, of which the third is the one that
+matters: an object that loses its slot and comes back must resume its ORIGINAL
+stableId, or every occlusion fragments one object into several tracks. On the
+37-second window:
+
+```
+2. slots that carried >1 identity over the session: 14   <- recycling happens
+3. identities that disappeared and came back      : 0
+   identities that held more than one slot        : 0    <- never observed
+```
+
+Slot recycling was exercised, so the data looked like a real test. It was not:
+no object ever left and returned inside that window, so the property was
+asserted by the design and demonstrated by nothing. I would have shipped
+"identity survives slot loss" as a claim with zero supporting evidence, in a
+report that otherwise looked thorough.
+
+Two responses, because they cover different failures:
+
+- A unit test for `ReleaseSlot`, which was new and had none. Eviction was
+  covered; voluntary release was not. Eight assertions including the one that
+  matters: the returning object resumes its original id *under a different
+  slot*, while the slot it used to hold now belongs to something else.
+- Capture stride raised from 30 to 60 so the observed window spans 150 seconds
+  rather than 37.
+
+On the longer window the property shows up plainly:
+
+```
+identities that disappeared and came back: 52
+identities that held more than one slot  : 55
+
+  id 26  slots 26,189,192   StaticMeshComponent0
+  id 29  slots 29,191,194   StaticMeshComponent0
+```
+
+One object, three different pixel values over a session, one identity
+throughout. That is the 8-bit channel actually carrying stable identity, rather
+than a design document saying it does.
 
 ### 7.9 One set doing two jobs
 
