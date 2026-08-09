@@ -632,6 +632,51 @@ submissions without incident, so the obvious suspect does not fit. It has not
 recurred across the six runs since. Unattributed, and marked as such rather than
 explained away.
 
+### 7.11 The second crash — a data race I had been walking past all project
+
+The game died 80 seconds into a run. The log simply stops, mid-collection:
+
+```
+79.859  ue4: [t+60s] array has 331701 slots      <- discovery thread
+79.922  ue4: 16459 readable regions mapped       <- marking thread
+<nothing>
+```
+
+Two threads, 63 milliseconds apart, both rebuilding the committed-memory map
+that `IsReadable` binary-searches. The map was a bare global vector rebuilt in
+place:
+
+```cpp
+void BuildReadableMap() {
+    g_readable.clear();            // readers are mid-search here
+    ...
+    g_readable.push_back(...);     // and it reallocates under them
+```
+
+`IsReadable` is called from the game thread on every marking write, from the
+discovery thread millions of times per structural scan, and from the render
+thread. So this was always a race. It survived the whole project only because
+exactly one thread ever refreshed the map, which made the window vanishingly
+small. Giving the marking loop its own `CollectCandidates` (§7.7) added a second
+writer *and* a continuous stream of game-thread readers, and it started killing
+the process within 80 seconds.
+
+Worth being precise about the mistake: I did not introduce the bug in §7.7, I
+introduced the *conditions that exposed it*. The unsafe publication had been
+sitting in the file since the first discovery run, reviewed several times, and I
+never looked at it as shared state because only one thread happened to write it.
+
+Fix: publish the map as an immutable snapshot behind a `shared_mutex`. The
+builder fills a fresh vector off to the side and swaps it in under an exclusive
+lock; readers take a shared lock, copy the `shared_ptr`, and search that. A
+reader can therefore never observe a partially built map, and the map it is
+searching cannot be freed underneath it. The duplicate collection pass on the
+discovery thread was removed as well — two full walks of 350,000 slots were
+producing the same pool.
+
+Verified with a clean 320-second run: no crash, 76 masks, 393,415 visibility
+tests, 0 evictions.
+
 ---
 
 ## 8. What I would do differently
@@ -659,3 +704,8 @@ explained away.
 8. **The engine usually already knows.** `WasRecentlyRendered` was in the
    reflected function list from the first successful discovery run. I spent a
    run building a slot lottery before reading the list I had already printed.
+9. **Re-audit shared state when you add a thread, not when it crashes.** §7.11
+   was unsafe from the first commit and invisible because only one thread wrote
+   it. Adding a writer is the moment to re-read every global the new thread can
+   reach — that review takes minutes, and the crash cost a full run plus the
+   diagnosis.
