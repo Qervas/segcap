@@ -24,6 +24,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -70,17 +71,46 @@ public:
     // stencil slots on objects that produce no pixels, and there are only 255.
     int CollectCandidates(ue4::Engine& engine, bool renderableOnly = true);
 
-    // Marks up to `limit` pending candidates. MUST run on the game thread.
-    // Bounded because each mark issues two UFunction calls inside ProcessEvent,
-    // and a large batch would stall the engine's dispatch.
-    int MarkBatch(ue4::Engine& engine, int limit);
+    // Scans up to `scanLimit` candidates and marks the ones the renderer has
+    // actually drawn recently. MUST run on the game thread.
+    //
+    // Bounded because every candidate tested costs a UFunction call inside the
+    // engine's own dispatch, and each mark costs two more.
+    //
+    // Testing visibility BEFORE spending a slot is the difference between a
+    // working mask and an empty one. An earlier version marked the first 255
+    // candidates it found. In the menu that happened to produce content, because
+    // there were few enough objects that some of them were on screen. In a real
+    // level there are 32,836 markable primitives and maybe a few hundred visible
+    // at once, so 255 arbitrary picks contained no visible object at all and
+    // every mask came back empty -- while the logs cheerfully reported "255 live
+    // slots, 0 evictions", which is a perfectly healthy-looking way to describe
+    // labelling 255 things nobody can see.
+    int MarkBatch(ue4::Engine& engine, int scanLimit);
+
+    // Re-tests up to `limit` currently-marked primitives and hands back the
+    // slots of any the renderer has stopped drawing. MUST run on the game
+    // thread. This is what lets the 255-slot working set follow the camera
+    // instead of being decided once and frozen.
+    int RefreshVisibility(ue4::Engine& engine, int limit);
 
     size_t pendingCount() const { return pending_.size(); }
+    size_t markedCount() const { return marked_.size(); }
 
     // Thread-safe snapshot of the current slot table, for emitting alongside a
     // captured mask. Marking runs on the game thread; mask dumps happen on the
     // render thread, so the table cannot simply be read across.
     FrameSidecar SnapshotSidecar(uint64_t frameIndex, uint32_t w, uint32_t h) const;
+
+    // The current slot table as an immutable, shareable snapshot.
+    //
+    // Published by the marking thread whenever the table actually changes,
+    // which is a few times a second -- not per frame. The render thread can
+    // therefore record "which table produced this frame" by copying a
+    // shared_ptr, at no per-frame cost, and a mask that lands several frames
+    // later is still written out with the table that was live when its pixels
+    // were rendered.
+    std::shared_ptr<const FrameSidecar> publishedSidecar() const;
 
     IdentityRegistry& identity() { return identity_; }
 
@@ -99,6 +129,20 @@ public:
 private:
     bool WriteMarked(void* component, uint8_t stencilValue, MarkedPrimitive& out);
 
+    // Asks the ENGINE whether it drew this primitive recently, via the
+    // UPrimitiveComponent::WasRecentlyRendered UFunction.
+    //
+    // Deliberately the engine's own answer rather than a reimplementation.
+    // Computing visibility ourselves would mean frustum culling against the
+    // active camera, then occlusion, then LOD and distance culling -- and any
+    // disagreement with the renderer produces slots leased to objects that
+    // contribute no pixels. The engine already knows; asking it is both less
+    // code and more correct.
+    bool WasRecentlyRendered(void* component, float toleranceSeconds);
+
+    // Turns the CustomDepth flag back off and forgets the primitive.
+    bool UnmarkPrimitive(const MarkedPrimitive& mp);
+
     bool resolved_ = false;
     ue4::PropertyInfo propRenderCustomDepth_;
     ue4::PropertyInfo propStencilValue_;
@@ -108,12 +152,23 @@ private:
     // proxy -- without it the renderer never learns the flag changed.
     void* fnSetRenderCustomDepth_ = nullptr;
     void* fnSetCustomDepthStencilValue_ = nullptr;
+    // UPrimitiveComponent::WasRecentlyRendered(float Tolerance) -> bool.
+    void* fnWasRecentlyRendered_ = nullptr;
 
     std::vector<MarkedPrimitive> marked_;
     std::unordered_map<uint8_t, MarkedPrimitive> slotTable_;
-    // Marking runs repeatedly as the level streams in. Without this, each pass
-    // would reassign a different slot to the same object, making identities
-    // unstable across frames for no reason.
+    // Two DIFFERENT sets, which were one set until the visibility sweep made the
+    // distinction matter.
+    //
+    // `pooled_`       -- component is already in `pending_`; stops repeated
+    //                    collection passes queueing it twice as the level
+    //                    streams in.
+    // `alreadyMarked_`-- component currently holds a stencil slot.
+    //
+    // Sharing one set for both meant "queued" implied "marked", so once
+    // collection had run, the visibility sweep skipped every candidate as
+    // already marked and could never mark anything at all.
+    std::unordered_set<void*> pooled_;
     std::unordered_set<void*> alreadyMarked_;
 
     // Candidates found by CollectCandidates, waiting to be marked on the game
@@ -125,8 +180,17 @@ private:
         std::string className;
         std::string name;
     };
+    // The candidate POOL, not a queue.
+    //
+    // Candidates are no longer consumed when scanned. A primitive that is off
+    // screen now may be the subject of the shot ten seconds from now, so
+    // discarding it on first inspection would mean it could never be labelled.
+    // `scanCursor_` sweeps the pool round-robin, which also spreads the cost of
+    // visibility testing evenly instead of hammering the same prefix.
     std::vector<Candidate> pending_;
     mutable std::mutex pendingMutex_;
+    size_t scanCursor_ = 0;
+    size_t refreshCursor_ = 0;
 
     // Slots are LEASED through the registry rather than handed out by a counter.
     // A counter gives every object a different number each pass and reuses
@@ -144,6 +208,19 @@ private:
     // "the call ran and the pass is disabled" from "the call did nothing",
     // which need entirely different fixes.
     uint64_t setterEffective_ = 0;
+
+    // Visibility accounting. The ratio of tested to visible is the interesting
+    // number: it says how much of the level is on screen at once, and therefore
+    // whether 255 slots is a real constraint or a comfortable one.
+    uint64_t visibilityTested_ = 0;
+    uint64_t visibilityHits_ = 0;
+    uint64_t slotsReleased_ = 0;
+
+    // Rebuilt and republished whenever the slot table changes. Guarded by
+    // identityMutex_ because the render thread reads it while the marking
+    // thread replaces it.
+    void PublishSidecar();
+    std::shared_ptr<const FrameSidecar> published_;
 };
 
 // The process-wide marker instance, defined in dllmain.cpp.

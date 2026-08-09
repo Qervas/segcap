@@ -25,10 +25,15 @@
 #include <dxgi1_4.h>
 
 #include <cstdint>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include "identity.h"
 #include "readback.h"
 
 namespace segcap {
@@ -220,7 +225,26 @@ private:
     // resampling, and no way for them to drift apart.
     Readback colourRing_;
     uint32_t colourDumped_ = 0;
+    // Frame indices whose mask was kept, so the colour ring keeps exactly
+    // the matching frames. Unpaired captures are dead weight: make_demo
+    // can only use indices that have both.
+    std::unordered_set<uint64_t> maskKept_;
     ID3D12Resource* electedTarget_ = nullptr;
+
+    // Which slot table was live when each in-flight frame's copy was submitted.
+    //
+    // Readback latency is a few frames and the marking thread mutates the table
+    // continuously, so reading the table when a mask ARRIVES describes a
+    // different moment than the one the pixels came from. Bounded to a handful
+    // of entries -- anything older than the ring depth can never be claimed.
+    mutable std::deque<std::pair<uint64_t, std::shared_ptr<const FrameSidecar>>>
+        sidecarHistory_;
+
+    // Has the currently elected target ever yielded a non-empty mask? Gates the
+    // incumbency bonus, so a target that produces nothing can never entrench
+    // itself against a better candidate discovered a few frames later. Reset
+    // whenever the election changes.
+    bool electedProducedContent_ = false;
     uint32_t masksDumped_ = 0;
     // Counted separately so a few baseline (all-zero) captures for the task-11
     // A/B comparison cannot consume the budget reserved for frames that

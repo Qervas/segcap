@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <set>
 #include <string>
 
 // Linker-provided base of this module; avoids needing the HMODULE passed around
@@ -27,6 +28,22 @@ constexpr int kCreateDSVSlot = 21;           // ID3D12Device::CreateDepthStencil
 // marginally-better challenger cannot displace it, small enough that a target
 // which stops being viable (goes to zero or negative) still loses.
 constexpr int kIncumbencyBonus = 40;
+
+// Capture budget, expressed as coverage in TIME rather than in frames.
+//
+// At 720p a mask is 900KB and a colour frame 3.6MB, so 150 captures is ~675MB.
+// The stride is what matters: at 60fps a stride of 5 frames means 12 captures a
+// second, so a 40-capture budget was spent in 3.3 seconds. One run recorded all
+// 21 of its masks between t+201.4s and t+203.0s -- a 1.6-second window that
+// happened to fall while the marking working set was still filling, so every
+// mask contained exactly one object. The data was not wrong, it was a
+// photograph of a transient.
+//
+// A stride of 30 gives two captures a second, so 150 of them span 75 seconds of
+// gameplay: long enough to cross rooms, change what is on screen, and show the
+// slot working set actually tracking the camera.
+constexpr uint32_t kMaxCaptures = 150;
+constexpr uint64_t kCaptureStride = 30;
 
 constexpr int kCreateCommittedResourceSlot = 27; // ID3D12Device::CreateCommittedResource
 constexpr int kResourceBarrierSlot = 26;     // ID3D12GraphicsCommandList::ResourceBarrier
@@ -280,6 +297,27 @@ void STDMETHODCALLTYPE Hooks::CreateDepthStencilView_(ID3D12Device* self, ID3D12
     if (res) {
         std::lock_guard<std::mutex> lock(h.mutex_);
         h.descriptorToResource_[dest.ptr] = res;
+
+        // Log every DISTINCT depth-stencil resource the game ever views.
+        //
+        // This exists because a run once produced a census containing exactly
+        // one depth target -- a 1x1 dummy -- while the game was plainly
+        // rendering a 3D scene. From the census alone the two explanations are
+        // indistinguishable: either the game never created a real depth buffer
+        // (absurd), or OMSetRenderTargets was binding one we failed to resolve.
+        // The census cannot tell them apart because it only ever sees targets
+        // that were successfully resolved. This log sits upstream of that
+        // filter, so silence here means the DSV really was never created, and
+        // noise here means the loss happens later.
+        static std::set<ID3D12Resource*> seen;
+        if (seen.insert(res).second) {
+            const D3D12_RESOURCE_DESC d = res->GetDesc();
+            LogInfo("CreateDSV #%zu: %p %s %llux%u samples=%u flags=0x%X viewFmt=%s",
+                    seen.size(), static_cast<void*>(res), FormatName(d.Format),
+                    d.Width, d.Height, d.SampleDesc.Count,
+                    static_cast<unsigned>(d.Flags),
+                    desc ? FormatName(desc->Format) : "<null desc>");
+        }
     }
     h.origCreateDSV_(self, res, desc, dest);
 }
@@ -393,30 +431,65 @@ std::vector<ElectionScore> Hooks::ScoreTargets(
     // does not exist here.
     for (const TargetFingerprint& t : targets) maxBinds = std::max(maxBinds, t.bindCount);
 
+    // Establish the SCENE resolution, which is not necessarily the backbuffer
+    // resolution.
+    //
+    // An earlier version hard-required t.width/height == backbuffer, on the
+    // reasoning that anything smaller is a shadow map or a downsample. That
+    // rejected every real depth target in a run where the game was configured
+    // with ScreenPercentage=50: the backbuffer was 1280x720 but the entire 3D
+    // scene -- including scene depth and CustomDepth -- rendered at 640x360.
+    // The census then showed exactly one depth target, a 1x1 dummy, which reads
+    // as "this game has no depth buffer" rather than "my filter ate them".
+    //
+    // Screen percentage, dynamic resolution and upsampling are all common, so
+    // "equals the backbuffer" was never the right test. What actually
+    // identifies the scene cohort is aspect ratio plus being the largest of
+    // that shape: the scene targets share the backbuffer's aspect, while
+    // shadow atlases are square and downsample chains are a fraction of it.
+    uint64_t sceneW = 0;
+    uint32_t sceneH = 0;
+    if (backbufferWidth_ != 0 && backbufferHeight_ != 0) {
+        for (const TargetFingerprint& t : targets) {
+            if (!HasStencilPlane(t.format) || t.width == 0 || t.height == 0) continue;
+            // Aspect match within 2%, done in integer arithmetic to avoid
+            // float comparison entirely: w/h ~= bbW/bbH  <=>  w*bbH ~= h*bbW.
+            const uint64_t lhs = t.width * static_cast<uint64_t>(backbufferHeight_);
+            const uint64_t rhs = static_cast<uint64_t>(t.height) * backbufferWidth_;
+            const uint64_t diff = lhs > rhs ? lhs - rhs : rhs - lhs;
+            if (rhs == 0 || diff * 50 > rhs) continue;      // > 2% off: not the scene
+            if (t.width > sceneW) { sceneW = t.width; sceneH = t.height; }
+        }
+    }
+
     std::vector<ElectionScore> out;
     for (const TargetFingerprint& t : targets) {
         ElectionScore s;
         s.resource = t.resource;
 
         // Hard requirements. Without a stencil plane there is nothing to read,
-        // and a target that is not full-res is a shadow map or a downsample.
+        // and a target below the scene resolution is a shadow map or a
+        // downsample rather than a candidate.
         if (!HasStencilPlane(t.format)) {
             _snprintf_s(s.reason, _TRUNCATE, "rejected: no stencil plane (%s)",
                         FormatName(t.format));
             out.push_back(s);
             continue;
         }
-        const bool fullRes = backbufferWidth_ != 0 &&
-                             t.width == backbufferWidth_ && t.height == backbufferHeight_;
-        if (!fullRes) {
-            _snprintf_s(s.reason, _TRUNCATE, "rejected: %llux%u != backbuffer %ux%u",
-                        t.width, t.height, backbufferWidth_, backbufferHeight_);
+        if (sceneW == 0) {
+            _snprintf_s(s.reason, _TRUNCATE, "rejected: scene resolution not established yet");
+            out.push_back(s);
+            continue;
+        }
+        if (t.width != sceneW || t.height != sceneH) {
+            _snprintf_s(s.reason, _TRUNCATE, "rejected: %llux%u != scene %llux%u",
+                        t.width, t.height, sceneW, sceneH);
             out.push_back(s);
             continue;
         }
 
         int score = 100;
-        char detail[192] = "full-res + stencil";
+        char detail[192] = "scene-res + stencil";
 
         if (t.sampleCount == 1) {
             score += 20;
@@ -474,13 +547,33 @@ std::vector<ElectionScore> Hooks::ScoreTargets(
             _snprintf_s(detail, _TRUNCATE, "%s; new (%u frames)", detail, t.framesSeen);
         }
 
-        // Incumbency. Switching targets mid-capture splits the mask stream
-        // across two buffers, so a challenger must be clearly better, not
-        // marginally. This is what actually stops the thrashing; persistence
-        // alone would still flip while two candidates are neck and neck.
+        // Incumbency, but EARNED rather than granted on arrival.
+        //
+        // Switching targets mid-capture splits the mask stream across two
+        // buffers, so a challenger must be clearly better -- that is why the
+        // bonus exists, and it did stop the thrashing it was written for.
+        //
+        // What it also did, unintentionally, was make the first guess
+        // permanent. On one run the very first election happened at frame 2,
+        // when only one scene-res candidate had been observed at all. It scored
+        // 200 and became the incumbent. Two frames later the real CustomDepth
+        // target appeared and scored 250 on its own merits -- but 230+40 beat
+        // it every frame thereafter, so the wrong target stayed elected for the
+        // entire session and every mask came back empty.
+        //
+        // The fix is to make incumbency conditional on the incumbent actually
+        // having produced a non-empty mask. A target that has never yielded a
+        // single non-zero stencil pixel has no stream worth protecting, so it
+        // gets no protection and the election stays free to correct itself.
+        // Once a target is genuinely producing data, the bonus applies and
+        // thrash protection works as designed.
         if (t.resource == electedTarget_) {
-            score += kIncumbencyBonus;
-            _snprintf_s(detail, _TRUNCATE, "%s; INCUMBENT", detail);
+            if (electedProducedContent_) {
+                score += kIncumbencyBonus;
+                _snprintf_s(detail, _TRUNCATE, "%s; INCUMBENT (producing)", detail);
+            } else {
+                _snprintf_s(detail, _TRUNCATE, "%s; incumbent but no content yet", detail);
+            }
         }
 
         s.score = score;
@@ -636,6 +729,11 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     constexpr uint32_t kFramesToStop = 30;
 
     if (hasContent) {
+        // The elected target has now demonstrably produced a mask, which is
+        // what entitles it to incumbency protection in future elections. This
+        // is the only place that flag is ever set, so an unproductive target
+        // can never acquire it.
+        electedProducedContent_ = true;
         ++consecutiveContent_;
         consecutiveEmpty_ = 0;
         if (!recording_ && consecutiveContent_ >= kFramesToStart) {
@@ -661,8 +759,15 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
         ++emptyMasksDumped_;
     } else {
         ++recordedFrames_;
-        if (masksDumped_ >= 6) return;
+        if (masksDumped_ >= kMaxCaptures) return;
+        // Capture every Nth frame rather than N consecutive ones. At ~30fps a
+        // run of consecutive frames is under two seconds of game time and shows
+        // almost no motion, which makes a useless demo. Striding spreads the
+        // same budget across ~20 seconds so objects actually move, enter, and
+        // leave -- which is also what makes the identity/slot behaviour visible.
+        if ((recordedFrames_ % kCaptureStride) != 1) return;
         ++masksDumped_;
+        maskKept_.insert(frame.frameIndex);
     }
 
     // Absolute path next to the DLL. A relative filename resolves against the
@@ -715,7 +820,10 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
 // converts. Frames are named by the same monotonic index as the masks, which is
 // what lets a mask and its frame be paired by filename alone.
 void Hooks::OnColourReady(const MaskFrame& frame) {
-    if (!recording_ || colourDumped_ >= 6) return;
+    if (!recording_ || colourDumped_ >= kMaxCaptures) return;
+    // Only keep colour frames whose mask was also kept. An unpaired frame is
+    // dead weight -- make_demo can only use indices that have both.
+    if (!maskKept_.count(frame.frameIndex)) return;
     ++colourDumped_;
 
     wchar_t dllPath[MAX_PATH] = {};
@@ -766,8 +874,42 @@ void Hooks::OnColourReady(const MaskFrame& frame) {
 // separated. A mask file without its sidecar is undecodable, and the format
 // should make that impossible to forget rather than merely documented.
 void Hooks::WriteSidecar(const MaskFrame& frame) const {
-    const FrameSidecar sc = GetMarker().SnapshotSidecar(frame.frameIndex, frame.width,
-                                                        frame.height);
+    // Use the table as it stood WHEN THE COPY WAS SUBMITTED, not as it stands
+    // now.
+    //
+    // Readback is asynchronous by design -- the copy is queued on the game's own
+    // command list and collected several frames later, which is what keeps the
+    // render thread off the GPU's critical path. Meanwhile the marking thread is
+    // continuously releasing slots for primitives that left the screen and
+    // leasing them to new ones. So by the time a mask lands, the live slot table
+    // can already describe a different set of objects than the one that wrote
+    // that mask's pixels.
+    //
+    // The overlay is what exposed this: a gameplay mask contained ids 154, 156,
+    // 242 and 255 that had no binding at all in the sidecar written beside it --
+    // 5.4% of the frame's pixels labelled with an id whose meaning had already
+    // been recycled. Reading the table at dump time is exactly the kind of
+    // "close enough" that produces a dataset with quietly wrong labels.
+    FrameSidecar sc;
+    bool fromHistory = false;
+    for (const auto& entry : sidecarHistory_) {
+        if (entry.first == frame.frameIndex && entry.second) {
+            sc = *entry.second;
+            fromHistory = true;
+            break;
+        }
+    }
+    if (!fromHistory) {
+        // Fall back to the live table rather than emitting nothing, but say so:
+        // a sidecar that might not correspond to its mask is worth knowing about
+        // rather than silently trusting.
+        sc = GetMarker().SnapshotSidecar(frame.frameIndex, frame.width, frame.height);
+        LogWarn("sidecar for frame %llu not found in history; using the live table, "
+                "which may describe a different moment", frame.frameIndex);
+    }
+    sc.frameIndex = frame.frameIndex;
+    sc.width = frame.width;
+    sc.height = frame.height;
 
     wchar_t dllPath[MAX_PATH] = {};
     GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), dllPath, MAX_PATH);
@@ -816,6 +958,11 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     ID3D12Resource* const winner =
         (!ranked.empty() && ranked.front().score > 0) ? ranked.front().resource : nullptr;
     const bool electionChanged = (winner != electedTarget_);
+    if (electionChanged) {
+        // A new target has produced nothing yet by definition, so it starts
+        // without incumbency protection and must earn it the same way.
+        electedProducedContent_ = false;
+    }
     electedTarget_ = winner;
 
     // Census-only mode issues no GPU work at all: no copy, no barriers, nothing
@@ -825,6 +972,16 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     if (!censusOnly_ && electedTarget_ && device_ && queue_) {
         if (readback_.Prepare(device_, electedTarget_, 1 /*stencil plane*/)) {
             readback_.Enqueue(queue_, electedTarget_, StateOf(electedTarget_), frameIndex_);
+
+            // Remember which slot table was live at submission. Copying a
+            // shared_ptr costs nothing per frame; the table itself is only
+            // rebuilt when the marking thread actually changes it.
+            if (auto sc = GetMarker().publishedSidecar()) {
+                sidecarHistory_.emplace_back(frameIndex_, std::move(sc));
+                // The readback ring is 3 deep, so nothing older than a few
+                // frames can still be in flight.
+                while (sidecarHistory_.size() > 16) sidecarHistory_.pop_front();
+            }
         }
 
         // Colour backbuffer, same frame, same index. Capturing both here is the
@@ -862,9 +1019,17 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
             recording_ ? "YES" : "no", recordedFrames_, skippedFrames_);
 
     for (const TargetFingerprint& t : snapshot) {
-        // Only depth-stencil-capable targets matter for the mask route; logging
-        // every colour target would bury them.
-        if (!HasStencilPlane(t.format)) continue;
+        // Only depth-stencil targets matter for the mask route; logging every
+        // colour target would bury them.
+        //
+        // "Ever bound as depth" is included alongside the format test on
+        // purpose. Filtering on format alone means a depth buffer in a format
+        // this build does not recognise is invisible here -- and "invisible"
+        // and "absent" look identical in a log, which is exactly the confusion
+        // that cost a run. If something was bound to the depth slot, it gets
+        // printed whatever its format, and an unexpected format shows up as
+        // "other" rather than as silence.
+        if (!HasStencilPlane(t.format) && !t.everBoundAsDepth) continue;
         LogInfo("  DS %p %-22s %llux%u samples=%u binds=%u clears=%u depth=%s state=0x%X",
                 static_cast<void*>(t.resource), FormatName(t.format), t.width, t.height,
                 t.sampleCount, t.bindCount, t.clearCount,

@@ -67,6 +67,12 @@ struct FrameSidecar {
 
 class IdentityRegistry {
 public:
+    // Slots 1..255 are leasable; 0 is reserved for "unlabelled" in the mask, so
+    // it can never be handed out. Callers need this to know when the working
+    // set is full -- marking more objects than there are slots does not label
+    // more of the scene, it just evicts labels that were already working.
+    static constexpr size_t kSlotCount = 255;
+
     // Returns the stable id for an object, allocating one on first sighting.
     // The (pointer, serial) pair is the key: a recycled UObject slot has a
     // different serial and therefore becomes a genuinely new identity rather
@@ -83,6 +89,16 @@ public:
 
     // Marks a slot as still in use this frame, protecting it from LRU eviction.
     void Touch(uint8_t slot, uint64_t currentFrame);
+
+    // Hands a slot back voluntarily, so it can be leased to something else.
+    //
+    // Distinct from eviction: eviction is the registry deciding under pressure,
+    // whereas this is the caller reporting that the object no longer deserves a
+    // slot -- in practice, that the renderer has stopped drawing it. The stable
+    // id is KEPT, so if the object becomes visible again it resumes its previous
+    // identity rather than being logged as a new object. That is the whole point
+    // of separating a 64-bit identity from an 8-bit lease.
+    void ReleaseSlot(uint8_t slot);
 
     // The table needed to decode this frame's mask.
     FrameSidecar BuildSidecar(uint64_t frameIndex, uint32_t width, uint32_t height) const;

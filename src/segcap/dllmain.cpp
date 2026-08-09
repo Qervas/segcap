@@ -112,6 +112,9 @@ namespace segcap { CustomDepthMarker& GetMarker() { return g_marker; } }
 
 namespace {
 
+// Defined below; started from DiscoverThread as soon as ProcessEvent is proven.
+DWORD WINAPI MarkLoopThread(LPVOID);
+
 DWORD WINAPI DiscoverThread(LPVOID) {
     for (int attempt = 1; attempt <= 40; ++attempt) {
         Sleep(2000);
@@ -228,6 +231,23 @@ DWORD WINAPI DiscoverThread(LPVOID) {
                 segcap::LogInfo("customdepth: MARK MODE ENABLED");
                 // Resolve on the game thread, then collect off it.
                 pe.RunOnGameThread([](segcap::ue4::Engine& e) { g_marker.Resolve(e); });
+                g_marker.CollectCandidates(g_engine, true);
+
+                // Start marking NOW, on its own thread, rather than after the
+                // sampling schedule.
+                //
+                // Marking used to run only after the staged samples finished at
+                // t+180s. On a 240-second run that left ~40 seconds of marking,
+                // and because captures are taken every few frames, all 21 of
+                // them landed inside a 1.6-second window at t+201 -- before the
+                // working set had filled. Every mask in that run contained
+                // exactly one object, which reads as "CustomDepth barely works"
+                // when the truth is "we photographed the first two seconds of a
+                // process that needed twenty".
+                //
+                // Sampling is diagnostics; marking is the product. The product
+                // should not wait on the diagnostics.
+                CreateThread(nullptr, 0, MarkLoopThread, nullptr, 0, nullptr);
             }
         }
     }
@@ -251,20 +271,50 @@ DWORD WINAPI DiscoverThread(LPVOID) {
             // Collect here, on the discovery thread: it walks ~350,000 slots and
             // is read-only, so it must not run inside ProcessEvent.
             g_marker.CollectCandidates(g_engine, true);
-
-            // Then drain in bounded batches on the game thread. Each mark issues
-            // two UFunction calls inside the engine's dispatch, so a large batch
-            // would hitch the game. Several batches per interval converge
-            // quickly without any single one being expensive.
-            for (int b = 0; b < 12; ++b) {
-                segcap::ue4::GetProcessEventHook().RunOnGameThread(
-                    [](segcap::ue4::Engine& e) { g_marker.MarkBatch(e, 250); });
-                Sleep(250);
-            }
         }
     }
     if (g_engine.namesResolved()) g_engine.CountDerivedFrom("PrimitiveComponent");
     return 0;
+}
+
+// Continuous, visibility-tracked marking. Runs on its own thread from the
+// moment ProcessEvent is verified until the process exits.
+//
+// Two operations per tick:
+//
+//   RefreshVisibility  re-test primitives that hold slots and hand back the
+//                      ones the renderer has stopped drawing
+//   MarkBatch          sweep the candidate pool and lease the freed slots to
+//                      primitives that are currently being drawn
+//
+// Together they make the 255-slot working set follow the camera, which is the
+// only way a fixed-width id channel can describe a level with tens of thousands
+// of primitives. Release runs BEFORE acquire: with a full working set the sweep
+// would otherwise find no free slots and could never react to the camera moving.
+//
+// Both are bounded per tick because every object tested costs a UFunction call
+// inside the engine's own dispatch. The budgets here are ~1,700 visibility tests
+// per second, a few milliseconds of game-thread time.
+DWORD WINAPI MarkLoopThread(LPVOID) {
+    segcap::LogInfo("customdepth: continuous visibility-tracked marking started");
+    int tick = 0;
+    for (;;) {
+        Sleep(250);
+        ++tick;
+
+        auto& pe = segcap::ue4::GetProcessEventHook();
+        if (!pe.verified() || !g_marker.ready()) continue;
+
+        pe.RunOnGameThread([](segcap::ue4::Engine& e) { g_marker.RefreshVisibility(e, 120); });
+        pe.RunOnGameThread([](segcap::ue4::Engine& e) { g_marker.MarkBatch(e, 300); });
+
+        // Re-walk the object array periodically. Level streaming adds and
+        // removes primitives throughout a session, so a pool collected once
+        // slowly stops describing the level actually being played.
+        if (tick % 120 == 0) {   // every ~30s
+            g_marker.CollectCandidates(g_engine, true);
+        }
+    }
 }
 
 }  // namespace

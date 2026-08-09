@@ -106,6 +106,19 @@ void IdentityRegistry::Touch(uint8_t slot, uint64_t currentFrame) {
     if (obj != byObject_.end()) obj->second.lastSeenFrame = currentFrame;
 }
 
+void IdentityRegistry::ReleaseSlot(uint8_t slot) {
+    auto binding = bySlot_.find(slot);
+    if (binding == bySlot_.end()) return;
+
+    // Clear the slot on the entry but KEEP the entry itself. The object's stable
+    // id survives, so an object that goes off screen and comes back is
+    // recognised as the same object rather than counted as a new one -- which
+    // is exactly the distinction between a 64-bit identity and an 8-bit lease.
+    auto obj = byObject_.find(binding->second);
+    if (obj != byObject_.end()) obj->second.slot = 0;
+    bySlot_.erase(binding);
+}
+
 FrameSidecar IdentityRegistry::BuildSidecar(uint64_t frameIndex, uint32_t width,
                                             uint32_t height) const {
     FrameSidecar sc;

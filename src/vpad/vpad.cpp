@@ -111,12 +111,18 @@ void TapButton(USHORT button, int holdMs = 120) {
     Sleep(120);
 }
 
-void MenuSequence() {
+void MenuSequence(int presses) {
     // Stray: main menu -> SELECT SAVE (slot 1 pre-highlighted) -> SLOT 1
     // (CONTINUE pre-highlighted) -> in game. A confirms on every screen.
-    // A fourth press is harmless once in gameplay.
-    Log("menu: A x4 with settle time between");
-    for (int i = 0; i < 4; ++i) {
+    //
+    // More presses than screens, deliberately. The number of screens is not
+    // actually fixed: intro logos, a "press any button" attract screen, and an
+    // autosave notice all appear or not depending on how the game last exited.
+    // A is contextual in gameplay (jump/interact) so surplus presses cost
+    // nothing, whereas one press too few leaves the run stranded at a menu --
+    // which is the failure this whole harness exists to stop repeating.
+    Log("menu: A x%d with settle time between", presses);
+    for (int i = 0; i < presses; ++i) {
         TapButton(XUSB_GAMEPAD_A);
         Sleep(2500);
     }
@@ -184,11 +190,13 @@ void Usage(const char* exe) {
 int main(int argc, char** argv) {
     bool doTest = false, doMenu = false;
     int patrolSeconds = 0;
+    int menuPresses = 8;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--test") doTest = true;
         else if (a == "--menu") doMenu = true;
+        else if (a == "--menu-presses" && i + 1 < argc) menuPresses = std::atoi(argv[++i]);
         else if (a == "--patrol" && i + 1 < argc) patrolSeconds = std::atoi(argv[++i]);
         else if (a == "--help") { Usage(argv[0]); return 0; }
         else { Log("unknown argument: %s", a.c_str()); Usage(argv[0]); return 2; }
@@ -214,7 +222,7 @@ int main(int argc, char** argv) {
         Log("test complete");
     }
 
-    if (doMenu) MenuSequence();
+    if (doMenu) MenuSequence(menuPresses);
     if (patrolSeconds > 0) Patrol(patrolSeconds);
 
     Neutral();

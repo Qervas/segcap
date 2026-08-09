@@ -79,6 +79,18 @@ bool CustomDepthMarker::Resolve(ue4::Engine& engine) {
     LogInfo("customdepth: SetCustomDepthStencilValue UFunction = %p",
             fnSetCustomDepthStencilValue_);
 
+    // Visibility oracle. Without it the marker can still run, but it spends its
+    // 255 slots on arbitrary primitives, which in a real level means labelling
+    // almost nothing that is on screen.
+    fnWasRecentlyRendered_ = engine.FindFunction(primClass, "WasRecentlyRendered");
+    LogInfo("customdepth: WasRecentlyRendered        UFunction = %p",
+            fnWasRecentlyRendered_);
+    if (!fnWasRecentlyRendered_) {
+        LogWarn("customdepth: WasRecentlyRendered not found -- slots will be leased "
+                "without a visibility test, which in a level with tens of thousands "
+                "of primitives will label mostly off-screen objects");
+    }
+
     if (!fnSetRenderCustomDepth_ || !fnSetCustomDepthStencilValue_) {
         LogWarn("customdepth: setter UFunction(s) not found -- will fall back to a "
                 "raw property write, which sets the flag but leaves the render "
@@ -186,6 +198,101 @@ bool CustomDepthMarker::WriteMarked(void* component, uint8_t stencilValue,
     return true;
 }
 
+bool CustomDepthMarker::WasRecentlyRendered(void* component, float toleranceSeconds) {
+    // No oracle available: treat everything as visible rather than as invisible.
+    // Marking too broadly degrades to the old behaviour; marking nothing would
+    // produce an empty mask and look like a completely different failure.
+    if (!fnWasRecentlyRendered_) return true;
+
+    // UFunction parameters are the declared arguments laid out in order,
+    // followed by the return value. For
+    //   bool WasRecentlyRendered(float Tolerance)
+    // that is a 4-byte float then a 1-byte bool at offset 4. The struct is
+    // zeroed first so a call that writes nothing reads back as false rather
+    // than as whatever was on the stack -- an uninitialised "true" here would
+    // silently reproduce the exact bug this function exists to fix.
+    struct Params {
+        float Tolerance;
+        uint8_t ReturnValue;
+        uint8_t pad[3];
+    } params = {};
+    params.Tolerance = toleranceSeconds;
+
+    ue4::GetProcessEventHook().CallFunction(component, fnWasRecentlyRendered_, &params);
+
+    ++visibilityTested_;
+    const bool visible = params.ReturnValue != 0;
+    if (visible) ++visibilityHits_;
+    return visible;
+}
+
+bool CustomDepthMarker::UnmarkPrimitive(const MarkedPrimitive& mp) {
+    if (!mp.component) return false;
+
+    // Use the engine's setter for the same reason marking does: clearing the
+    // property without MarkRenderStateDirty() leaves the render proxy still
+    // opted in, so the primitive would keep writing its old stencil value into
+    // the mask after we had already leased that slot to something else. That
+    // failure would show up as two objects sharing one id -- the single most
+    // confusing thing a segmentation mask can do.
+    if (fnSetRenderCustomDepth_) {
+        struct { uint32_t bValue; } off = {0};
+        ue4::GetProcessEventHook().CallFunction(mp.component, fnSetRenderCustomDepth_, &off);
+    }
+
+    // Restore the exact original bytes as well, so the primitive is left byte
+    // identical to how we found it.
+    auto* base = reinterpret_cast<uint8_t*>(mp.component);
+    const size_t boolByteOff =
+        static_cast<size_t>(propRenderCustomDepth_.offset) + propRenderCustomDepth_.byteOffset;
+    uint8_t* boolByte = base + boolByteOff;
+    auto* stencilField = reinterpret_cast<int32_t*>(base + propStencilValue_.offset);
+    if (!ue4::IsReadable(boolByte, 1) || !ue4::IsReadable(stencilField, 4)) return false;
+
+    *boolByte = mp.originalByte;
+    *stencilField = mp.originalStencil;
+    return true;
+}
+
+int CustomDepthMarker::RefreshVisibility(ue4::Engine& engine, int limit) {
+    (void)engine;
+    if (!resolved_ || !fnWasRecentlyRendered_) return 0;
+    if (marked_.empty()) return 0;
+
+    int released = 0;
+    const size_t n = std::min(static_cast<size_t>(limit > 0 ? limit : 0), marked_.size());
+
+    for (size_t i = 0; i < n; ++i) {
+        if (refreshCursor_ >= marked_.size()) refreshCursor_ = 0;
+        const MarkedPrimitive mp = marked_[refreshCursor_];
+
+        // A tolerance wider than the one used for acquisition, on purpose.
+        // Equal thresholds make an object hovering at the edge of visibility
+        // acquire and release a slot every pass, which is thrash by another
+        // name. The gap is hysteresis.
+        if (WasRecentlyRendered(mp.component, 1.0f)) {
+            std::lock_guard<std::mutex> lock(identityMutex_);
+            identity_.Touch(mp.stencilValue, markPass_);
+            ++refreshCursor_;
+            continue;
+        }
+
+        UnmarkPrimitive(mp);
+        {
+            std::lock_guard<std::mutex> lock(identityMutex_);
+            identity_.ReleaseSlot(mp.stencilValue);
+        }
+        slotTable_.erase(mp.stencilValue);
+        alreadyMarked_.erase(mp.component);
+        marked_.erase(marked_.begin() + static_cast<ptrdiff_t>(refreshCursor_));
+        ++released;
+        ++slotsReleased_;
+        // Do not advance: the erase already shifted the next element here.
+    }
+    if (released > 0) PublishSidecar();
+    return released;
+}
+
 int CustomDepthMarker::CollectCandidates(ue4::Engine& engine, bool renderableOnly) {
     if (!resolved_) {
         LogError("customdepth: Resolve() must succeed first");
@@ -216,10 +323,10 @@ int CustomDepthMarker::CollectCandidates(ue4::Engine& engine, bool renderableOnl
 
         {
             std::lock_guard<std::mutex> lock(pendingMutex_);
-            if (alreadyMarked_.count(ref.object)) continue;
+            if (pooled_.count(ref.object)) continue;
             // Reserve immediately so a later collection pass cannot queue the
             // same object twice while this batch is still pending.
-            alreadyMarked_.insert(ref.object);
+            pooled_.insert(ref.object);
             pending_.push_back({ref.object, ref.index, ref.serialNumber,
                                 ref.className, ref.name});
         }
@@ -235,20 +342,75 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
     (void)engine;
     if (!resolved_) return 0;
 
+    // Take only as many candidates as there are FREE slots.
+    //
+    // This bound is the difference between a stable mask and a strobing one.
+    // Without it, every batch pulled another `limit` candidates and leased them
+    // slots, evicting whatever held those slots before -- measured at 9,000
+    // identities and 8,745 evictions in 150 seconds, with the log cheerfully
+    // reporting "marked 250 this batch" each time as though it were progress.
+    //
+    // The arithmetic was never survivable: the level has ~38,000 markable
+    // primitives and the stencil channel has 255 slots. Cycling through them
+    // does not label more of the scene, it just guarantees no object keeps an
+    // id long enough to be tracked across two frames -- which destroys the one
+    // property the identity registry exists to provide.
+    //
+    // So the working set is capped by the channel width: fill the slots, then
+    // hold them.
+    size_t freeSlots = 0;
+    {
+        std::lock_guard<std::mutex> lock(identityMutex_);
+        const size_t live = identity_.liveSlots();
+        freeSlots = IdentityRegistry::kSlotCount > live
+                        ? IdentityRegistry::kSlotCount - live
+                        : 0;
+    }
+    if (freeSlots == 0) return 0;
+
+    // Sweep the candidate POOL round-robin, testing visibility as we go, and
+    // stop as soon as the free slots are spent.
+    //
+    // Candidates are not removed from the pool. An object that is off screen on
+    // this sweep may be the subject of the shot on the next one, and a queue
+    // that consumes what it inspects could never come back to it.
     std::vector<Candidate> batch;
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
-        const size_t n = std::min(static_cast<size_t>(limit > 0 ? limit : 0), pending_.size());
-        batch.assign(pending_.end() - static_cast<ptrdiff_t>(n), pending_.end());
-        pending_.resize(pending_.size() - n);
+        if (pending_.empty()) return 0;
+        const size_t scan = std::min(static_cast<size_t>(limit > 0 ? limit : 0), pending_.size());
+        batch.reserve(scan);
+        for (size_t i = 0; i < scan; ++i) {
+            if (scanCursor_ >= pending_.size()) scanCursor_ = 0;
+            batch.push_back(pending_[scanCursor_]);
+            ++scanCursor_;
+        }
     }
     if (batch.empty()) return 0;
 
     ++markPass_;
     int assigned = 0;
     int refused = 0;
+    int skippedInvisible = 0;
+    int skippedAlready = 0;
 
     for (const Candidate& c : batch) {
+        if (freeSlots == 0) break;
+
+        // Already holds a slot: nothing to do, and re-leasing would only churn.
+        if (alreadyMarked_.find(c.component) != alreadyMarked_.end()) {
+            ++skippedAlready;
+            continue;
+        }
+
+        // The visibility gate. Tested BEFORE leasing, because a slot spent on
+        // an off-screen primitive is a slot that cannot label a visible one,
+        // and there are only 255 of them against ~32,800 candidates.
+        if (!WasRecentlyRendered(c.component, 0.3f)) {
+            ++skippedInvisible;
+            continue;
+        }
+
         // Lease a slot through the registry rather than handing out a counter.
         //
         // The registry assigns a stable 64-bit id keyed on (pointer, serial) and
@@ -275,10 +437,19 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
         mp.className = c.className;
         mp.stencilValue = slot;
 
-        if (!WriteMarked(c.component, slot, mp)) continue;
+        if (!WriteMarked(c.component, slot, mp)) {
+            // The write failed, so the lease must be given back or the slot is
+            // burned for the rest of the session on an object that is not
+            // actually marked.
+            std::lock_guard<std::mutex> lock(identityMutex_);
+            identity_.ReleaseSlot(slot);
+            continue;
+        }
 
         marked_.push_back(mp);
         slotTable_[slot] = mp;
+        alreadyMarked_.insert(c.component);
+        --freeSlots;
         ++assigned;
 
         if (marked_.size() <= 6) {
@@ -287,12 +458,33 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
         }
     }
 
-    std::lock_guard<std::mutex> lock(identityMutex_);
-    LogInfo("customdepth: marked %d this batch (%d refused, all slots busy); "
-            "%zu live slots, %llu identities, %llu evictions, %llu recycle-collisions",
-            assigned, refused, identity_.liveSlots(), identity_.totalIdentities(),
-            identity_.evictions(), identity_.recycleCollisions());
+    if (assigned > 0) PublishSidecar();
+
+    // Only log when something happened. The sweep runs several times a second
+    // and a line per sweep buried the interesting events under thousands of
+    // "marked 0" entries last time.
+    if (assigned > 0 || refused > 0) {
+        std::lock_guard<std::mutex> lock(identityMutex_);
+        LogInfo("customdepth: marked %d (refused %d, invisible %d, already %d of %zu scanned); "
+                "%zu live slots, %llu identities, %llu evictions, visible %llu/%llu tested",
+                assigned, refused, skippedInvisible, skippedAlready, batch.size(),
+                identity_.liveSlots(), identity_.totalIdentities(), identity_.evictions(),
+                visibilityHits_, visibilityTested_);
+    }
     return assigned;
+}
+
+void CustomDepthMarker::PublishSidecar() {
+    // Width/height/frameIndex are stamped at write time, not here: the table is
+    // a property of the marking state, not of any particular frame.
+    auto sc = std::make_shared<FrameSidecar>(SnapshotSidecar(0, 0, 0));
+    std::lock_guard<std::mutex> lock(identityMutex_);
+    published_ = std::move(sc);
+}
+
+std::shared_ptr<const FrameSidecar> CustomDepthMarker::publishedSidecar() const {
+    std::lock_guard<std::mutex> lock(identityMutex_);
+    return published_;
 }
 
 FrameSidecar CustomDepthMarker::SnapshotSidecar(uint64_t frameIndex, uint32_t w,

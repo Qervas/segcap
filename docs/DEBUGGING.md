@@ -421,7 +421,220 @@ code can.
 
 ---
 
-## 7. What I would do differently
+## 7. Getting to unattended gameplay capture
+
+Everything above was proved at a menu or on a fixture. Making the system run a
+real level start to finish, with nobody at the keyboard, broke it in seven more
+places. Five of the seven produced *plausible healthy-looking logs*, which is
+the same pattern as §2.
+
+### 7.1 The screensaver — four consecutive failed runs
+
+Symptom: `window focused: False`, the virtual gamepad ignored, the run stranded
+at the main menu producing menu frames. `GetForegroundWindow()` returned NULL
+for 60 seconds straight.
+
+I had already misdiagnosed this exact symptom twice: once as an
+exclusive-fullscreen mode switch (plausible — it does transiently return NULL
+during one), and once, worse, as a locked session, which meant telling the user
+their machine was locked when it was not. They corrected me. I was wrong both
+times and, critically, I had *inferred* both answers rather than measuring them.
+
+The measurement that settles it is the **input desktop name**:
+
+```
+input desktop name : 'Screen-saver'      <- not 'Default'
+screensaver running: True
+screensaver timeout: 60 s
+ScreenSaverIsSecure: 0                   <- NOT locked
+```
+
+With the user AFK there is no physical input, so after 60 seconds Windows
+activates the screensaver and switches the input desktop from `Default` to
+`Screen-saver`. From `Default`, `GetForegroundWindow()` then correctly returns
+NULL — there genuinely is no foreground window there any more — and no injected
+input can be delivered.
+
+Three states produce the identical symptom and need different fixes:
+
+| State | `OpenInputDesktop` | Desktop name | Fix |
+|---|---|---|---|
+| Mode switch in progress | succeeds | `Default` | wait |
+| Screensaver active | succeeds | `Screen-saver` | disable + dismiss |
+| Session locked | **denied** | — | nothing in user space |
+
+`SetThreadExecutionState(ES_DISPLAY_REQUIRED)` — which the harness already
+called, and which I had assumed covered this — prevents the *display powering
+down*. The screensaver is a separate mechanism. Necessary but not sufficient,
+and "I already handle that" is why it took four runs.
+
+Fix: save `SPI_GETSCREENSAVEACTIVE`, disable it for the run, kill an
+already-running `scrnsave.scr`, restore the user's setting afterwards. Focus now
+lands at **t=2s** every run.
+
+### 7.2 Steam relaunch, and what fixing it unlocked
+
+`SteamAPI_RestartAppIfNecessary` relaunches the game through Steam and exits, so
+the suspended process we injected into was never the process that rendered. That
+had forced `--watch`-mode injection (attach after the fact) for the whole
+project, which permanently lost every descriptor view created before we arrived.
+
+Writing `steam_appid.txt` next to the shipping executable makes that call a
+no-op. It is the documented Steamworks mechanism for running your own build, not
+a DRM bypass — Steam still has to be running.
+
+That one 8-byte file unlocked three things at once: injection before the first
+D3D call (**0 descriptor misses**), `-windowed` to remove the fullscreen mode
+switch entirely, and `-ResX/-ResY` to drop readback bandwidth to a quarter.
+
+### 7.3 The election rejected every real depth target
+
+In-level, the census contained exactly **one** depth-stencil target: a 1×1
+dummy. Read literally that says the game renders a 3D scene with no depth
+buffer, which is absurd — but the log said it flatly and nothing errored.
+
+The census can only report targets it successfully resolved, so it cannot
+distinguish "absent" from "filtered out by me". Logging every distinct resource
+passed to `CreateDepthStencilView`, *upstream* of the filter, answered it in one
+run:
+
+```
+CreateDSV #2: R32G8X24_TYPELESS 640x360 ... D32_FLOAT_S8X24_UINT
+CreateDSV #5: R32G8X24_TYPELESS 640x360
+CreateDSV #6: R32G8X24_TYPELESS 640x360
+```
+
+They were 640×360 against a 1280×720 backbuffer, because the game was configured
+with `ScreenPercentage=50`. The election hard-required dimensions *equal to the
+backbuffer*, on the reasoning that anything smaller is a shadow map.
+
+That reasoning was never sound. Screen percentage, dynamic resolution and
+upsampling are all normal. The scene cohort is identified by **matching the
+backbuffer's aspect ratio and being the largest of that shape** — shadow atlases
+are square, downsample chains are a fraction. Same §2 lesson: a filter that eats
+its own evidence.
+
+### 7.4 Incumbency cemented a first-frame guess
+
+The +40 incumbency bonus exists to stop election thrash (§5) and it works. But
+it was granted for *being elected*, so a target elected at frame 2 — when only
+one candidate had been observed at all — kept winning forever:
+
+```
++270  CFB02B30  few binds (2) => CustomDepth pass; INCUMBENT     <- 230 + 40
++250  EEA5320   cleared but never bound => CustomDepth with no opt-ins
+```
+
+`EEA5320` is the correct target and says so on its own merits; 230+40 beat it
+every frame for the entire session and every mask came back empty.
+
+Fix: incumbency must be **earned, not granted**. The bonus now applies only once
+the elected target has produced a non-empty mask. A target that has never
+yielded a single non-zero pixel has no stream worth protecting, so the election
+stays free to correct itself.
+
+### 7.5 Slot thrash — 8,745 evictions in 150 seconds
+
+```
+marked 250 this batch (0 refused); 255 live slots, 15000 identities, 14745 evictions
+```
+
+`markPass_` advanced once per *batch*, so the registry's "never evict something
+seen this pass" guard only ever protected the current 250. The next batch evicted
+all of them. The arithmetic was never survivable — ~38,000 markable primitives,
+255 slots — and cycling does not label more of the scene, it just guarantees no
+object holds an id long enough to be tracked across two frames.
+
+Note how healthy `marked 250 this batch` reads. It reports work done, not work
+retained.
+
+Fix: take only as many candidates as there are free slots. Evictions went to **0**.
+
+### 7.6 255 slots spent on things nobody can see
+
+With the thrash fixed the working set was stable, 0 evictions — and every
+in-level mask was still empty, or contained exactly one object.
+
+The 255 marked primitives were simply the first 255 found. Against 32,836
+candidates with a few hundred visible at any moment, essentially none of them
+were on screen. It had *appeared* to work at the menu only because there were
+few enough objects there that some marked ones happened to be visible.
+
+`255 live slots, 0 evictions` is a perfectly healthy way to describe labelling
+255 objects nobody can see.
+
+Fix: ask the engine. `UPrimitiveComponent::WasRecentlyRendered` was sitting in
+the reflected function list at `+0x48` the whole time. Slots are now leased only
+to primitives the renderer actually drew, and `RefreshVisibility` hands slots
+back when objects leave the screen, so the working set follows the camera.
+Acquisition uses a 0.3s tolerance and release 1.0s — deliberately unequal, or an
+object hovering at the edge of visibility thrashes its own slot.
+
+Measured: ~23% of tested primitives visible at once, 60–89 distinct ids per
+mask, 94–99% of pixels labelled.
+
+### 7.7 Photographing a transient
+
+First run with visibility marking: 21 masks, all with one object. Recording
+started at t+201.4s and the last capture was at t+203.0s — **all 21 captures in
+a 1.6-second window**, taken while the working set was still filling.
+
+Two causes compounding. Marking ran only after the staged diagnostic samples
+finished at t+180, leaving ~40s of a 240s run; and a capture stride of 5 frames
+at 60fps spends a 40-capture budget in 3.3 seconds.
+
+Fix: marking moved onto its own thread starting the moment ProcessEvent is
+verified — sampling is diagnostics, marking is the product, and the product
+should not wait on the diagnostics. Stride raised to 30 frames so 150 captures
+span 75 seconds.
+
+The data was never wrong. It was a photograph of a transient, correctly taken.
+
+### 7.8 The sidecar described a different moment than its mask
+
+Caught by the overlay, not by any log line. A gameplay mask contained ids 154,
+156, 242 and 255 with **no binding at all** in the sidecar written beside it —
+5.4% of the frame labelled with an id whose meaning had already been recycled.
+
+Readback is asynchronous by design (that is what keeps the render thread off the
+GPU's critical path), and the marking thread continuously releases and re-leases
+slots. Reading the slot table when a mask *arrives* describes a different moment
+than the one that wrote its pixels.
+
+Fix: the marker publishes an immutable `shared_ptr` snapshot whenever the table
+changes — a few times a second, not per frame — and `Present` records which
+snapshot was live when it submitted each copy. Copying a `shared_ptr` per frame
+is free; rebuilding a 250-entry table per frame would not have been. History
+misses went from unmeasured to **1 in 76 frames**, and the remaining one is
+logged as a warning rather than silently trusted.
+
+Residual, honestly stated: a primitive unmarked mid-frame can still write its old
+stencil value for a frame or two while the render proxy rebuilds, so a small
+number of ids can outlive their binding. Not yet fixed.
+
+### 7.9 One set doing two jobs
+
+`alreadyMarked_` meant both "queued in the candidate pool" and "currently holds
+a slot". Once collection had run, every candidate was "already marked", so the
+visibility sweep skipped all 300 candidates it scanned and could never mark
+anything. Split into `pooled_` and `alreadyMarked_`.
+
+### 7.10 A GPU fault, not attributed
+
+One run ended with the game exiting early and `nvlddmkm` event 153 plus
+`LiveKernelEvent 141` (video engine timeout) in the system log, timestamped
+inside the run. Recording it because it happened during our capture and we
+submit GPU work.
+
+I did **not** establish that it was ours. The readback rate at the time (60
+submissions/second) was identical to earlier runs that completed 9,300
+submissions without incident, so the obvious suspect does not fit. It has not
+recurred across the six runs since. Unattributed, and marked as such rather than
+explained away.
+
+---
+
+## 8. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have
    been caught in 12 seconds by the 3-buffer fixture I already had.
@@ -430,5 +643,19 @@ code can.
 3. **Compare timestamps, not just facts.** §2.5 cost three runs because two log
    lines were read as independent rather than as a sequence.
 4. **Check the arithmetic before adding a bound.** 3000 of 350,000 is 4%, and I
-   shipped it as a robustness improvement.
-5. **Diagnose my instrument before diagnosing someone's machine.**
+   shipped it as a robustness improvement. Same error in §7.5: 255 slots against
+   38,000 primitives was never going to work by cycling.
+5. **Diagnose my instrument before diagnosing someone's machine.** §7.1 is the
+   worst instance in the project: the same symptom, misdiagnosed twice by
+   inference, settled in one command once I actually asked the OS what the input
+   desktop was called.
+6. **Distinguish "absent" from "filtered".** §2.4 and §7.3 are the same bug two
+   months apart. Any filter that can hide evidence needs a log line upstream of
+   itself, or its silence is unreadable.
+7. **Ask what the metric would look like if it were wrong.** `marked 250 this
+   batch`, `255 live slots, 0 evictions`, and `21 masks captured` were all true
+   and all describing failures. A counter that only goes up measures effort, not
+   result — pair it with one that can go down.
+8. **The engine usually already knows.** `WasRecentlyRendered` was in the
+   reflected function list from the first successful discovery run. I spent a
+   run building a slot lottery before reading the list I had already printed.
