@@ -22,7 +22,8 @@ reflection at runtime, not hardcoded.
 | **The demo** | [`docs/evidence/stray-gameplay-demo.mp4`](docs/evidence/stray-gameplay-demo.mp4) — 75 frames, rendered left, mask overlaid right |
 | **The debugging story** | [`docs/DEBUGGING.md`](docs/DEBUGGING.md) — every crash and wrong turn, and what actually found each one |
 | **Where AI helped and where it was overridden** | [`docs/AI-USAGE.md`](docs/AI-USAGE.md) |
-| **Output format** | [`docs/FORMAT.md`](docs/FORMAT.md) |
+| **Output format** | [`docs/FORMAT.md`](docs/FORMAT.md) — masks, sidecars, actions, container |
+| **PSO vs dynamic state** | [`docs/PIPELINE-STATE.md`](docs/PIPELINE-STATE.md) — why this decided the architecture |
 
 If you read one thing, read `DEBUGGING.md` §7 and §8.
 
@@ -84,9 +85,20 @@ the identity, and it survives losing a slot. Slots are leased only to primitives
 the engine says it actually drew (`WasRecentlyRendered`), and handed back when
 objects leave, so the working set follows the camera.
 
+**Why through the engine rather than the renderer.** Stencil *enable*, *write
+mask* and *pass op* are all baked into the PSO; only the reference value is
+dynamic. So an injected DLL cannot make the game's draws write arbitrary IDs
+without building stencil-writing twins of thousands of PSOs — a shadow renderer,
+not instrumentation. UE's CustomDepth pass already has those PSOs and already
+feeds `CustomDepthStencilValue` to `OMSetStencilRef`, so the intervention is
+setting an integer on a game object. That is also why the ID is 8 bits: it is the
+width of the pass the engine already runs. See
+[`docs/PIPELINE-STATE.md`](docs/PIPELINE-STATE.md).
+
 **Safety.** Writes happen on the game thread via a proven `ProcessEvent` hook,
 are read-modify-write on the masked bit only, are verified after the fact, and
-are reversible.
+are reversible. The D3D12 hooks stay strictly read-only: none alters an argument,
+none issues GPU work.
 
 ---
 
