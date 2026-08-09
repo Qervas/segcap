@@ -46,6 +46,9 @@ constexpr int kIncumbencyBonus = 40;
 // which not one identity was released and re-acquired, so the analysis could
 // not demonstrate that identity survives slot loss. The mechanism was fine; the
 // observation window was too short to contain the event being claimed.
+// Defaults. Overridable at runtime via segcap.captures / segcap.stride, because
+// a demo run and an identity-analysis run want opposite settings and neither is
+// "the" correct value. See Hooks::SetCaptureProfile.
 constexpr uint32_t kMaxCaptures = 150;
 constexpr uint64_t kCaptureStride = 60;
 
@@ -76,6 +79,22 @@ const char* FormatName(DXGI_FORMAT f) {
         case DXGI_FORMAT_R11G11B10_FLOAT: return "R11G11B10_FLOAT";
         default: return "other";
     }
+}
+
+// Milliseconds since the Unix epoch, from the system wall clock.
+//
+// Must be the SAME clock vpad.exe stamps its input log with, or the two cannot
+// be joined -- they are different processes, so anything process-relative
+// (QueryPerformanceCounter without a shared epoch, time since DLL attach) is
+// meaningless across the boundary. GetSystemTimeAsFileTime is identical in both
+// and has 100ns resolution, far finer than a 16ms frame.
+long long NowMs() {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return static_cast<long long>(u.QuadPart / 10000ULL) - 11644473600000LL;
 }
 
 bool HasStencilPlane(DXGI_FORMAT f) {
@@ -715,14 +734,32 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     // coupling entirely: the capture happens when there is something to capture,
     // whenever that turns out to be.
     bool seen[256] = {};
-    bool hasContent = false;
     for (uint32_t y = 0; y < frame.height; ++y) {
         const uint8_t* row = frame.data + static_cast<size_t>(y) * frame.rowPitch;
         for (uint32_t x = 0; x < frame.width; ++x) {
-            if (row[x] != 0) hasContent = true;
             seen[row[x]] = true;
         }
     }
+    uint32_t distinctIds = 0;
+    for (int i = 1; i < 256; ++i) {
+        if (seen[i]) ++distinctIds;
+    }
+
+    // "Content" means a USEFUL mask, not merely a non-empty one.
+    //
+    // Gating on "any non-zero pixel" starts recording the instant the first
+    // primitive is marked -- which is the worst possible moment, because the
+    // working set then takes another 30-60 seconds to fill to 255 slots. With a
+    // dense capture stride the entire budget was spent inside that ramp: a
+    // 10-second demo where every frame showed 11 objects and 29% coverage,
+    // while the same build 40 seconds later was doing 80 objects and 100%.
+    //
+    // This is the third time in this project the shutter fired at the wrong
+    // moment (see DEBUGGING.md 7.7 and the note above). The pattern is always
+    // the same -- a trigger condition that is technically satisfied long before
+    // the thing it is meant to detect is actually happening.
+    constexpr uint32_t kMinIdsToStart = 24;
+    const bool hasContent = distinctIds >= kMinIdsToStart;
 
     // ---- recording gate ----------------------------------------------------
     //
@@ -750,7 +787,8 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
         if (!recording_ && consecutiveContent_ >= kFramesToStart) {
             recording_ = true;
             recordingStartedFrame_ = frame.frameIndex;
-            LogInfo("RECORDING STARTED at frame %llu (mask has content)", frame.frameIndex);
+            LogInfo("RECORDING STARTED at frame %llu (%u distinct ids in the mask)",
+                    frame.frameIndex, distinctIds);
         }
     } else {
         ++consecutiveEmpty_;
@@ -770,13 +808,13 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
         ++emptyMasksDumped_;
     } else {
         ++recordedFrames_;
-        if (masksDumped_ >= kMaxCaptures) return;
+        if (masksDumped_ >= maxCaptures_) return;
         // Capture every Nth frame rather than N consecutive ones. At ~30fps a
         // run of consecutive frames is under two seconds of game time and shows
         // almost no motion, which makes a useless demo. Striding spreads the
         // same budget across ~20 seconds so objects actually move, enter, and
         // leave -- which is also what makes the identity/slot behaviour visible.
-        if ((recordedFrames_ % kCaptureStride) != 1) return;
+        if ((recordedFrames_ % captureStride_) != 1) return;
         ++masksDumped_;
         maskKept_.insert(frame.frameIndex);
     }
@@ -820,8 +858,13 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     // The sidecar is what makes the mask decodable. Written for every dumped
     // mask, never separately, so a mask file cannot exist without the table
     // that says what its slot numbers mean.
+    //
+    // NOTE: masksDumped_ is incremented by the recording gate above, not here.
+    // It used to be incremented in both places, which silently halved every
+    // capture budget -- asking for 150 produced 75 masks and asking for 200
+    // produced 100. It looked like a plausible number every single time, and
+    // was only caught by requesting a round 200 and getting exactly half.
     WriteSidecar(frame);
-    ++masksDumped_;
 }
 
 // Writes the colour backbuffer as a binary PPM (P6).
@@ -831,7 +874,7 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
 // converts. Frames are named by the same monotonic index as the masks, which is
 // what lets a mask and its frame be paired by filename alone.
 void Hooks::OnColourReady(const MaskFrame& frame) {
-    if (colourDumped_ >= kMaxCaptures) return;
+    if (colourDumped_ >= maxCaptures_) return;
 
     // A/B mode captures colour UNCONDITIONALLY on a stride.
     //
@@ -935,6 +978,11 @@ void Hooks::WriteSidecar(const MaskFrame& frame) const {
     sc.width = frame.width;
     sc.height = frame.height;
 
+    long long stamp = 0;
+    for (const auto& e : frameStamps_) {
+        if (e.first == frame.frameIndex) { stamp = e.second; break; }
+    }
+
     wchar_t dllPath[MAX_PATH] = {};
     GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), dllPath, MAX_PATH);
     std::wstring dir(dllPath);
@@ -950,6 +998,9 @@ void Hooks::WriteSidecar(const MaskFrame& frame) const {
 
     std::fprintf(f, "{\n");
     std::fprintf(f, "  \"frameIndex\": %llu,\n", sc.frameIndex);
+    // Wall clock at Present, on the same clock vpad.exe stamps its input log
+    // with. This is the join key between what was rendered and what was pressed.
+    std::fprintf(f, "  \"timestampMs\": %lld,\n", stamp);
     std::fprintf(f, "  \"width\": %u,\n", sc.width);
     std::fprintf(f, "  \"height\": %u,\n", sc.height);
     std::fprintf(f, "  \"bindings\": [\n");
@@ -1012,6 +1063,12 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
                 // frames can still be in flight.
                 while (sidecarHistory_.size() > 16) sidecarHistory_.pop_front();
             }
+            // Stamped HERE, at Present, not when the mask lands. The action
+            // that produced a frame is the one in effect while it was being
+            // rendered; a timestamp taken when the readback completes is
+            // several frames late and would shift every action label.
+            frameStamps_.emplace_back(frameIndex_, NowMs());
+            while (frameStamps_.size() > 64) frameStamps_.pop_front();
         }
 
         // Colour backbuffer, same frame, same index. Capturing both here is the

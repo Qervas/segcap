@@ -80,6 +80,29 @@ DWORD WINAPI InitThread(LPVOID) {
         const bool abtest = GetFileAttributesW(ab.c_str()) != INVALID_FILE_ATTRIBUTES;
         segcap::Hooks::Get().SetAbTest(abtest);
         if (abtest) segcap::LogInfo("A/B MODE: colour frames captured unconditionally");
+
+        // Optional capture profile. Each file holds a single integer.
+        auto readInt = [&](const wchar_t* ext) -> unsigned long {
+            std::wstring q(marker);
+            const size_t d = q.find_last_of(L'.');
+            if (d != std::wstring::npos) q = q.substr(0, d);
+            q += ext;
+            std::FILE* fp = nullptr;
+            if (_wfopen_s(&fp, q.c_str(), L"r") != 0 || !fp) return 0;
+            unsigned long v = 0;
+            if (fwscanf_s(fp, L"%lu", &v) != 1) v = 0;
+            std::fclose(fp);
+            return v;
+        };
+        const unsigned long caps = readInt(L".captures");
+        const unsigned long strd = readInt(L".stride");
+        if (caps || strd) {
+            segcap::Hooks::Get().SetCaptureProfile(static_cast<uint32_t>(caps),
+                                                   static_cast<uint64_t>(strd));
+            segcap::LogInfo("capture profile: max=%u stride=%llu",
+                            segcap::Hooks::Get().maxCaptures(),
+                            segcap::Hooks::Get().captureStride());
+        }
     }
 
     // The host may not have created its device yet when we are injected at

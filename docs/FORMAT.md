@@ -8,6 +8,50 @@ A capture session produces, for every captured frame:
 | `segcap_frame_<N>.ppm` | the rendered frame, binary PPM (P6), RGB24 |
 | `segcap_mask_<N>.json` | the slot → object table for that frame |
 
+and once per session:
+
+| file | contents |
+|---|---|
+| `segcap_input.jsonl` | every controller state delivered to the game, timestamped |
+
+## Actions, for world models
+
+A world model learns `P(next frame | frame, action)`. A video without the actions
+that produced it is half a training pair, so the input is recorded alongside the
+frames.
+
+The unusual property here is that the pipeline **synthesises** the input, so the
+action is known exactly rather than inferred. There is no hook into the game's
+input handling, no guessing at deadzone curves, no sampling race against the
+game's polling. Each record is literally the report handed to the virtual pad
+driver, written at the moment it was sent:
+
+```json
+{"t":1786260344126,"lx":0,"ly":24000,"rx":9000,"ry":0,"lt":0,"rt":0,"buttons":4096}
+```
+
+`buttons` is the XUSB bitfield (`0x1000` = A). Sticks are the native
+−32768..32767; triggers 0..255.
+
+**Joining frames to actions.** Every sidecar carries `timestampMs`, stamped at
+`Present` — not when the readback lands, which is several frames later and would
+shift every action label. `segcap_input.jsonl` uses the same clock. Both come
+from `GetSystemTimeAsFileTime`, deliberately a wall clock rather than
+`QueryPerformanceCounter`: the two logs are written by *different processes*
+(the injected DLL and `vpad.exe`), so anything process-relative cannot be joined
+across that boundary at all.
+
+The join is a step function — the last sample at or before the frame — because
+that is what a gamepad is. Interpolating between samples would invent stick
+positions the game never saw. Frames further than 2s from any sample are
+reported as having no known action rather than being attributed the nearest one.
+
+The pad re-sends its held state at ~10Hz rather than only on change, so the log
+has regular samples instead of one record per multi-second hold. Measured on a
+300-frame session: **300/300 frames matched to an action.**
+
+`tools/make_demo.py` draws this as a live controller panel under the video.
+
 `<N>` is the same monotonic frame index in all three, so a mask and its frame
 are paired by filename alone. They are the *same* frame by construction: both
 are copied during the same `Present` call, so there is no synchronisation step

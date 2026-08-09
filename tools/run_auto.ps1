@@ -65,7 +65,13 @@ param(
     # after it. Done as ONE run rather than two: across two sessions the cat's
     # idle animation and the NPCs are at different phases, which shows up as a
     # large pixel difference that has nothing to do with CustomDepth.
-    [switch]$AbTest
+    [switch]$AbTest,
+    # Capture profile. Demo runs want a small stride (consecutive gameplay,
+    # smooth playback); identity-analysis runs want a large one (minutes of
+    # coverage, so objects actually leave and re-enter the working set). One
+    # run cannot serve both well.
+    [int]$Captures = 0,
+    [int]$Stride = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -306,6 +312,14 @@ if ($NoMark) {
     Write-Host "[auto] marking ENABLED"
 }
 
+$capFile = Join-Path $root "build\bin\segcap.captures"
+$strFile = Join-Path $root "build\bin\segcap.stride"
+if ($Captures -gt 0) { Set-Content $capFile -Value "$Captures" -NoNewline } else { Remove-Item $capFile -ErrorAction SilentlyContinue }
+if ($Stride -gt 0)   { Set-Content $strFile -Value "$Stride"   -NoNewline } else { Remove-Item $strFile -ErrorAction SilentlyContinue }
+if ($Captures -gt 0 -or $Stride -gt 0) {
+    Write-Host "[auto] capture profile: captures=$Captures stride=$Stride"
+}
+
 $abFile = Join-Path $root "build\bin\segcap.abtest"
 if ($AbTest) {
     Set-Content -Path $abFile -Value "1" -NoNewline
@@ -394,18 +408,22 @@ Start-Sleep -Seconds 5
 # at the menu's slot count after four scan-code taps. ViGEm presents the pad
 # through a kernel bus driver, so the game cannot tell it from real hardware.
 $padOut = Join-Path $env:TEMP "vpad_out.txt"
+# The input log lands beside the captures so a session is self-contained:
+# frames, masks, sidecars and the actions that produced them in one directory.
+$inputLog = Join-Path $root "build\bin\segcap_input.jsonl"
+Remove-Item $inputLog -ErrorAction SilentlyContinue
 if ($AbTest) {
     # Menu only, then nothing. A moving camera would swamp the measurement:
     # the question is whether MARKING changed the image, so everything else
     # must be held as still as the engine allows.
     Write-Host "[auto] vpad: menu only (A/B run holds the camera still)"
     $pad = Start-Process -FilePath $vpad -NoNewWindow -PassThru -RedirectStandardOutput $padOut `
-        -ArgumentList "--menu --menu-presses 8"
+        -ArgumentList "--menu --menu-presses 8 --input-log `"$inputLog`""
 } else {
     $patrolFor = [Math]::Max(30, $Seconds - 40)
     Write-Host "[auto] vpad: menu, then ${patrolFor}s patrol"
     $pad = Start-Process -FilePath $vpad -NoNewWindow -PassThru -RedirectStandardOutput $padOut `
-        -ArgumentList "--menu --menu-presses 8 --patrol $patrolFor"
+        -ArgumentList "--menu --menu-presses 8 --patrol $patrolFor --input-log `"$inputLog`""
 }
 
 # --- 4. run, watching for the in-level transition ----------------------------

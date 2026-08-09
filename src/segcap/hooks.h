@@ -95,6 +95,23 @@ public:
     // mask was kept, so the "marking off" condition produces frames at all.
     void SetAbTest(bool on) { abTest_ = on; }
 
+    // Capture profile, read from marker files at startup.
+    //
+    // These are a genuine trade-off rather than a tuning knob, which is why
+    // they are configurable instead of compiled in. A SMALL stride captures
+    // consecutive gameplay -- smooth motion, good for a demo -- but spends the
+    // budget over a few seconds, which is a window too short to observe objects
+    // leaving and re-entering the working set. A LARGE stride covers minutes
+    // and shows identity recycling, but plays back as a slideshow. One run
+    // cannot do both well, and pretending otherwise produced two separate
+    // wrong-looking results earlier (see DEBUGGING.md 7.7 and 7.8c).
+    void SetCaptureProfile(uint32_t maxCaptures, uint64_t stride) {
+        if (maxCaptures) maxCaptures_ = maxCaptures;
+        if (stride) captureStride_ = stride;
+    }
+    uint32_t maxCaptures() const { return maxCaptures_; }
+    uint64_t captureStride() const { return captureStride_; }
+
     // ---- state recovered from the game ----------------------------------
 
     ID3D12Device* device() const { return device_; }
@@ -244,6 +261,13 @@ private:
     mutable std::deque<std::pair<uint64_t, std::shared_ptr<const FrameSidecar>>>
         sidecarHistory_;
 
+    // frameIndex -> wall-clock milliseconds at Present. Written into the
+    // sidecar so a captured frame can be joined against the input log that
+    // vpad.exe writes from a different process. World models train on
+    // (frame, action) pairs, so a frame with no action attached is half a
+    // training example.
+    mutable std::deque<std::pair<uint64_t, long long>> frameStamps_;
+
     // Has the currently elected target ever yielded a non-empty mask? Gates the
     // incumbency bonus, so a target that produces nothing can never entrench
     // itself against a better candidate discovered a few frames later. Reset
@@ -277,6 +301,8 @@ private:
     // title can be observed before anything is submitted on its queue.
     bool censusOnly_ = false;
     bool abTest_ = false;
+    uint32_t maxCaptures_ = 150;
+    uint64_t captureStride_ = 60;
 };
 
 }  // namespace segcap

@@ -36,6 +36,25 @@ namespace {
 
 PVIGEM_CLIENT g_client = nullptr;
 PVIGEM_TARGET g_pad = nullptr;
+FILE* g_inputLog = nullptr;
+
+// Milliseconds since the Unix epoch, from the system clock.
+//
+// Deliberately a WALL CLOCK rather than QueryPerformanceCounter or a
+// process-relative timer. The input log is written by this process and the
+// frame timestamps are written by a DLL inside the game; a per-process origin
+// cannot be joined across that boundary, and QPC needs a shared epoch to be
+// comparable. GetSystemTimeAsFileTime is the same clock in both processes and
+// has 100ns resolution, which is far finer than a 16ms frame.
+long long NowMs() {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    // FILETIME is 100ns ticks since 1601-01-01; 11644473600s to the Unix epoch.
+    return static_cast<long long>(u.QuadPart / 10000ULL) - 11644473600000LL;
+}
 
 void Log(const char* fmt, ...) {
     va_list ap;
@@ -87,8 +106,35 @@ void Disconnect() {
     }
 }
 
+// Every input state we hand to the game, timestamped.
+//
+// This exists because the capture is meant to feed world models, which learn
+// P(next frame | current frame, action). A video without the actions that
+// produced it is only half the training pair.
+//
+// The unusual advantage here is that we are the one SYNTHESISING the input, so
+// the action is known exactly rather than inferred. There is no hooking of the
+// game's input handling, no guessing at deadzones, no sampling race: this is
+// literally the report the driver delivered, written at the moment it was sent.
+//
+// Written as JSONL -- one self-contained record per line, appended and flushed
+// immediately -- so a run that is killed mid-session still leaves a valid,
+// readable log up to the last delivered input.
+void LogInput(const XUSB_REPORT& r) {
+    if (!g_inputLog) return;
+    std::fprintf(g_inputLog,
+                 "{\"t\":%lld,\"lx\":%d,\"ly\":%d,\"rx\":%d,\"ry\":%d,"
+                 "\"lt\":%u,\"rt\":%u,\"buttons\":%u}\n",
+                 NowMs(), r.sThumbLX, r.sThumbLY, r.sThumbRX, r.sThumbRY,
+                 static_cast<unsigned>(r.bLeftTrigger),
+                 static_cast<unsigned>(r.bRightTrigger),
+                 static_cast<unsigned>(r.wButtons));
+    std::fflush(g_inputLog);
+}
+
 void Send(const XUSB_REPORT& report) {
     if (g_client && g_pad) vigem_target_x360_update(g_client, g_pad, report);
+    LogInput(report);
 }
 
 void Neutral() {
@@ -166,8 +212,18 @@ void Patrol(int seconds) {
         Send(r);
         Log("  %s", s.what);
 
+        // Re-send the held state at ~10Hz rather than sleeping on it.
+        //
+        // Two reasons. A real pad reports continuously, and some titles treat a
+        // silent gap as the pad going away. More importantly for the dataset:
+        // this gives the input log regular samples instead of one record every
+        // couple of seconds, so a frame can be joined to an action without
+        // extrapolating across a long hold.
         const ULONGLONG until = GetTickCount64() + static_cast<ULONGLONG>(s.ms);
-        while (GetTickCount64() < until && GetTickCount64() < deadline) Sleep(50);
+        while (GetTickCount64() < until && GetTickCount64() < deadline) {
+            Sleep(100);
+            Send(r);
+        }
     }
     Neutral();
     Log("patrol complete");
@@ -191,11 +247,13 @@ int main(int argc, char** argv) {
     bool doTest = false, doMenu = false;
     int patrolSeconds = 0;
     int menuPresses = 8;
+    std::string inputLogPath;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--test") doTest = true;
         else if (a == "--menu") doMenu = true;
+        else if (a == "--input-log" && i + 1 < argc) inputLogPath = argv[++i];
         else if (a == "--menu-presses" && i + 1 < argc) menuPresses = std::atoi(argv[++i]);
         else if (a == "--patrol" && i + 1 < argc) patrolSeconds = std::atoi(argv[++i]);
         else if (a == "--help") { Usage(argv[0]); return 0; }
@@ -210,6 +268,16 @@ int main(int argc, char** argv) {
     if (!Connect()) {
         Disconnect();
         return 1;
+    }
+
+    if (!inputLogPath.empty()) {
+        if (fopen_s(&g_inputLog, inputLogPath.c_str(), "w") != 0 || !g_inputLog) {
+            Log("could not open input log %s -- continuing without it",
+                inputLogPath.c_str());
+            g_inputLog = nullptr;
+        } else {
+            Log("input log -> %s", inputLogPath.c_str());
+        }
     }
 
     if (doTest) {
@@ -227,6 +295,10 @@ int main(int argc, char** argv) {
 
     Neutral();
     Disconnect();
+    if (g_inputLog) {
+        std::fclose(g_inputLog);
+        g_inputLog = nullptr;
+    }
     Log("pad released");
     return 0;
 }

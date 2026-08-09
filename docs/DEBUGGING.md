@@ -743,6 +743,45 @@ producing the same pool.
 Verified with a clean 320-second run: no crash, 76 masks, 393,415 visibility
 tests, 0 evictions.
 
+### 7.12 The shutter fired at the wrong moment, a third time
+
+The recording gate started on the first mask containing *any* non-zero pixel.
+That is the instant the first primitive is marked — and the working set then
+takes another 30–60 seconds to fill 255 slots. With a dense capture stride the
+whole budget was spent inside that ramp:
+
+```
+frame 4893:  11 objects,  29.3% of pixels labelled     <- what the demo showed
+40s later:   62 objects,  87.0%                        <- same build, same level
+```
+
+Nothing was broken. The capture was a correct recording of the first ten seconds
+of a process that needed a minute, exactly like §7.7 and exactly like the
+earlier "masks dumped at t=3.1s, marking at t=41.2s" failure. Three instances of
+one mistake: **a trigger condition that is technically satisfied long before the
+thing it is meant to detect is actually happening.**
+
+Fix: the gate now requires ≥24 distinct ids, not ≥1 pixel. "Content" should mean
+a useful mask, not a non-empty one.
+
+### 7.13 A budget that was silently half what it said
+
+Asking for 150 captures produced 76 masks. Asking for 200 produced exactly 101.
+Both looked like plausible numbers — some frames get skipped, recording starts
+late, the run ends early. All of those are true and none of them was the cause.
+
+`masksDumped_` was incremented in two places: once in the recording gate and
+again after writing the sidecar. Every capture counted twice, so every budget
+was halved.
+
+It survived a dozen runs because the output was never *obviously* wrong — 76 is
+a believable number of frames. It was caught by asking for a round 200 and
+getting exactly 100, which is the kind of coincidence worth being suspicious of.
+
+Worth noting what did **not** catch it: every capture run logged its mask count,
+and I read that count many times. A number being plausible is not the same as a
+number being checked, and a duplicated `++` produces plausible numbers forever.
+
 ---
 
 ## 8. What I would do differently
