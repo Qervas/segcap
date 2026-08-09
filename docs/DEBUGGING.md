@@ -782,6 +782,60 @@ Worth noting what did **not** catch it: every capture run logged its mask count,
 and I read that count many times. A number being plausible is not the same as a
 number being checked, and a duplicated `++` produces plausible numbers forever.
 
+### 7.14 Building a correctness check, and having it fail for the wrong reason
+
+Every validation in this project proved the labels were *consistent*: 0 slot
+ambiguity, 0 unbound ids, byte-identical round-trips, identity surviving slot
+loss. None proved slot 71's pixels are the object the sidecar names. A bug
+writing a consistent-but-wrong stencil value would pass all of it.
+
+`tools/verify_labels.py` is the check that can fail in that case. Three tests a
+wrong label breaks and a right one does not: a stableId must always name the
+same object; a real object projects to a mostly-connected region; and across
+0.1s an object should move roughly as much as the rest of the scene, because
+that is the camera.
+
+**The first run failed, and both failures were mine.**
+
+*Failure one: "13,088 pixels in 13,088 pieces."* Every pixel its own connected
+component. Not fragmentation — a **stipple**. UE4 renders dithered LOD
+transitions and dithered opacity as a screen-door pattern, and CustomDepth
+inherits it, so those objects arrive as a checkerboard. Counting raw components
+called a perfectly well-formed label "completely fragmented". A 3×3
+morphological close makes a stipple read as the one object it is; the raw count
+is kept and reported separately, because dithering is a genuine constraint of
+the CustomDepth route worth naming rather than silently repairing. Measured at
+**1.0% of regions**.
+
+*Failure two: an object "moving 156× the scene".* Slot 47, `StaticMeshComponent0`
+— and its bounding box was the **entire frame**, in 4–5 pieces. A modular mesh
+spread across the scene. As the camera panned, different pieces dominated and
+the whole-region centroid slid across the screen far faster than any individual
+piece moved. I was measuring the instability of my own statistic. Fixed by
+tracking the largest blob's centroid and skipping regions that are not
+predominantly one blob.
+
+Even after that, three transitions were flagged — all of them real, none of them
+explained. **The action log settled it in one query:** right stick at ±16000,
+full deflection, the patrol's turn-in-place step. Under a fast yaw perspective
+sweeps objects near the screen edges many times further in pixels than objects
+near the centre, so a large ratio there is geometry.
+
+The input recording was added for world-model training and paid for itself first
+as a debugging instrument. The validator now reports the stick deflection
+alongside every flagged transition, so this question answers itself next time.
+
+**Final:** 344 identities, none ever changed what they named; median region is
+100% one blob; 3 flagged transitions in 3,068 (0.098%), 2 explained by camera
+rotation, **1 unexplained (0.03%)** — reported as unexplained rather than
+rounded away.
+
+Stated limit, because it matters: these checks are **necessary, not sufficient**.
+A label wrong in a spatially and temporally coherent way — two objects that
+always move together and are always adjacent — would still pass. True ground
+truth needs intervention: unmark one primitive and confirm exactly its pixels
+vanish. That is a live-run test and is not built.
+
 ---
 
 ## 8. What I would do differently

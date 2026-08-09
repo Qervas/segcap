@@ -46,6 +46,7 @@ and restores your settings.
 python tools\overlay.py build\bin\segcap_mask_<N>.pgm `
     --frame build\bin\segcap_frame_<N>.ppm --sidecar build\bin\segcap_mask_<N>.json
 python tools\identity_report.py --dir build\bin
+python tools\verify_labels.py   --dir build\bin
 python tools\pack.py --dir build\bin --out session.segcap --verify
 python tools\make_demo.py --dir build\bin --out demo.mp4
 .\build\bin\test_identity.exe
@@ -98,6 +99,10 @@ are reversible.
 | Every mask id resolves via its sidecar | **0 unbound**, 0.000% of pixels |
 | Identity survives slot loss | 52 objects left and returned; 55 held >1 slot |
 | Slot ambiguity within a frame | **0** |
+| Identity never renamed | **0 of 344** changed what they named |
+| Region is one connected blob | median **1.000**, mean 0.907 |
+| Labels that jump against the scene | 3 of 3,068 (0.098%); 2 explained by camera turn |
+| Dithered (stipple) regions | 1.0% — UE4 dithered LOD, a real CustomDepth constraint |
 | Did we change what the player sees? | **1.04× the noise floor** — PASS |
 | Mask compression, lossless | **104.6×** (225/225 records verified byte-identical) |
 | Descriptor misses | 0 |
