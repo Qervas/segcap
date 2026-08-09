@@ -90,6 +90,7 @@ public:
     // environment variable: an injected DLL inherits the host's environment,
     // which was fixed when Steam created the process, so we cannot influence it.
     void SetCensusOnly(bool on) { censusOnly_ = on; }
+    bool censusOnly() const { return censusOnly_; }
 
     // A/B mode: capture colour frames on a fixed stride regardless of whether a
     // mask was kept, so the "marking off" condition produces frames at all.

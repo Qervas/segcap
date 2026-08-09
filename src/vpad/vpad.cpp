@@ -160,7 +160,7 @@ void TapButton(USHORT button, int holdMs = 120) {
     Sleep(120);
 }
 
-void MenuSequence(int presses) {
+void MenuSequence(int presses, int gapMs) {
     // Stray: main menu -> SELECT SAVE (slot 1 pre-highlighted) -> SLOT 1
     // (CONTINUE pre-highlighted) -> in game. A confirms on every screen.
     //
@@ -170,10 +170,15 @@ void MenuSequence(int presses) {
     // A is contextual in gameplay (jump/interact) so surplus presses cost
     // nothing, whereas one press too few leaves the run stranded at a menu --
     // which is the failure this whole harness exists to stop repeating.
-    Log("menu: A x%d with settle time between", presses);
+    // The gap is configurable because it is title-specific, not a constant.
+    // Stray's menus animate in under two seconds. inZOI loads a saved world
+    // between confirmations and can take a minute, so a 2.5s gap would fire
+    // every remaining press into a loading screen and arrive in gameplay having
+    // already pressed A four more times than intended.
+    Log("menu: A x%d, %dms between", presses, gapMs);
     for (int i = 0; i < presses; ++i) {
         TapButton(XUSB_GAMEPAD_A);
-        Sleep(2500);
+        Sleep(gapMs);
     }
 }
 
@@ -294,10 +299,85 @@ void Recover(int escalation) {
 // meant the shared section did not exist yet, so the agent fell back to
 // open-loop for the entire run and said it was doing so exactly once, 40
 // seconds before the state it wanted became available.
-void Patrol(int seconds, StateReader& reader) {
-    Log("patrol: %d seconds", seconds);
+// inZOI's control scheme, read off its own on-screen legend rather than assumed:
+//
+//     RB + L   Run
+//     LB + R   Move Camera        <- camera needs LB HELD
+//     X        UI Focus
+//     Y        Radial Menu
+//     B        Cancel Action
+//
+// Two things this corrects. The Stray-derived patrol turns the camera with a
+// bare right stick, which in inZOI does nothing at all -- the modifier is not
+// optional. And inZOI auto-resumes into the last save, so it needs no menu
+// navigation whatsoever; the A presses written for Stray's menus were being
+// delivered into live gameplay, where A is a context action.
+//
+// Found by screenshotting the game and reading the legend. Every other blind
+// input loop in this project cost multiple runs before an instrument was
+// pointed at it; this one cost two.
+void PatrolInZoi(int seconds, int cancelEverySecs) {
+    Log("patrol (inZOI profile): %d seconds", seconds);
+    const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(seconds) * 1000;
+    ULONGLONG nextCancel =
+        cancelEverySecs > 0 ? GetTickCount64() + static_cast<ULONGLONG>(cancelEverySecs) * 1000 : 0;
+
+    // No A anywhere. In gameplay it is a context action and can open dialogs,
+    // start conversations, or confirm something we cannot see.
+    static const struct { SHORT lx, ly, rx; bool run; int ms; const char* what; } kSteps[] = {
+        {     0,  26000,     0, false, 2600, "walk forward" },
+        {     0,  26000, 12000, false, 2200, "walk + pan right" },
+        { 20000,  16000,     0, false, 2000, "walk forward-right" },
+        {     0,  26000,-12000, false, 2200, "walk + pan left" },
+        {-20000,  16000,     0, false, 2000, "walk forward-left" },
+        {     0,      0, 20000, false, 1800, "pan camera right" },
+        {     0,  28000,     0, true,  2600, "run forward" },
+        {     0, -20000,     0, false, 1600, "back up" },
+        {     0,      0,-20000, false, 1800, "pan camera left" },
+    };
+    const size_t n = sizeof(kSteps) / sizeof(kSteps[0]);
+
+    size_t i = 0;
+    while (GetTickCount64() < deadline) {
+        if (nextCancel && GetTickCount64() > nextCancel) {
+            nextCancel = GetTickCount64() + static_cast<ULONGLONG>(cancelEverySecs) * 1000;
+            Log("  cancel action: B");
+            TapButton(XUSB_GAMEPAD_B, 120);
+            Sleep(400);
+        }
+
+        const auto& s = kSteps[i % n];
+        ++i;
+
+        XUSB_REPORT r;
+        XUSB_REPORT_INIT(&r);
+        r.sThumbLX = s.lx;
+        r.sThumbLY = s.ly;
+        r.sThumbRX = s.rx;
+        // The modifiers are held for the whole step, not tapped: they gate the
+        // stick, so releasing them mid-step silently stops the camera moving.
+        if (s.rx != 0) r.wButtons |= XUSB_GAMEPAD_LEFT_SHOULDER;
+        if (s.run)     r.wButtons |= XUSB_GAMEPAD_RIGHT_SHOULDER;
+        Send(r);
+        Log("  %s", s.what);
+
+        const ULONGLONG until = GetTickCount64() + static_cast<ULONGLONG>(s.ms);
+        while (GetTickCount64() < until && GetTickCount64() < deadline) {
+            Sleep(100);
+            Send(r);
+        }
+    }
+    Neutral();
+    Log("patrol complete (inZOI profile)");
+}
+
+void Patrol(int seconds, StateReader& reader, int uiEscapeSecs) {
+    Log("patrol: %d seconds%s", seconds,
+        uiEscapeSecs > 0 ? " (with periodic UI escape)" : "");
     const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(seconds) * 1000;
     ULONGLONG nextOpenAttempt = 0;
+    ULONGLONG nextUiEscape =
+        uiEscapeSecs > 0 ? GetTickCount64() + static_cast<ULONGLONG>(uiEscapeSecs) * 1000 : 0;
     bool announced = false;
 
     // Deterministic, not random: a reproducible traversal means two capture runs
@@ -335,6 +415,20 @@ void Patrol(int seconds, StateReader& reader) {
     ULONGLONG lastSampleMs = 0;
 
     while (GetTickCount64() < deadline) {
+        // Periodic UI escape. In a game whose gameplay is interleaved with
+        // menus -- inZOI opens panels constantly -- movement input is swallowed
+        // by whatever dialog is focused, and no amount of stick deflection will
+        // move anything. B backs out of it. Done on a timer rather than on
+        // detection because there is no perception on this title yet: the
+        // property reflection that would say "the pawn did not move" does not
+        // resolve on UE5.
+        if (nextUiEscape && GetTickCount64() > nextUiEscape) {
+            nextUiEscape = GetTickCount64() + static_cast<ULONGLONG>(uiEscapeSecs) * 1000;
+            Log("  UI escape: B");
+            TapButton(XUSB_GAMEPAD_B, 120);
+            Sleep(500);
+        }
+
         const auto& s = kSteps[stepIdx % kStepCount];
         ++stepIdx;
 
@@ -405,6 +499,122 @@ void Patrol(int seconds, StateReader& reader) {
     Log("patrol complete (%d recoveries)", recoveries);
 }
 
+// Command-server mode: hold the pad open and apply whatever an external prober
+// asks for, one input at a time.
+//
+// This exists because hardcoding a control scheme per title is a dead end. It
+// was wrong for inZOI twice -- once assuming Stray's menu flow on a game that
+// auto-resumes into a save, once assuming a bare right stick turns a camera
+// that requires LB held. Both were guesses, and the correct answer was
+// obtainable in a minute by pressing one button and looking at the screen.
+//
+// So: the pad becomes an instrument something else can drive, and control
+// discovery becomes a measurement (tools/probe_controls.py) instead of a
+// constant in a table. That generalises to any title; a hardcoded scheme
+// generalises to none.
+//
+// File protocol rather than a socket, for the same reason the rest of this
+// project uses marker files: no port to collide, no lifetime to manage, and it
+// can be driven by hand from a shell when something needs poking.
+//
+//   command file:  seq=<n> lx=<n> ly=<n> rx=<n> ry=<n> lt=<n> rt=<n> btn=<CSV> ms=<n>
+//   ack file:      the seq most recently applied
+//   seq=-1         exit
+USHORT ButtonMask(const std::string& csv) {
+    static const struct { const char* name; USHORT bit; } kMap[] = {
+        {"A", XUSB_GAMEPAD_A}, {"B", XUSB_GAMEPAD_B},
+        {"X", XUSB_GAMEPAD_X}, {"Y", XUSB_GAMEPAD_Y},
+        {"LB", XUSB_GAMEPAD_LEFT_SHOULDER}, {"RB", XUSB_GAMEPAD_RIGHT_SHOULDER},
+        {"LS", XUSB_GAMEPAD_LEFT_THUMB},    {"RS", XUSB_GAMEPAD_RIGHT_THUMB},
+        {"START", XUSB_GAMEPAD_START},      {"BACK", XUSB_GAMEPAD_BACK},
+        {"DU", XUSB_GAMEPAD_DPAD_UP},       {"DD", XUSB_GAMEPAD_DPAD_DOWN},
+        {"DL", XUSB_GAMEPAD_DPAD_LEFT},     {"DR", XUSB_GAMEPAD_DPAD_RIGHT},
+    };
+    USHORT mask = 0;
+    size_t start = 0;
+    while (start <= csv.size()) {
+        const size_t comma = csv.find(',', start);
+        const std::string tok =
+            csv.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        for (const auto& m : kMap) {
+            if (tok == m.name) { mask |= m.bit; break; }
+        }
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return mask;
+}
+
+void Serve(const std::string& cmdPath) {
+    Log("serve: reading commands from %s", cmdPath.c_str());
+    const std::string ackPath = cmdPath + ".ack";
+    long long lastSeq = 0;
+    Neutral();
+
+    for (;;) {
+        std::FILE* f = nullptr;
+        if (fopen_s(&f, cmdPath.c_str(), "r") == 0 && f) {
+            char line[512] = {};
+            if (std::fgets(line, sizeof(line), f)) {
+                long long seq = 0; int lx = 0, ly = 0, rx = 0, ry = 0, lt = 0, rt = 0, ms = 400;
+                char btn[128] = "";
+                // Tolerant parse: a partially written file just fails to match
+                // and is retried on the next poll rather than applying garbage.
+                const char* p = line;
+                while (*p) {
+                    if      (sscanf_s(p, "seq=%lld", &seq) == 1 && strncmp(p, "seq=", 4) == 0) {}
+                    else if (strncmp(p, "lx=", 3) == 0)  sscanf_s(p, "lx=%d", &lx);
+                    else if (strncmp(p, "ly=", 3) == 0)  sscanf_s(p, "ly=%d", &ly);
+                    else if (strncmp(p, "rx=", 3) == 0)  sscanf_s(p, "rx=%d", &rx);
+                    else if (strncmp(p, "ry=", 3) == 0)  sscanf_s(p, "ry=%d", &ry);
+                    else if (strncmp(p, "lt=", 3) == 0)  sscanf_s(p, "lt=%d", &lt);
+                    else if (strncmp(p, "rt=", 3) == 0)  sscanf_s(p, "rt=%d", &rt);
+                    else if (strncmp(p, "ms=", 3) == 0)  sscanf_s(p, "ms=%d", &ms);
+                    else if (strncmp(p, "btn=", 4) == 0) sscanf_s(p, "btn=%127s", btn, (unsigned)_countof(btn));
+                    while (*p && *p != ' ') ++p;
+                    while (*p == ' ') ++p;
+                }
+                std::fclose(f);
+                f = nullptr;
+
+                if (seq == -1) { Log("serve: exit requested"); break; }
+                if (seq > lastSeq) {
+                    XUSB_REPORT r;
+                    XUSB_REPORT_INIT(&r);
+                    r.sThumbLX = static_cast<SHORT>(lx);
+                    r.sThumbLY = static_cast<SHORT>(ly);
+                    r.sThumbRX = static_cast<SHORT>(rx);
+                    r.sThumbRY = static_cast<SHORT>(ry);
+                    r.bLeftTrigger = static_cast<BYTE>(lt);
+                    r.bRightTrigger = static_cast<BYTE>(rt);
+                    r.wButtons = ButtonMask(btn);
+
+                    Log("serve: #%lld lx=%d ly=%d rx=%d ry=%d btn=%s ms=%d",
+                        seq, lx, ly, rx, ry, btn[0] ? btn : "-", ms);
+
+                    // Hold by re-sending: a single report can be missed if the
+                    // game polls between frames, and some titles treat silence
+                    // as the pad going idle.
+                    const ULONGLONG until = GetTickCount64() + static_cast<ULONGLONG>(ms);
+                    while (GetTickCount64() < until) { Send(r); Sleep(16); }
+                    Neutral();
+
+                    lastSeq = seq;
+                    std::FILE* a = nullptr;
+                    if (fopen_s(&a, ackPath.c_str(), "w") == 0 && a) {
+                        std::fprintf(a, "%lld\n", lastSeq);
+                        std::fclose(a);
+                    }
+                }
+            } else if (f) {
+                std::fclose(f);
+            }
+        }
+        Sleep(40);
+    }
+    Neutral();
+}
+
 void Usage(const char* exe) {
     std::printf(
         "usage: %s [--test] [--menu] [--patrol SECONDS]\n"
@@ -423,7 +633,12 @@ int main(int argc, char** argv) {
     bool doTest = false, doMenu = false;
     int patrolSeconds = 0;
     int menuPresses = 8;
+    int menuGapMs = 2500;
+    int preDelaySecs = 0;
+    int uiEscapeSecs = 0;
     std::string inputLogPath;
+    std::string profile = "stray";
+    std::string servePath;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -431,12 +646,17 @@ int main(int argc, char** argv) {
         else if (a == "--menu") doMenu = true;
         else if (a == "--input-log" && i + 1 < argc) inputLogPath = argv[++i];
         else if (a == "--menu-presses" && i + 1 < argc) menuPresses = std::atoi(argv[++i]);
+        else if (a == "--menu-gap" && i + 1 < argc) menuGapMs = std::atoi(argv[++i]);
+        else if (a == "--pre-delay" && i + 1 < argc) preDelaySecs = std::atoi(argv[++i]);
+        else if (a == "--ui-escape" && i + 1 < argc) uiEscapeSecs = std::atoi(argv[++i]);
+        else if (a == "--profile" && i + 1 < argc) profile = argv[++i];
+        else if (a == "--serve" && i + 1 < argc) servePath = argv[++i];
         else if (a == "--patrol" && i + 1 < argc) patrolSeconds = std::atoi(argv[++i]);
         else if (a == "--help") { Usage(argv[0]); return 0; }
         else { Log("unknown argument: %s", a.c_str()); Usage(argv[0]); return 2; }
     }
 
-    if (!doTest && !doMenu && patrolSeconds == 0) {
+    if (!doTest && !doMenu && patrolSeconds == 0 && servePath.empty()) {
         Usage(argv[0]);
         return 2;
     }
@@ -466,13 +686,36 @@ int main(int argc, char** argv) {
         Log("test complete");
     }
 
-    if (doMenu) MenuSequence(menuPresses);
+    if (!servePath.empty()) {
+        Serve(servePath);
+        Neutral();
+        Disconnect();
+        if (g_inputLog) { std::fclose(g_inputLog); g_inputLog = nullptr; }
+        Log("pad released");
+        return 0;
+    }
+
+    if (preDelaySecs > 0) {
+        Log("waiting %ds before touching anything (title still loading)", preDelaySecs);
+        Neutral();
+        Sleep(preDelaySecs * 1000);
+    }
+
+    if (doMenu) MenuSequence(menuPresses, menuGapMs);
 
     if (patrolSeconds > 0) {
-        StateReader reader;
-        reader.Open();                 // may fail; Patrol retries
-        Patrol(patrolSeconds, reader);
-        reader.Close();
+        if (profile == "inzoi") {
+            // No StateReader: property reflection does not resolve on UE5, so
+            // there is no pawn transform to close the loop on. Open loop, and
+            // say so rather than pretending otherwise.
+            Log("profile inzoi: open loop (no UE5 perception yet)");
+            PatrolInZoi(patrolSeconds, uiEscapeSecs);
+        } else {
+            StateReader reader;
+            reader.Open();             // may fail; Patrol retries
+            Patrol(patrolSeconds, reader, uiEscapeSecs);
+            reader.Close();
+        }
     }
 
     Neutral();

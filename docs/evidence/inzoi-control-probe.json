@@ -1,0 +1,140 @@
+{
+  "process": "inZOI-Win64-Shipping",
+  "drift_floor": 8.72557678442682,
+  "threshold": 2.5,
+  "results": [
+    {
+      "label": "L stick forward",
+      "input": {
+        "ly": 26000,
+        "ms": 2200
+      },
+      "drift": 9.30024032684451,
+      "during_mean": 31.238536409516943,
+      "during_pct": 0.4293198750300409,
+      "after_mean": 32.92283105022831,
+      "after_pct": 0.4485099735640471,
+      "recovered": false
+    },
+    {
+      "label": "L stick back",
+      "input": {
+        "ly": -26000,
+        "ms": 2200
+      },
+      "drift": 1.978622927180966,
+      "during_mean": 13.818409036289353,
+      "during_pct": 0.15457822638788754,
+      "after_mean": 11.796262917567892,
+      "after_pct": 0.14596250901225666,
+      "recovered": false
+    },
+    {
+      "label": "L stick left",
+      "input": {
+        "lx": -26000,
+        "ms": 2200
+      },
+      "drift": 5.96760394136025,
+      "during_mean": 8.360346070656092,
+      "during_pct": 0.11230473443883682,
+      "after_mean": 9.15507089641913,
+      "after_pct": 0.12232636385484258,
+      "recovered": null
+    },
+    {
+      "label": "L stick right",
+      "input": {
+        "lx": 26000,
+        "ms": 2200
+      },
+      "drift": 11.98323720259553,
+      "during_mean": 10.38184330689738,
+      "during_pct": 0.11279740447007931,
+      "after_mean": 12.849363133862052,
+      "after_pct": 0.1459745253544821,
+      "recovered": null
+    },
+    {
+      "label": "R stick right",
+      "input": {
+        "rx": 26000,
+        "ms": 2200
+      },
+      "drift": 9.83806777217015,
+      "during_mean": 14.041023792357606,
+      "during_pct": 0.14825763037731315,
+      "after_mean": 13.995734198509973,
+      "after_pct": 0.15336457582311944,
+      "recovered": null
+    },
+    {
+      "label": "R stick left",
+      "input": {
+        "rx": -26000,
+        "ms": 2200
+      },
+      "drift": 8.150913242009132,
+      "during_mean": 11.716846911800047,
+      "during_pct": 0.14848594087959624,
+      "after_mean": 11.659108387406873,
+      "after_pct": 0.14962749339101178,
+      "recovered": null
+    },
+    {
+      "label": "R stick up",
+      "input": {
+        "ry": 26000,
+        "ms": 2200
+      },
+      "drift": 6.820523912521028,
+      "during_mean": 8.694136024993991,
+      "during_pct": 0.12227829848594088,
+      "after_mean": 13.151562124489306,
+      "after_pct": 0.15801490026435952,
+      "recovered": null
+    },
+    {
+      "label": "LB + R stick right",
+      "input": {
+        "rx": 26000,
+        "btn": "LB",
+        "ms": 2200
+      },
+      "drift": 10.417543859649124,
+      "during_mean": 4.663902907954818,
+      "during_pct": 0.04776496034607065,
+      "after_mean": 12.07490987743331,
+      "after_pct": 0.1341744772891132,
+      "recovered": null
+    },
+    {
+      "label": "LB + R stick left",
+      "input": {
+        "rx": -26000,
+        "btn": "LB",
+        "ms": 2200
+      },
+      "drift": 12.515993751502043,
+      "during_mean": 5.71071857726508,
+      "during_pct": 0.06458783946166786,
+      "after_mean": 12.329524152847872,
+      "after_pct": 0.14830569574621486,
+      "recovered": null
+    },
+    {
+      "label": "RB + L stick forward",
+      "input": {
+        "ly": 26000,
+        "btn": "RB",
+        "ms": 2200
+      },
+      "drift": 3.4380437394857006,
+      "during_mean": 78.46348233597693,
+      "during_pct": 0.7754506128334535,
+      "after_mean": 79.23645758231194,
+      "after_pct": 0.7906032203797164,
+      "recovered": false
+    }
+  ]
+}

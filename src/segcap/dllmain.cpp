@@ -9,6 +9,12 @@
 
 #include <windows.h>
 
+#include <algorithm>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
 #include "customdepth.h"
 #include "hooks.h"
 #include "log.h"
@@ -23,6 +29,56 @@ HMODULE g_self = nullptr;
 // opt-in per run: every session so far has been read-only, and that must stay
 // the default rather than something that happens because a flag was left on.
 bool g_markCustomDepth = false;
+
+// Read-only introspection dump, from a "segcap.introspect" marker file. Each
+// non-empty line names a class whose reflected properties should be logged.
+bool g_introspect = false;
+std::vector<std::string> g_introspectClasses;
+
+// Enumerates what is actually extractable from a title.
+//
+// Deliberately a measurement rather than a design document. On an unfamiliar
+// game the useful question is not "what does UE expose" -- that is known -- but
+// "which classes does THIS game instantiate, and what fields do they carry".
+// Both are answerable by reflection in a few hundred milliseconds, and guessing
+// either has already cost this project a run.
+void Introspect(segcap::ue4::Engine& engine, const std::vector<std::string>& classes) {
+    engine.RefreshMemoryMap();
+
+    std::unordered_map<std::string, int> histogram;
+    const int32_t total = engine.NumObjects();
+    for (int32_t i = 0; i < total; ++i) {
+        segcap::ue4::ObjectRef ref;
+        if (!engine.GetObject(i, ref)) continue;
+        ++histogram[ref.className];
+    }
+
+    std::vector<std::pair<std::string, int>> sorted(histogram.begin(), histogram.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    segcap::LogInfo("introspect: %zu DISTINCT CLASSES across %d objects",
+                    sorted.size(), total);
+    const size_t cap = sorted.size() < 250 ? sorted.size() : 250;
+    for (size_t i = 0; i < cap; ++i) {
+        segcap::LogInfo("introspect:   %6d  %s", sorted[i].second, sorted[i].first.c_str());
+    }
+
+    for (const std::string& cls : classes) {
+        void* uclass = engine.FindClass(cls.c_str());
+        if (!uclass) {
+            segcap::LogWarn("introspect: class '%s' not found", cls.c_str());
+            continue;
+        }
+        const auto props = engine.ListProperties(uclass, true);
+        segcap::LogInfo("introspect: --- %s : %zu reflected properties ---",
+                        cls.c_str(), props.size());
+        for (const auto& p : props) {
+            segcap::LogInfo("introspect:   +0x%04X %-4d %-22s %s",
+                            p.offset, p.size, p.type.c_str(), p.name.c_str());
+        }
+    }
+}
 
 // Signalled once hooks are live. The injector creates this event before
 // injecting and waits on it before resuming a suspended process.
@@ -95,6 +151,28 @@ DWORD WINAPI InitThread(LPVOID) {
             std::fclose(fp);
             return v;
         };
+        // Read-only introspection: each line of segcap.introspect names a class
+        // whose reflected properties should be dumped.
+        std::wstring intro(marker);
+        const size_t dot4 = intro.find_last_of(L'.');
+        if (dot4 != std::wstring::npos) intro = intro.substr(0, dot4);
+        intro += L".introspect";
+        std::FILE* ifp = nullptr;
+        if (_wfopen_s(&ifp, intro.c_str(), L"r") == 0 && ifp) {
+            g_introspect = true;
+            char line[256];
+            while (std::fgets(line, sizeof(line), ifp)) {
+                std::string s(line);
+                while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) {
+                    s.pop_back();
+                }
+                if (!s.empty()) g_introspectClasses.push_back(s);
+            }
+            std::fclose(ifp);
+            segcap::LogInfo("introspect marker present: %zu class(es) requested",
+                            g_introspectClasses.size());
+        }
+
         const unsigned long caps = readInt(L".captures");
         const unsigned long strd = readInt(L".stride");
         if (caps || strd) {
@@ -245,6 +323,46 @@ DWORD WINAPI DiscoverThread(LPVOID) {
     // ---- ProcessEvent second ----------------------------------------------
     // Needs the engine actively dispatching, so give the game a moment to get
     // going, but do not wait for the full sampling schedule.
+    //
+    // CENSUS MODE MUST NOT REACH HERE.
+    //
+    // Census was described, in this file and to its users, as a read-only mode
+    // for first contact with an unfamiliar title. It suppressed GPU work and
+    // UObject writes -- and not this, which is neither. Finding ProcessEvent
+    // means installing a hook on UObject vtable slots 60..80 one at a time and
+    // seeing which one behaves like ProcessEvent. On a familiar engine that is
+    // a measured risk. On an unfamiliar one it is a loaded gun: the search
+    // calls whatever occupies each slot using ProcessEvent's signature.
+    //
+    // It killed inZOI on the second census run, at candidate 70, and the log
+    // shows why -- the validator was reporting 810 valid against 432,080
+    // invalid, i.e. the slot was a hot function that is not ProcessEvent. UE5
+    // does not have it where UE4 does.
+    //
+    // The mode was doing most of what it promised, which is exactly why nobody
+    // noticed it was not doing all of it.
+    if (segcap::Hooks::Get().censusOnly()) {
+        segcap::LogInfo("census mode: skipping ProcessEvent discovery "
+                        "(probing vtable slots is not a read-only act)");
+        // Still do everything that IS read-only -- sampling and introspection
+        // are the whole point of a census run.
+        if (g_engine.namesResolved()) {
+            const int kSampleAt[] = {30, 60, 120, 180};
+            int elapsed = 0;
+            for (int stage : kSampleAt) {
+                if (stage > elapsed) Sleep((stage - elapsed) * 1000);
+                elapsed = stage;
+                char label[32];
+                _snprintf_s(label, sizeof(label), _TRUNCATE, "t+%ds", stage);
+                g_engine.ReportSample(label);
+            }
+            g_engine.CountDerivedFrom("PrimitiveComponent");
+            if (g_introspect) Introspect(g_engine, g_introspectClasses);
+        }
+        segcap::LogInfo("census complete");
+        return 0;
+    }
+
     if (g_engine.namesResolved()) {
         Sleep(25000);
         auto& pe = segcap::ue4::GetProcessEventHook();
@@ -311,6 +429,25 @@ DWORD WINAPI DiscoverThread(LPVOID) {
         // over, to produce the same pool. The marking loop owns collection.
     }
     if (g_engine.namesResolved()) g_engine.CountDerivedFrom("PrimitiveComponent");
+
+    // ---- optional read-only introspection dump -----------------------------
+    //
+    // Answers "what can we actually read out of this game" with evidence rather
+    // than speculation. Two passes, both pure reads:
+    //
+    //   1. every distinct class name in the object array, with instance counts.
+    //      On an unfamiliar title this is the map: it shows the engine classes,
+    //      the game's own classes (inZOI prefixes everything B1, Stray uses
+    //      Toyo), and which of them actually exist at runtime rather than in
+    //      the headers.
+    //   2. the full reflected property list for any class named in the marker
+    //      file, so the fields available for extraction are enumerated instead
+    //      of guessed.
+    //
+    // Gated behind segcap.introspect because it logs thousands of lines.
+    if (g_engine.namesResolved() && g_introspect) {
+        Introspect(g_engine, g_introspectClasses);
+    }
     return 0;
 }
 
