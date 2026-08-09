@@ -19,7 +19,8 @@ reflection at runtime, not hardcoded.
 
 | | |
 |---|---|
-| **The demo** | [`docs/evidence/stray-gameplay-demo.mp4`](docs/evidence/stray-gameplay-demo.mp4) — 75 frames, rendered left, mask overlaid right |
+| **The demo** | [`docs/evidence/stray-gameplay-demo.mp4`](docs/evidence/stray-gameplay-demo.mp4) — 30s real-time, rendered left, labelled mask right, live controller panel |
+| **Picking this back up** | [`docs/RESUME.md`](docs/RESUME.md) — state, sanity check, and what to do next |
 | **The debugging story** | [`docs/DEBUGGING.md`](docs/DEBUGGING.md) — every crash and wrong turn, and what actually found each one |
 | **Where AI helped and where it was overridden** | [`docs/AI-USAGE.md`](docs/AI-USAGE.md) |
 | **Output format** | [`docs/FORMAT.md`](docs/FORMAT.md) — masks, sidecars, actions, container |
