@@ -1,0 +1,59 @@
+ID? 0000025D06B150A0 DXGI_FMT_3             96x128 binds=21 clears=0
+ID? 0000025C025AE460 DXGI_FMT_3             32x32 binds=15 clears=0
+ID? 0000025D152343C0 R32_UINT               32x32 binds=5 clears=0
+ID? 0000025D15278FB0 R32_UINT               64x64 binds=5 clears=0
+ID? 0000025C025AF370 DXGI_FMT_3             32x32 binds=20 clears=0
+ID? 0000025C025AD550 DXGI_FMT_3             32x32 binds=20 clears=0
+ID? 0000025D15230780 DXGI_FMT_3             32x32 binds=20 clears=0
+ID? 0000025D152352D0 R32G32_UINT            32x32 binds=10 clears=0
+ID? 0000025D152361E0 DXGI_FMT_3             32x32 binds=20 clears=0
+ID? 0000025D15231690 DXGI_FMT_3             32x32 binds=20 clears=0
+ID? 0000025D152370F0 DXGI_FMT_3             32x32 binds=20 clears=0
+ID? 0000025D15277FA0 R32G32_UINT            64x32 binds=10 clears=0
+ID? 0000025D14C89E30 R32_UINT               1280x800 binds=1 clears=0   <-- scene-scale integer target
+ID? 0000025D06B150A0 DXGI_FMT_3             96x128 binds=2 clears=0
+ID? 0000025D152343C0 R32_UINT               32x32 binds=4 clears=0
+ID? 0000025D15278FB0 R32_UINT               64x64 binds=1 clears=0
+ID? 0000025C025AD550 DXGI_FMT_3             32x32 binds=1 clears=0
+ID? 0000025D15230780 DXGI_FMT_3             32x32 binds=5 clears=0
+ID? 0000025D152352D0 R32G32_UINT            32x32 binds=6 clears=0
+ID? 0000025D152361E0 DXGI_FMT_3             32x32 binds=4 clears=0
+ID? 0000025D15231690 DXGI_FMT_3             32x32 binds=3 clears=0
+ID? 0000025D152370F0 DXGI_FMT_3             32x32 binds=1 clears=0
+ID? 0000025D15277FA0 R32G32_UINT            64x32 binds=5 clears=0
+ID? 0000025D533B1620 R32_UINT               1280x800 binds=1 clears=0   <-- scene-scale integer target
+ID? 0000025F0D8D1BC0 DXGI_FMT_3             224x128 binds=42 clears=0
+ID? 0000025C025AE460 DXGI_FMT_3             32x32 binds=1 clears=0
+ID? 0000025D15278FB0 R32_UINT               64x64 binds=2 clears=0
+ID? 0000025C025AF370 DXGI_FMT_3             32x32 binds=1 clears=0
+ID? 0000025C025AD550 DXGI_FMT_3             32x32 binds=9 clears=0
+ID? 0000025E83CCD580 R32G32_UINT            64x64 binds=6 clears=0
+ID? 0000025D15230780 DXGI_FMT_3             32x32 binds=16 clears=0
+ID? 0000025E335B4660 DXGI_FMT_3             256x128 binds=2 clears=0
+ID? 0000025D152361E0 DXGI_FMT_3             32x32 binds=5 clears=0
+ID? 0000025D15231690 DXGI_FMT_3             32x32 binds=6 clears=0
+ID? 0000025D152370F0 DXGI_FMT_3             32x32 binds=5 clears=0
+ID? 0000025F10BACA50 R32_UINT               1280x800 binds=2 clears=0   <-- scene-scale integer target
+ID? 0000025F0D8CF9A0 DXGI_FMT_3             128x128 binds=11 clears=0
+ID? 0000025F0D8D3DE0 R32_UINT               128x64 binds=1 clears=0
+ID? 0000025D5336A830 DXGI_FMT_3             64x64 binds=13 clears=0
+ID? 0000025D5336C850 R32G32_UINT            96x64 binds=5 clears=0
+ID? 0000025D5336B840 R32_UINT               64x64 binds=5 clears=0
+ID? 0000025D152352D0 R32G32_UINT            32x32 binds=1 clears=0
+ID? 0000025E335B4660 DXGI_FMT_3             256x128 binds=1 clears=0
+ID? 0000025D152361E0 DXGI_FMT_3             32x32 binds=8 clears=0
+ID? 0000025D15231690 DXGI_FMT_3             32x32 binds=1 clears=0
+ID? 0000025D152370F0 DXGI_FMT_3             32x32 binds=4 clears=0
+ID? 0000025D5336A830 DXGI_FMT_3             64x64 binds=12 clears=0
+ID? 0000025D5336C850 R32G32_UINT            96x64 binds=1 clears=0
+ID? 0000025D5336B840 R32_UINT               64x64 binds=3 clears=0
+ID? 0000025CFCA16500 R32_UINT               1280x800 binds=1 clears=0   <-- scene-scale integer target
+ID? 0000025CFCA27A50 R8_UINT                1280x800 binds=1 clears=0   <-- scene-scale integer target
+ID? 0000025D152361E0 DXGI_FMT_3             32x32 binds=1 clears=0
+ID? 0000025D5336A830 DXGI_FMT_3             64x64 binds=1 clears=0
+ID? 0000025D5336B840 R32_UINT               64x64 binds=1 clears=0
+ID? 0000025C025AD550 DXGI_FMT_3             32x32 binds=6 clears=0
+ID? 0000025D5336C850 R32G32_UINT            96x64 binds=2 clears=0
+ID? 0000025F0D8D3DE0 R32_UINT               128x64 binds=3 clears=0
+ID? 0000025D152361E0 DXGI_FMT_3             32x32 binds=6 clears=0
+ID? 0000025D152370F0 DXGI_FMT_3             32x32 binds=9 clears=0

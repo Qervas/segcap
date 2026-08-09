@@ -129,6 +129,26 @@ long long NowMs() {
     return static_cast<long long>(u.QuadPart / 10000ULL) - 11644473600000LL;
 }
 
+// Integer-typed render targets. UE uses these for identity data -- object ids,
+// primitive ids, and Nanite's packed visible-cluster index.
+bool IsIntegerFormat(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R32G32B32A32_UINT:
+        case DXGI_FORMAT_R32G32B32_UINT:
+        case DXGI_FORMAT_R32G32_UINT:
+        case DXGI_FORMAT_R32_UINT:
+        case DXGI_FORMAT_R16G16B16A16_UINT:
+        case DXGI_FORMAT_R16G16_UINT:
+        case DXGI_FORMAT_R16_UINT:
+        case DXGI_FORMAT_R8G8B8A8_UINT:
+        case DXGI_FORMAT_R8G8_UINT:
+        case DXGI_FORMAT_R8_UINT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool HasStencilPlane(DXGI_FORMAT f) {
     switch (f) {
         case DXGI_FORMAT_R24G8_TYPELESS:
@@ -1153,6 +1173,27 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
                 static_cast<void*>(t.resource), FormatName(t.format), t.width, t.height,
                 t.sampleCount, t.bindCount, t.clearCount,
                 t.everBoundAsDepth ? "yes" : "NO", StateOf(t.resource));
+    }
+
+    // Integer render targets, listed separately with their dimensions.
+    //
+    // These are the OTHER route to per-object identity. UE writes ids into
+    // integer targets, and UE5's Nanite visibility buffer is an R32G32_UINT at
+    // scene resolution packing depth with a visible-cluster index. Reading one
+    // needs no engine mutation at all -- which matters on a title where the
+    // CustomDepth route is blocked because ProcessEvent cannot be found safely.
+    //
+    // Listed here rather than inferred from the election's rejection lines,
+    // which say only "no stencil plane" and drop the dimensions. Knowing an
+    // R32G32_UINT exists is useless; knowing whether it is scene-sized is the
+    // entire question.
+    for (const TargetFingerprint& t : snapshot) {
+        if (!IsIntegerFormat(t.format)) continue;
+        const bool sceneSized = backbufferWidth_ != 0 && t.width >= backbufferWidth_ / 4;
+        LogInfo("  ID? %p %-22s %llux%u binds=%u clears=%u%s",
+                static_cast<void*>(t.resource), FormatName(t.format), t.width, t.height,
+                t.bindCount, t.clearCount,
+                sceneSized ? "   <-- scene-scale integer target" : "");
     }
 
     // The full score table is logged, not just the winner. A wrong election is
