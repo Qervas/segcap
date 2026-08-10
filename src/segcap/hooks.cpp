@@ -61,6 +61,21 @@ constexpr uint64_t kAbCaptureStride = 120;   // ~2s at 60fps -> ~300s of coverag
 
 constexpr int kCreateCommittedResourceSlot = 27; // ID3D12Device::CreateCommittedResource
 constexpr int kResourceBarrierSlot = 26;     // ID3D12GraphicsCommandList::ResourceBarrier
+
+// ID3D12GraphicsCommandList7::Barrier -- the Enhanced Barriers entry point.
+//
+// Derived by counting the interface chain rather than looked up in a table:
+//   IUnknown 3, ID3D12Object 4, ID3D12DeviceChild 1, ID3D12CommandList 1  = 9
+//   ID3D12GraphicsCommandList  51  -> 60
+//   GCL1 6, GCL2 1, GCL3 1, GCL4 9, GCL5 2, GCL6 1                        -> 80
+// Barrier is GCL7's only method, so slot 80.
+//
+// The same count puts ResourceBarrier at 9 + 18 - 1 = 26, which is the constant
+// above and has been correct on two engines -- so the arithmetic is anchored to
+// something already known good, and InstallBarrierHook re-checks that anchor at
+// runtime before trusting slot 80. Guessing a vtable index is exactly the
+// mistake that cost days on ProcessEvent; this one is derived and verified.
+constexpr int kEnhancedBarrierSlot = 80;
 constexpr int kOMSetRenderTargetsSlot = 46;  // ID3D12GraphicsCommandList::OMSetRenderTargets
 constexpr int kClearDSVSlot = 47;            // ID3D12GraphicsCommandList::ClearDepthStencilView
 
@@ -239,6 +254,37 @@ bool Hooks::AcquireVTables() {
                         reinterpret_cast<void**>(&origClearDSV_));
 
         if (ok) LogInfo("device/queue/commandlist vtables hooked");
+
+        // Enhanced Barriers, if this runtime exposes them.
+        //
+        // Verified, not assumed: QueryInterface must succeed AND the derived
+        // slot must hold a code pointer AND the QI'd vtable must agree with the
+        // base list at the known-good ResourceBarrier slot -- that last check is
+        // what confirms the numbering, since both interfaces are the same object
+        // and must share a vtable prefix.
+        ID3D12GraphicsCommandList7* gcl7 = nullptr;
+        if (SUCCEEDED(dummyList->QueryInterface(IID_PPV_ARGS(&gcl7))) && gcl7) {
+            auto** vt7 = *reinterpret_cast<void***>(gcl7);
+            const bool anchorOk = vt7[kResourceBarrierSlot] == listVT[kResourceBarrierSlot];
+            if (!anchorOk) {
+                LogError("GraphicsCommandList7 present but slot %d disagrees with the "
+                         "base list -- refusing to hook slot %d on a numbering I cannot "
+                         "confirm", kResourceBarrierSlot, kEnhancedBarrierSlot);
+            } else if (CreateHook(vt7, kEnhancedBarrierSlot,
+                                  reinterpret_cast<void*>(&Hooks::Barrier_),
+                                  reinterpret_cast<void**>(&origEnhancedBarrier_))) {
+                enhancedBarriersHooked_ = true;
+                LogInfo("Enhanced Barriers hooked (ID3D12GraphicsCommandList7::Barrier, "
+                        "slot %d) -- state shadow can now see them",
+                        kEnhancedBarrierSlot);
+            } else {
+                LogError("failed to hook Enhanced Barriers at slot %d", kEnhancedBarrierSlot);
+            }
+            gcl7->Release();
+        } else {
+            LogInfo("ID3D12GraphicsCommandList7 not available; this runtime predates "
+                    "Enhanced Barriers, so ResourceBarrier sees everything");
+        }
     } else {
         LogError("could not create dummy command allocator/list");
     }
@@ -305,6 +351,36 @@ bool Hooks::AcquireSwapChainVTable() {
     DestroyWindow(hwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
     return ok;
+}
+
+// Enhanced Barriers detour. Records what the LEGACY path can no longer see.
+//
+// Per the D3D12 spec the runtime translates legacy ResourceBarrier calls into
+// enhanced ones internally, and an application written against Barrier() never
+// calls ResourceBarrier at all. Our state shadow is built entirely from
+// ResourceBarrier, so against such an application it observes nothing and every
+// StateBefore we declare is invented -- which is what the validation layer
+// caught on inZOI (we said PIXEL_SHADER_RESOURCE, the runtime knew
+// UNORDERED_ACCESS).
+void STDMETHODCALLTYPE Hooks::Barrier_(ID3D12GraphicsCommandList7* self,
+                                       UINT32 numGroups,
+                                       const D3D12_BARRIER_GROUP* groups) {
+    Hooks& h = Get();
+    if (groups) {
+        std::lock_guard<std::mutex> lock(h.mutex_);
+        for (UINT32 g = 0; g < numGroups; ++g) {
+            const D3D12_BARRIER_GROUP& grp = groups[g];
+            if (grp.Type != D3D12_BARRIER_TYPE_TEXTURE || !grp.pTextureBarriers) continue;
+            for (UINT32 i = 0; i < grp.NumBarriers; ++i) {
+                const D3D12_TEXTURE_BARRIER& tb = grp.pTextureBarriers[i];
+                if (!tb.pResource) continue;
+                h.textureLayout_[tb.pResource] = tb.LayoutAfter;
+                ++h.barriersSeen_[tb.pResource];
+                ++h.enhancedBarrierCount_;
+            }
+        }
+    }
+    h.origEnhancedBarrier_(self, numGroups, groups);
 }
 
 void Hooks::AttachInfoQueue() {
@@ -1410,8 +1486,18 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
 
     // Say plainly when we are simply waiting, so silence is never ambiguous.
     if (requireArm_ && !armed_ && electedTarget_ && (frameIndex_ % 600) == 0) {
-        LogInfo("readback holding: DISARMED (target %p, %llu barriers observed so far)",
-                static_cast<void*>(electedTarget_), barriers);
+        int layout = -1;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = textureLayout_.find(electedTarget_);
+            if (it != textureLayout_.end()) layout = static_cast<int>(it->second);
+        }
+        // The number that settles the Enhanced Barriers question, printed
+        // rather than inferred from an absence.
+        LogInfo("readback holding: DISARMED (target %p, %llu barriers observed, "
+                "enhanced hooked=%d total enhanced=%llu, layout=%d)",
+                static_cast<void*>(electedTarget_), barriers,
+                enhancedBarriersHooked_ ? 1 : 0, enhancedBarrierCount_, layout);
     }
 
     if (armReady && electedTarget_ && shadowUsable && !loggedArmedOk_) {

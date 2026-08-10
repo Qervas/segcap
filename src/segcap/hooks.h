@@ -192,6 +192,11 @@ private:
     static void STDMETHODCALLTYPE ResourceBarrier_(ID3D12GraphicsCommandList* self,
                                                    UINT count,
                                                    const D3D12_RESOURCE_BARRIER* barriers);
+    // Enhanced Barriers. A game written against this never calls the legacy
+    // ResourceBarrier above, which is why the state shadow could see nothing.
+    static void STDMETHODCALLTYPE Barrier_(ID3D12GraphicsCommandList7* self,
+                                           UINT32 numGroups,
+                                           const D3D12_BARRIER_GROUP* groups);
     static HRESULT STDMETHODCALLTYPE CreateCommittedResource_(
         ID3D12Device* self, const D3D12_HEAP_PROPERTIES* heapProps,
         D3D12_HEAP_FLAGS heapFlags, const D3D12_RESOURCE_DESC* desc,
@@ -333,6 +338,13 @@ private:
     bool censusOnly_ = false;
     bool noReadback_ = false;
     bool warnedNoReadback_ = false;
+
+    using EnhancedBarrierFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList7*, UINT32,
+                                                       const D3D12_BARRIER_GROUP*);
+    EnhancedBarrierFn origEnhancedBarrier_ = nullptr;
+    bool enhancedBarriersHooked_ = false;
+    uint64_t enhancedBarrierCount_ = 0;
+    std::unordered_map<ID3D12Resource*, D3D12_BARRIER_LAYOUT> textureLayout_;
 
     std::unordered_map<ID3D12Resource*, uint64_t> barriersSeen_;
     uint64_t BarriersSeenFor(ID3D12Resource* res);
