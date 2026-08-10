@@ -332,6 +332,10 @@ private:
     bool noReadback_ = false;
     bool warnedNoReadback_ = false;
 
+    std::unordered_map<ID3D12Resource*, uint64_t> barriersSeen_;
+    uint64_t BarriersSeenFor(ID3D12Resource* res);
+    bool warnedUnshadowed_ = false;
+
     bool d3dDebug_ = false;
     ID3D12InfoQueue* infoQueue_ = nullptr;
     uint64_t d3dMessagesLogged_ = 0;

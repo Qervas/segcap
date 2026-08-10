@@ -507,6 +507,7 @@ void STDMETHODCALLTYPE Hooks::ResourceBarrier_(ID3D12GraphicsCommandList* self, 
             // COPY_SOURCE and back without guessing. A wrong guess here is a
             // debug-layer error at best and a GPU hang at worst.
             h.resourceState_[b.Transition.pResource] = b.Transition.StateAfter;
+            ++h.barriersSeen_[b.Transition.pResource];
         }
     }
     h.origBarrier_(self, count, barriers);
@@ -754,6 +755,27 @@ D3D12_RESOURCE_STATES Hooks::StateOf(ID3D12Resource* res) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = resourceState_.find(res);
     return it == resourceState_.end() ? D3D12_RESOURCE_STATE_COMMON : it->second;
+}
+
+// How many ResourceBarrier transitions we have actually WATCHED for this
+// resource. Zero is the number that matters.
+//
+// StateOf() answers COMMON for a resource it has never seen, which is a guess
+// wearing the costume of an answer -- and the readback then submits a
+// transition declaring that guess as StateBefore. On inZOI the debug layer
+// caught it exactly: we declared NON_PIXEL|PIXEL_SHADER_RESOURCE for a resource
+// the runtime knew was in UNORDERED_ACCESS.
+//
+// The likely mechanism is that UE5 transitions it somewhere we cannot see.
+// Enhanced Barriers (ID3D12GraphicsCommandList7::Barrier) are a different entry
+// point entirely and our ResourceBarrier hook is blind to them, which would
+// make the shadow stale by construction rather than by accident. Rather than
+// guess, count: a target that is bound every frame but for which we have
+// watched zero barriers is a target whose state we are inventing.
+uint64_t Hooks::BarriersSeenFor(ID3D12Resource* res) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = barriersSeen_.find(res);
+    return it == barriersSeen_.end() ? 0 : it->second;
 }
 
 void Hooks::NoteBind(ID3D12Resource* res, bool asDepth) {
@@ -1325,7 +1347,26 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
         LogWarn("readback SUPPRESSED by marker -- marking stays live, no GPU work "
                 "is issued. Isolation run: this is the only variable.");
     }
-    if (!censusOnly_ && !noReadback_ && electedTarget_ && device_ && queue_) {
+    // Refuse to transition a resource whose state we have never watched change.
+    //
+    // Without this the readback declares StateBefore from StateOf(), which
+    // answers COMMON for anything it has not seen and a possibly-stale value
+    // for anything it has. Declaring a wrong StateBefore is not a soft error:
+    // the runtime took it as a promise, and inZOI died 0.5-1.5s later every
+    // time. Refusing costs a title we could not have captured correctly anyway,
+    // and it says why instead of taking the process down.
+    const bool shadowUsable = electedTarget_ && BarriersSeenFor(electedTarget_) > 0;
+    if (electedTarget_ && !shadowUsable && !censusOnly_ && !noReadback_ && !warnedUnshadowed_) {
+        warnedUnshadowed_ = true;
+        LogError("readback REFUSED: elected target %p has been bound as a render target "
+                 "but we have observed ZERO ResourceBarrier transitions for it, so any "
+                 "StateBefore we declare is invented. Likely Enhanced Barriers "
+                 "(ID3D12GraphicsCommandList7::Barrier), which this build does not hook. "
+                 "Capture is off; marking is unaffected.",
+                 static_cast<void*>(electedTarget_));
+    }
+
+    if (!censusOnly_ && !noReadback_ && shadowUsable && device_ && queue_) {
         if (readback_.Prepare(device_, electedTarget_, 1 /*stencil plane*/)) {
             readback_.Enqueue(queue_, electedTarget_, StateOf(electedTarget_), frameIndex_);
 
