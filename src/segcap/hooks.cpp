@@ -606,6 +606,47 @@ HRESULT STDMETHODCALLTYPE Hooks::CreateCommittedResource_(
         desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
         auto* res = static_cast<ID3D12Resource*>(*resource);
         std::lock_guard<std::mutex> lock(h.mutex_);
+
+        // ---- ADDRESS RECYCLING ------------------------------------------------
+        //
+        // D3D12 hands the same ID3D12Resource* back for a completely different
+        // resource once the previous occupant is released, and UE5's pooled
+        // render-target allocator releases constantly -- 813 CreateDSV calls in
+        // 25 minutes on inZOI. Every map here is keyed by that address, so
+        // without this the dead resource's shadow state, barrier count and
+        // accumulated election evidence all silently transfer to whatever is
+        // created at the same address next.
+        //
+        // That is not hypothetical. inZOI elected 000001846D62F690 two hundred
+        // times as a full-res depth-stencil; by the end of the session the same
+        // address was reporting R10G10B10A2_UNORM with no stencil plane. We were
+        // scoring a target that no longer existed and asking to copy from it --
+        // which is the whole explanation for D3D12 error 527 (StateBefore
+        // mismatch) and for the readback crash.
+        //
+        // This is the identical bug we already fixed on the UObject side with
+        // generational handles. Creation at a known address IS the generation
+        // bump; it is observable, so use it rather than inventing one.
+        const size_t hadState = h.resourceState_.erase(res);
+        const size_t hadBarriers = h.barriersSeen_.erase(res);
+        const size_t hadLayout = h.textureLayout_.erase(res);
+        const size_t hadEvidence = h.evidence_.erase(res);
+        h.targets_.erase(res);
+        if (hadState || hadBarriers || hadLayout || hadEvidence) {
+            ++h.addressRecycles_;
+            // If the recycled address is the one we were about to copy from,
+            // the election is void. Say so loudly -- a silent re-election here
+            // would look like ordinary target churn in the log.
+            if (res == h.electedTarget_) {
+                ++h.electedRecycles_;
+                LogWarn("elected target %p was DESTROYED and its address reused by a new "
+                        "resource; election voided (recycle #%llu)",
+                        static_cast<void*>(res), h.electedRecycles_);
+                h.electedTarget_ = nullptr;
+                h.electedProducedContent_ = false;
+            }
+        }
+
         h.resourceState_[res] = initialState;
     }
     return hr;
@@ -899,6 +940,54 @@ std::vector<TargetFingerprint> Hooks::SnapshotTargets() {
     for (auto& kv : targets_) {
         const TargetFingerprint& fresh = kv.second;
         TargetFingerprint& acc = evidence_[kv.first];
+        // Has this ADDRESS changed identity since we last saw it?
+        //
+        // `fresh` was built from a live GetDesc in NoteBind during this frame,
+        // so it is always the truth about whatever occupies the address now.
+        // `acc` is what we have been scoring. When they disagree on the
+        // immutable properties of a resource -- format and dimensions cannot
+        // change without destroying and recreating it -- the previous occupant
+        // is gone and the accumulated evidence belongs to a dead resource.
+        //
+        // This is the whole inZOI failure. The merge below deliberately carries
+        // only the per-frame counters forward, which means format/width/height
+        // were never refreshed after the first sighting. UE5's pooled allocator
+        // recycles render-target addresses within a frame or two, so a dead
+        // depth-stencil's format stayed attached to its address permanently
+        // while the new occupant's binds were merged on top of it. The election
+        // then chose a "1280x800 depth-stencil" that was really a 512x512
+        // R8G8B8A8_TYPELESS, and the readback failed to size a stencil plane
+        // that did not exist.
+        //
+        // The staleness prune below cannot catch this: the address keeps being
+        // bound by its NEW owner, so lastSeenFrame keeps refreshing and the
+        // entry never goes quiet. Identity has to be checked, not just liveness.
+        const bool identityChanged =
+            acc.resource != nullptr &&
+            (acc.format != fresh.format || acc.width != fresh.width ||
+             acc.height != fresh.height || acc.sampleCount != fresh.sampleCount);
+        if (identityChanged) {
+            ++addressRecycles_;
+            if (addressRecycles_ <= 8 || (addressRecycles_ % 100) == 0) {
+                LogWarn("address %p changed identity (%llux%u %s -> %llux%u %s); "
+                        "discarding %llu frames of evidence (recycle #%llu)",
+                        static_cast<void*>(kv.first), acc.width, acc.height,
+                        FormatName(acc.format), fresh.width, fresh.height,
+                        FormatName(fresh.format), acc.framesSeen, addressRecycles_);
+            }
+            if (kv.first == electedTarget_) {
+                ++electedRecycles_;
+                LogWarn("the ELECTED target %p is the one that changed identity; "
+                        "election voided", static_cast<void*>(kv.first));
+                electedTarget_ = nullptr;
+                electedProducedContent_ = false;
+            }
+            resourceState_.erase(kv.first);
+            barriersSeen_.erase(kv.first);
+            textureLayout_.erase(kv.first);
+            acc = TargetFingerprint{};
+        }
+
         if (acc.resource == nullptr) {
             acc = fresh;
             acc.framesSeen = 0;
@@ -1364,6 +1453,32 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
         // A new target has produced nothing yet by definition, so it starts
         // without incumbency protection and must earn it the same way.
         electedProducedContent_ = false;
+
+        // PIN the winner. Purging on creation (see CreateCommittedResource_)
+        // keeps the bookkeeping honest, but it is reactive: between the moment
+        // the game releases the elected target and the moment something else is
+        // created at its address, we would still be holding a dangling pointer
+        // and calling GetDesc/CopyTextureRegion on it. One AddRef removes that
+        // window entirely for the single resource we actually read from. The
+        // cost is one full-res depth-stencil kept alive (~5 MB); pinning every
+        // tracked target instead would pin hundreds and cost gigabytes.
+        //
+        // Safe to AddRef here: the winner was bound or cleared during this
+        // frame, so the game held a reference to it moments ago on this thread.
+        if (pinnedTarget_) {
+            pinnedTarget_->Release();
+            pinnedTarget_ = nullptr;
+        }
+        electedDesc_ = {};
+        if (winner) {
+            winner->AddRef();
+            pinnedTarget_ = winner;
+            const D3D12_RESOURCE_DESC d = winner->GetDesc();
+            electedDesc_ = d;
+            LogInfo("elected target PINNED %p %llux%u fmt=%s samples=%u",
+                    static_cast<void*>(winner), d.Width, d.Height,
+                    FormatName(d.Format), d.SampleDesc.Count);
+        }
     }
     electedTarget_ = winner;
 
@@ -1476,12 +1591,18 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     if (electedTarget_ && !censusOnly_ && !noReadback_ && armReady && !shadowUsable
         && electedTarget_ != lastUnshadowedTarget_) {
         lastUnshadowedTarget_ = electedTarget_;
-        LogError("readback REFUSED for target %p: ARMED and elected, but ZERO "
-                 "ResourceBarrier transitions have been observed for it, so any "
-                 "StateBefore we declare would be invented. Consistent with Enhanced "
-                 "Barriers (ID3D12GraphicsCommandList7::Barrier), which this build does "
-                 "not hook. Marking is unaffected.",
-                 static_cast<void*>(electedTarget_));
+        // The Enhanced Barriers explanation this message used to carry was
+        // measured and killed: inZOI calls ID3D12GraphicsCommandList7::Barrier
+        // zero times while a legacy target showed 7,340 transitions. The real
+        // cause found afterwards was address recycling -- we were scoring a
+        // resource that had already been destroyed, so of course nothing had
+        // ever been observed transitioning the thing now at that address.
+        LogError("readback REFUSED for target %p (%llux%u %s): ARMED and elected, but ZERO "
+                 "ResourceBarrier transitions observed for it, so any StateBefore we "
+                 "declare would be invented. %llu address recycles seen so far. Marking "
+                 "is unaffected.",
+                 static_cast<void*>(electedTarget_), electedDesc_.Width, electedDesc_.Height,
+                 FormatName(electedDesc_.Format), addressRecycles_);
     }
 
     // Say plainly when we are simply waiting, so silence is never ambiguous.

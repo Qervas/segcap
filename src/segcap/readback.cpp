@@ -89,7 +89,17 @@ bool Readback::Prepare(ID3D12Device* device, ID3D12Resource* target, uint32_t pl
         if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bufDesc,
                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                    IID_PPV_ARGS(&s.buffer)))) {
-            LogError("readback: could not create readback buffer %u", i);
+            // Rate-limited: Prepare() is retried every frame, so an
+            // unsatisfiable request logs at frame rate. One such run wrote tens
+            // of thousands of identical lines and buried the election messages
+            // that explained WHY it was unsatisfiable.
+            static uint64_t complaints = 0;
+            if (++complaints <= 3 || (complaints % 600) == 0) {
+                LogError("readback: could not create readback buffer %u (%llu bytes, "
+                         "occurrence %llu) -- usually means the elected target has no "
+                         "such plane",
+                         i, static_cast<unsigned long long>(bufDesc.Width), complaints);
+            }
             ReleaseResources();
             return false;
         }

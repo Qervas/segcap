@@ -348,6 +348,19 @@ private:
 
     std::unordered_map<ID3D12Resource*, uint64_t> barriersSeen_;
     uint64_t BarriersSeenFor(ID3D12Resource* res);
+
+    // ---- resource identity -------------------------------------------------
+    //
+    // Every map above is keyed by ID3D12Resource*, and D3D12 reuses those
+    // addresses as soon as the previous resource is released. A reference held
+    // on the elected target makes its address un-recyclable for as long as we
+    // intend to copy from it; the counters record how often the game recycled
+    // an address we were tracking, which is the signal that told us the
+    // election had been scoring a destroyed resource.
+    ID3D12Resource* pinnedTarget_ = nullptr;
+    D3D12_RESOURCE_DESC electedDesc_ = {};
+    uint64_t addressRecycles_ = 0;
+    uint64_t electedRecycles_ = 0;
     bool warnedUnshadowed_ = false;
     ID3D12Resource* lastUnshadowedTarget_ = nullptr;
     bool loggedArmedOk_ = false;

@@ -122,6 +122,21 @@ if ($NoReadback) {
 Set-Content -Path (Join-Path $bin "segcap.captures") -Value "$Captures" -NoNewline
 Set-Content -Path (Join-Path $bin "segcap.stride")   -Value "$Stride"   -NoNewline
 
+# ---- arm the readback in GAMEPLAY, not on the first frame that qualifies ------
+#
+# The dump budget is a fixed number of frames, and without this it is spent on
+# whatever renders first. A run that reached gameplay perfectly still produced 61
+# masks of the MAIN MENU and zero of the world, because the menu satisfied the
+# recording gate at t=49 and the budget was gone by t=65.
+#
+# So the readback is held disarmed until the script has actually clicked play,
+# and armed from here rather than by hand. The script is the only thing that
+# knows where in the route we are; asking a human to drop the file is exactly
+# the manual step this harness exists to remove.
+Remove-Item (Join-Path $bin "segcap.arm") -ErrorAction SilentlyContinue
+Set-Content -Path (Join-Path $bin "segcap.requirearm") -Value "1" -NoNewline
+Write-Host "[play] readback DISARMED until gameplay (budget reserved for the world)"
+
 Get-Process -Name "inZOI*","vpad" -ErrorAction SilentlyContinue | ForEach-Object {
     Write-Host "[play] closing stale $($_.ProcessName) $($_.Id)"
     Stop-Process -Id $_.Id -Force
@@ -176,6 +191,16 @@ Start-Sleep -Seconds $LoadWait
 # The sim loads PAUSED. Clicking play is what starts time; the clock in the
 # bottom-left advancing is how you know it worked.
 Click 0.0660 0.9606 5  "transport play (unpause)"
+
+# Let marking catch up before spending the dump budget. The mark loop needs the
+# world to be stable and the field layout calibrated, and neither is true in the
+# first seconds after a save load -- marking reported "stale 300 of 300" for a
+# long stretch while the previous world's components were still being released.
+$armSettle = 25
+Write-Host "[play] settling ${armSettle}s, then ARMING the readback"
+Start-Sleep -Seconds $armSettle
+Set-Content -Path (Join-Path $bin "segcap.arm") -Value "1" -NoNewline
+Write-Host "[play] ARMED -- every captured frame from here is gameplay"
 
 Write-Host "[play] in gameplay; holding for ${Seconds}s while segcap marks"
 $deadline = (Get-Date).AddSeconds($Seconds)
