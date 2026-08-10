@@ -55,7 +55,20 @@ param(
     # separate CombinedCustomStencil of format PF_R16G16_UINT -- a COLOUR
     # target. On such a title the depth-stencil we elect never has its stencil
     # plane written, which is exactly what inZOI's masks showed.
-    [switch]$IdBuf = $true
+    #
+    # DEFAULT OFF. The probe copies from arbitrary integer render targets, and on
+    # UE5 that is not yet safe: even with the "we have observed a transition"
+    # guard satisfied, copying a 1280x800 R32_UINT killed inZOI at t=49s twice.
+    # Observed-barriers turns out to be necessary but NOT sufficient, because the
+    # state shadow updates when a barrier is RECORDED while the GPU executes it
+    # later, and because a placed resource can inherit state records left by a
+    # previous tenant of the same address.
+    #
+    # Copying safely needs the copy to be recorded into the GAME's own command
+    # list at a point where its state is known exactly -- see HANDOFF.md. Until
+    # then this stays opt-in for diagnosis, because it identifies the right buffer
+    # and is the only thing that does.
+    [switch]$IdBuf
 )
 
 $ErrorActionPreference = "Stop"

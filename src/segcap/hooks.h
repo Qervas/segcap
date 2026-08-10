@@ -453,6 +453,12 @@ private:
     // from it is a GPU fault rather than a bad mask.
     uint32_t idBarrierWait_ = 0;
     static constexpr uint32_t kIdBarrierWaitFrames = 600;
+    // Consecutive frames the pinned id buffer has not been bound by the game.
+    // A few frames of absence are normal (a pass can skip a frame); a sustained
+    // absence means the transient allocator has moved on and we are copying a
+    // resource nobody writes to any more.
+    uint32_t maskSourceMissing_ = 0;
+    static constexpr uint32_t kMaskSourceMissingLimit = 120;
     bool idChannelFound_ = false;
     bool loggedIdExhausted_ = false;
     // Dumps to spend before giving up on a candidate and advancing. Small,

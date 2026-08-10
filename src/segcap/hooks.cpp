@@ -1504,6 +1504,10 @@ void Hooks::OnIdBufferReady(const MaskFrame& frame) {
         if (leasedCount > 0) {
             uint64_t nonZero[3] = {0, 0, 0};
             uint64_t hit[3] = {0, 0, 0};
+            // Per-channel histogram over LEASED values only, so the acceptance
+            // test can ask "how many of our slots actually appear, and is any one
+            // of them carrying the whole match".
+            std::vector<std::unordered_map<uint32_t, uint64_t>> leasedHist(3);
             const uint32_t bpp = frame.bytesPerPixel;
             for (uint32_t y = 0; y < frame.height; ++y) {
                 const uint8_t* row = frame.data + static_cast<size_t>(y) * frame.rowPitch;
@@ -1533,7 +1537,10 @@ void Hooks::OnIdBufferReady(const MaskFrame& frame) {
                     for (int c = 0; c < 3; ++c) {
                         if (!chan[c]) continue;
                         ++nonZero[c];
-                        if (chan[c] < 65536 && leased[chan[c]]) ++hit[c];
+                        if (chan[c] < 65536 && leased[chan[c]]) {
+                            ++hit[c];
+                            ++leasedHist[c][chan[c]];
+                        }
                     }
                 }
             }
@@ -1541,6 +1548,14 @@ void Hooks::OnIdBufferReady(const MaskFrame& frame) {
             const char* names2[3] = {"R16", "byte0", "byte1"};
             const char* names4[3] = {"R16(low)", "G16(high)", "R32(whole)"};
             const char* const* names = bpp == 1 ? names1 : (bpp == 2 ? names2 : names4);
+            uint32_t distinctLeasedSeen[3] = {0, 0, 0};
+            uint64_t topLeasedValueCount[3] = {0, 0, 0};
+            for (int c = 0; c < 3; ++c) {
+                distinctLeasedSeen[c] = static_cast<uint32_t>(leasedHist[c].size());
+                for (const auto& kv : leasedHist[c]) {
+                    if (kv.second > topLeasedValueCount[c]) topLeasedValueCount[c] = kv.second;
+                }
+            }
             int bestChan = -1;
             double bestFrac = 0.0;
             for (int c = 0; c < 3; ++c) {
@@ -1552,10 +1567,44 @@ void Hooks::OnIdBufferReady(const MaskFrame& frame) {
                         names[c], nonZero[c], 100.0 * frac);
                 if (frac > bestFrac) { bestFrac = frac; bestChan = c; }
             }
-            // A channel of unrelated data will land near zero; genuine ids land
-            // high. Half is a wide margin between those two outcomes.
-            constexpr double kIdChannelThreshold = 0.50;
-            if (bestChan >= 0 && bestFrac >= kIdChannelThreshold) {
+            // A high match fraction is NOT sufficient on its own, and believing
+            // it was cost a full misdiagnosis. With few slots leased, and
+            // especially when the leased set is a low contiguous range, a buffer
+            // of ordinary small integers matches trivially: the measured "100.0%"
+            // was carried by values 1, 2 and 3 covering 58.7% of the screen,
+            // while pixels genuinely from our marks were 0.41%.
+            //
+            // Slots are now issued in a scattered order (IdentityRegistry::
+            // LeaseSlot), so an honest match must ALSO reproduce the scatter.
+            // Three independent conditions, all cheap:
+            //   - enough distinct leased values actually present, so one dominant
+            //     value cannot carry the verdict
+            //   - no single value dominating the "match", for the same reason
+            //   - a decent share of the leased set observed, not just its head
+            constexpr double kIdChannelThreshold = 0.90;
+            constexpr uint32_t kMinDistinctLeasedSeen = 6;
+            constexpr double kMaxSingleValueShare = 0.60;
+            const bool enoughDistinct = bestChan >= 0 && distinctLeasedSeen[bestChan] >= kMinDistinctLeasedSeen;
+            const double dominance =
+                (bestChan >= 0 && hit[bestChan])
+                    ? static_cast<double>(topLeasedValueCount[bestChan]) /
+                          static_cast<double>(hit[bestChan])
+                    : 1.0;
+            const bool notDominated = dominance <= kMaxSingleValueShare;
+            if (bestChan >= 0 && bestFrac >= kIdChannelThreshold && !enoughDistinct) {
+                LogInfo("idbuf: %p channel %s matched %.1f%% but only %u distinct leased "
+                        "values appear -- too few to distinguish real ids from ordinary "
+                        "small integers; not accepting",
+                        static_cast<void*>(idTarget_), names[bestChan], 100.0 * bestFrac,
+                        distinctLeasedSeen[bestChan]);
+            } else if (bestChan >= 0 && bestFrac >= kIdChannelThreshold && !notDominated) {
+                LogInfo("idbuf: %p channel %s matched %.1f%% but %.0f%% of the matching "
+                        "texels are a single value -- that is one big region, not a set of "
+                        "object ids; not accepting",
+                        static_cast<void*>(idTarget_), names[bestChan], 100.0 * bestFrac,
+                        100.0 * dominance);
+            } else if (bestChan >= 0 && bestFrac >= kIdChannelThreshold && enoughDistinct &&
+                       notDominated) {
                 LogWarn("idbuf: FOUND OUR IDS in %p channel %s (%.1f%% of non-zero texels are "
                         "leased slots, %zu slots leased). This is the per-object id buffer.",
                         static_cast<void*>(idTarget_), names[bestChan], 100.0 * bestFrac,
@@ -2092,6 +2141,51 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     // id: measured 100.0% of non-zero texels in the R16G16_UINT's G channel
     // against 0.0% everywhere else.
     //
+    // ---- is the pinned id buffer still the one the game renders into? -------
+    //
+    // AddRef keeps the COM OBJECT alive; it does not keep the game using it, and
+    // under UE5's transient allocator it does not even keep the heap memory.
+    // Measured: the pinned resource was last bound by the game 7.3s after we
+    // pinned it, and in the following 894 census emissions 891 contained a live
+    // 1280x800 R16G16_UINT and NONE contained ours. Every one of 67,547
+    // "captured" frames was copied from a resource the game had abandoned, whose
+    // memory was meanwhile being rewritten by other passes -- live garbage rather
+    // than a stale snapshot, which is why the content kept changing and looked
+    // superficially plausible.
+    //
+    // So the id buffer needs what the depth-stencil election already has: it must
+    // be re-confirmed against what is actually being bound, and dropped the
+    // moment it stops appearing. Dropping it re-opens the probe, which then
+    // re-identifies the current buffer by the same leased-slot test.
+    if (maskSource_) {
+        bool stillBound = false;
+        for (const TargetFingerprint& t : snapshot) {
+            if (t.resource == maskSource_) { stillBound = true; break; }
+        }
+        if (stillBound) {
+            maskSourceMissing_ = 0;
+        } else if (++maskSourceMissing_ > kMaskSourceMissingLimit) {
+            LogWarn("capture: id buffer %p has not been bound for %u frames -- the game has "
+                    "moved to a different resource. Dropping it and re-probing rather than "
+                    "copying memory nobody is writing our ids into.",
+                    static_cast<void*>(maskSource_), maskSourceMissing_);
+            maskSource_->Release();
+            maskSource_ = nullptr;
+            maskChannel_ = -1;
+            maskSourceMissing_ = 0;
+            // Re-open the probe. The candidate we just dropped is NOT added to
+            // idRejected_: it was right once, and its successor is a different
+            // resource that must be judged on its own evidence.
+            idChannelFound_ = false;
+            idTarget_ = nullptr;
+            idDumped_ = 0;
+            loggedIdExhausted_ = false;
+            idRejected_.clear();
+            warnedUnleasedIds_ = false;
+            warnedMaskSourceUnshadowed_ = false;
+        }
+    }
+
     ID3D12Resource* const copySource = maskSource_ ? maskSource_ : electedTarget_;
     const UINT copyPlane = maskSource_ ? 0u : 1u;   // colour target vs stencil plane
 

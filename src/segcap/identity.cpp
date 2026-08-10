@@ -84,10 +84,31 @@ uint8_t IdentityRegistry::LeaseSlot(void* component, int32_t serialNumber,
     if (it->second.slot != 0) return it->second.slot;
 
     // Find a free slot. 0 is reserved for "unmarked".
+    //
+    // Slots are handed out in a SCATTERED order, not 1,2,3,... That is not
+    // cosmetic. "Which buffer contains our ids?" is answered by testing a
+    // candidate buffer's values against the set we leased, and with a contiguous
+    // leased range that test is nearly free to pass: any buffer holding mostly
+    // small integers matches. It cost a full misdiagnosis -- a probe reported
+    // "100.0% of non-zero texels are leased slots" for a velocity-adjacent
+    // buffer, where values 1, 2 and 3 covered 58.7% of the screen and value 2
+    // alone was 51.4%, while pixels genuinely attributable to our marks were
+    // 0.41%. The conclusion was confidently wrong and the evidence looked
+    // perfect.
+    //
+    // A scattered set makes the test discriminating: a buffer of small integers,
+    // depth bytes or velocity bytes has no reason to contain {137, 43, 211, ...}
+    // and nothing else. The permutation is FIXED and generated arithmetically --
+    // no RNG, so a session is reproducible and the sidecar remains the sole
+    // authority on what a value means.
+    //
+    // 157 is coprime with 255, so s -> 1 + ((s * 157) % 255) is a bijection onto
+    // 1..255: every slot is still reachable and none is issued twice.
     uint8_t slot = 0;
-    for (uint32_t s = 1; s <= 255; ++s) {
-        if (bySlot_.find(static_cast<uint8_t>(s)) == bySlot_.end()) {
-            slot = static_cast<uint8_t>(s);
+    for (uint32_t s = 0; s < 255; ++s) {
+        const uint8_t candidate = static_cast<uint8_t>(1 + ((s * 157u) % 255u));
+        if (bySlot_.find(candidate) == bySlot_.end()) {
+            slot = candidate;
             break;
         }
     }
