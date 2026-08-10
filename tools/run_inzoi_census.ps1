@@ -52,7 +52,14 @@ param(
     [int]$PreDelay = 80,        # inZOI is a 35 GB title; do not touch it while loading
     [int]$MenuPresses = 3,      # Continue -> first slot -> confirm
     [int]$MenuGapMs = 9000,     # a save load sits between confirmations
-    [int]$LoadWait = 90         # world streaming after the last confirmation
+    [int]$LoadWait = 90,        # world streaming after the last confirmation
+    # Attempt ProcessEvent discovery. NOT read-only -- it installs a trampoline
+    # on a UObject virtual. Safe enough to try now only because the search was
+    # rebuilt: read-only triage picks ~3 candidate slots instead of sweeping 21
+    # blind, and the validator stops after 2000 samples instead of running on
+    # every one of UE5's ~300k dispatches per second. The earlier version of
+    # this froze inZOI in under two seconds.
+    [switch]$PeTriage
 )
 
 $ErrorActionPreference = "Stop"
@@ -116,7 +123,14 @@ Set-Content -Path (Join-Path $root "build\bin\segcap.census") -Value "1" -NoNewl
 Remove-Item (Join-Path $root "build\bin\segcap.abtest")   -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $root "build\bin\segcap.captures") -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $root "build\bin\segcap.stride")   -ErrorAction SilentlyContinue
-Write-Host "[inzoi] READ-ONLY: mark marker removed, census marker set"
+$peMarker = Join-Path $root "build\bin\segcap.petriage"
+if ($PeTriage) {
+    Set-Content -Path $peMarker -Value "1" -NoNewline
+    Write-Host "[inzoi] NOT READ-ONLY: pe-triage marker set -- this run will hook a vtable slot"
+} else {
+    Remove-Item $peMarker -ErrorAction SilentlyContinue
+    Write-Host "[inzoi] READ-ONLY: mark marker removed, census marker set"
+}
 
 Get-Process -Name "$procName*" -ErrorAction SilentlyContinue | ForEach-Object {
     Write-Host "[inzoi] closing stale $($_.Id)"; Stop-Process -Id $_.Id -Force

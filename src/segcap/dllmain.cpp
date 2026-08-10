@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -29,6 +30,7 @@ HMODULE g_self = nullptr;
 // opt-in per run: every session so far has been read-only, and that must stay
 // the default rather than something that happens because a flag was left on.
 bool g_markCustomDepth = false;
+bool g_peTriageInCensus = false;
 
 // Read-only introspection dump, from a "segcap.introspect" marker file. Each
 // non-empty line names a class whose reflected properties should be logged.
@@ -136,6 +138,19 @@ DWORD WINAPI InitThread(LPVOID) {
         const bool census = GetFileAttributesW(m.c_str()) != INVALID_FILE_ATTRIBUTES;
         segcap::Hooks::Get().SetCensusOnly(census);
         segcap::LogInfo("census marker %ls: %s", m.c_str(), census ? "PRESENT" : "absent");
+
+        // Opt-in: attempt ProcessEvent discovery even in census mode. Census is
+        // read-only by contract and hooking is not a read, so this stays an
+        // explicit switch rather than something census quietly started doing.
+        std::wstring pt(marker);
+        const size_t dotp = pt.find_last_of(L'.');
+        if (dotp != std::wstring::npos) pt = pt.substr(0, dotp);
+        pt += L".petriage";
+        g_peTriageInCensus = GetFileAttributesW(pt.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (g_peTriageInCensus) {
+            segcap::LogInfo("pe-triage marker %ls: PRESENT -- census will attempt "
+                            "ProcessEvent discovery on the triage shortlist", pt.c_str());
+        }
 
         std::wstring mk(marker);
         const size_t dot2 = mk.find_last_of(L'.');
@@ -385,6 +400,13 @@ DWORD WINAPI DiscoverThread(LPVOID) {
     // vtable slots and calls them, and on UE5 it killed inZOI outright -- which
     // is precisely the blocker the id-buffer route exists to go around. Running
     // it here would reintroduce the crash while trying to avoid needing it.
+    //
+    // UPDATE: both halves of that gun have since been disarmed -- the search
+    // now tries only slots that read-only triage shortlisted (3, not 21), and
+    // the validator stops after 2000 samples instead of running on every one of
+    // UE5's ~300k calls per second. Census still defaults to skipping it,
+    // because census means read-only and hooking is not a read; drop a
+    // `segcap.petriage` marker to opt in.
     if (segcap::Hooks::Get().censusOnly() || segcap::Hooks::Get().probeIdBuffer()) {
         segcap::LogInfo("%s: skipping ProcessEvent discovery "
                         "(probing vtable slots is not a read-only act)",
@@ -403,7 +425,46 @@ DWORD WINAPI DiscoverThread(LPVOID) {
                 g_engine.ReportSample(label);
             }
             g_engine.CountDerivedFrom("PrimitiveComponent");
+            // No known index here -- this is the mode used on engines where the
+            // brute-force search is unsafe, so the ranking is the output rather
+            // than a calibration.
+            g_engine.ProbeVTablePrologues(-1);
             if (g_introspect) Introspect(g_engine, g_introspectClasses);
+
+            if (g_peTriageInCensus) {
+                // Explicitly requested. Install() now tries only the handful of
+                // slots the read-only triage shortlisted, and its validator
+                // stops after 2000 samples -- the two things that made the
+                // original sweep lethal here.
+                segcap::LogInfo("pe-triage: attempting ProcessEvent discovery "
+                                "(shortlist only, bounded validation)");
+                auto& pe = segcap::ue4::GetProcessEventHook();
+                if (pe.Install(g_engine)) {
+                    segcap::LogInfo("pe-triage: ProcessEvent FOUND at vtable %d",
+                                    pe.vtableIndex());
+                    // Prove the queue actually runs on the game thread before
+                    // anything is allowed to depend on it.
+                    // Static, not a stack local. If the slot dispatches but the
+                    // queue drains later than we wait, the task would otherwise
+                    // write through a dangling reference into a dead frame --
+                    // a use-after-free whose trigger is the hook working, just
+                    // slowly.
+                    static std::atomic<bool> ran{false};
+                    pe.RunOnGameThread([](segcap::ue4::Engine&) {
+                        ran.store(true, std::memory_order_release);
+                    });
+                    Sleep(2000);
+                    segcap::LogInfo("pe-triage: game-thread task %s",
+                                    ran.load(std::memory_order_acquire)
+                                        ? "RAN -- execution point is live"
+                                        : "did NOT run -- slot dispatches but the "
+                                          "queue never drained");
+                    Sleep(15000);   // let it idle under the hook before we judge it healthy
+                    segcap::LogInfo("pe-triage: still alive 15s after install");
+                } else {
+                    segcap::LogWarn("pe-triage: no candidate validated as ProcessEvent");
+                }
+            }
         }
         segcap::LogInfo("census complete");
         return 0;
@@ -415,6 +476,12 @@ DWORD WINAPI DiscoverThread(LPVOID) {
         if (pe.Install(g_engine)) {
             segcap::LogInfo("ue4: game-thread execution point ready (vtable %d)",
                             pe.vtableIndex());
+
+            // Calibrate the read-only vtable heuristic against the answer the
+            // brute-force search just proved. This is the whole point: the
+            // heuristic is only worth running on an engine where the answer is
+            // unknown if it can be shown to find the answer on one where it is.
+            g_engine.ProbeVTablePrologues(pe.vtableIndex());
             // Prove the queue actually runs there, before anything depends on it.
             pe.RunOnGameThread([](segcap::ue4::Engine&) {
                 segcap::LogInfo("ue4: >>> task executed on game thread %lu <<<",
