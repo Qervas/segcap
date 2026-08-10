@@ -1180,10 +1180,48 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     // Dumping on CONTENT rather than on frame number removes the timing
     // coupling entirely: the capture happens when there is something to capture,
     // whenever that turns out to be.
+    // When the mask comes from a multi-byte id buffer rather than a stencil
+    // plane, flatten the proven channel to 8 bits FIRST. Everything downstream --
+    // the content scan, the leased-slot check, the PGM writer, every tool in
+    // tools/ -- is written against one byte per pixel, and a slot is 1..255 by
+    // construction (IdentityRegistry::kSlotCount), so nothing is lost.
+    MaskFrame view = frame;
+    if (frame.bytesPerPixel != 1 && maskChannel_ >= 0) {
+        maskScratch_.assign(static_cast<size_t>(frame.width) * frame.height, 0);
+        const uint32_t bpp = frame.bytesPerPixel;
+        for (uint32_t y = 0; y < frame.height; ++y) {
+            const uint8_t* src = frame.data + static_cast<size_t>(y) * frame.rowPitch;
+            uint8_t* dst = maskScratch_.data() + static_cast<size_t>(y) * frame.width;
+            for (uint32_t x = 0; x < frame.width; ++x) {
+                const uint8_t* p = src + static_cast<size_t>(x) * bpp;
+                uint32_t v = 0;
+                if (bpp == 2) {
+                    v = maskChannel_ == 0
+                            ? (static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8))
+                            : (maskChannel_ == 1 ? p[0] : p[1]);
+                } else {
+                    const uint32_t w = static_cast<uint32_t>(p[0]) |
+                                       (static_cast<uint32_t>(p[1]) << 8) |
+                                       (static_cast<uint32_t>(p[2]) << 16) |
+                                       (static_cast<uint32_t>(p[3]) << 24);
+                    v = maskChannel_ == 0 ? (w & 0xFFFFu)
+                                          : (maskChannel_ == 1 ? ((w >> 16) & 0xFFFFu) : w);
+                }
+                // Anything outside the slot range is not one of ours; drop it to
+                // 0 (unlabelled) rather than let it alias onto a real slot.
+                dst[x] = v < 256 ? static_cast<uint8_t>(v) : 0;
+            }
+        }
+        view.data = maskScratch_.data();
+        view.rowPitch = frame.width;
+        view.bytesPerPixel = 1;
+    }
+    const MaskFrame& mf = view;
+
     bool seen[256] = {};
-    for (uint32_t y = 0; y < frame.height; ++y) {
-        const uint8_t* row = frame.data + static_cast<size_t>(y) * frame.rowPitch;
-        for (uint32_t x = 0; x < frame.width; ++x) {
+    for (uint32_t y = 0; y < mf.height; ++y) {
+        const uint8_t* row = mf.data + static_cast<size_t>(y) * mf.rowPitch;
+        for (uint32_t x = 0; x < mf.width; ++x) {
             seen[row[x]] = true;
         }
     }
@@ -1244,7 +1282,26 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     uint64_t unleasedPixels = 0;
     uint64_t labelledPixels = 0;
     bool leaseCheckPossible = false;
-    if (auto sc = GetMarker().publishedSidecar()) {
+
+    // Check against the table that was live WHEN THIS FRAME WAS SUBMITTED, not
+    // the one live now. The readback ring is three deep and marking runs
+    // continuously, so the current table can be several passes ahead -- and this
+    // check compares individual pixel values against it, which makes it maximally
+    // sensitive to that drift. Measured: 62.8% "unleased" against the current
+    // table on a frame that was fine against its own.
+    //
+    // The dump below already does exactly this lookup for exactly this reason,
+    // with the measured cost of getting it wrong recorded beside it. I wrote the
+    // check without reusing it.
+    std::shared_ptr<const FrameSidecar> atSubmission;
+    for (const auto& entry : sidecarHistory_) {
+        if (entry.first == frame.frameIndex && entry.second) {
+            atSubmission = entry.second;
+            break;
+        }
+    }
+    if (!atSubmission) atSubmission = GetMarker().publishedSidecar();
+    if (auto sc = atSubmission) {
         bool leased[256] = {};
         for (const auto& b : sc->bindings) {
             if (b.slot > 0 && b.slot < 256) leased[b.slot] = true;
@@ -1253,9 +1310,9 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
         for (int i = 1; i < 256; ++i) {
             if (seen[i] && !leased[i]) ++unleasedIds;
         }
-        for (uint32_t y = 0; y < frame.height; ++y) {
-            const uint8_t* row = frame.data + static_cast<size_t>(y) * frame.rowPitch;
-            for (uint32_t x = 0; x < frame.width; ++x) {
+        for (uint32_t y = 0; y < mf.height; ++y) {
+            const uint8_t* row = mf.data + static_cast<size_t>(y) * mf.rowPitch;
+            for (uint32_t x = 0; x < mf.width; ++x) {
                 const uint8_t v = row[x];
                 if (!v) continue;
                 ++labelledPixels;
@@ -1365,8 +1422,8 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     std::fprintf(f, "P5\n%u %u\n255\n", frame.width, frame.height);
     // Row by row using rowPitch, not width: the readback pitch is padded to 256
     // bytes, so treating it as tightly packed would shear the image.
-    for (uint32_t y = 0; y < frame.height; ++y) {
-        std::fwrite(frame.data + static_cast<size_t>(y) * frame.rowPitch, 1, frame.width, f);
+    for (uint32_t y = 0; y < mf.height; ++y) {
+        std::fwrite(mf.data + static_cast<size_t>(y) * mf.rowPitch, 1, mf.width, f);
     }
     std::fclose(f);
 
@@ -1504,6 +1561,23 @@ void Hooks::OnIdBufferReady(const MaskFrame& frame) {
                         static_cast<void*>(idTarget_), names[bestChan], 100.0 * bestFrac,
                         leasedCount);
                 idChannelFound_ = true;
+                // Switch the MASK pipeline onto this buffer. On a Nanite title
+                // the depth-stencil route cannot work at all: Nanite exports
+                // depth to CombinedCustomDepth (whose stencil plane is never
+                // written) and the stencil VALUE to this separate colour target,
+                // which the election was hard-rejecting as "no stencil plane".
+                maskSource_ = idTarget_;
+                maskChannel_ = bestChan;
+                maskSourceBpp_ = bpp;
+                // Pin it, for the same reason the elected depth-stencil is
+                // pinned: D3D12 recycles addresses and UE5's transient allocator
+                // reissues heap ranges within a frame, and this is now the one
+                // resource every captured mask comes from.
+                maskSource_->AddRef();
+                LogWarn("capture: mask source switched to the id buffer %p (channel %s). "
+                        "The CustomDepth stencil-plane route does not carry ids on this "
+                        "title.",
+                        static_cast<void*>(maskSource_), names[bestChan]);
             } else if (idDumped_ >= kIdProbeAttemptsPerCandidate) {
                 // Abandon this candidate permanently and pick another next
                 // frame. Recorded in idRejected_ rather than by index, because
@@ -1863,8 +1937,34 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
                         idRejected_.size());
             }
         }
-        if (idTarget_ && idRing_.Prepare(device_, idTarget_, 0 /*colour plane*/)) {
-            idRing_.Enqueue(queue_, idTarget_, StateOf(idTarget_), frameIndex_);
+        // NEVER copy from a resource whose state we have not observed. This is
+        // the same rule the mask path follows, and the probe was exempt from it
+        // by omission rather than by argument -- which killed inZOI twice: once
+        // on the first armed copy, and once at t=44.9s on the probe's very first
+        // candidate. StateOf() returns COMMON for an unseen resource, and
+        // declaring COMMON for something the game is actually using as a render
+        // target is an invalid transition, i.e. a GPU fault.
+        //
+        // Waiting costs nothing: a render target the game actually uses gets
+        // transitioned within a frame or two, so a candidate that never does is
+        // one we could not have copied safely anyway.
+        if (idTarget_) {
+            const uint64_t candidateBarriers = BarriersSeenFor(idTarget_);
+            if (candidateBarriers == 0) {
+                if (++idBarrierWait_ > kIdBarrierWaitFrames) {
+                    LogInfo("idbuf: candidate %p never transitioned in %u frames, so its "
+                            "state is unknown and copying it is unsafe; skipping it",
+                            static_cast<void*>(idTarget_), kIdBarrierWaitFrames);
+                    idRejected_.insert(idTarget_);
+                    idTarget_ = nullptr;
+                    idBarrierWait_ = 0;
+                }
+            } else {
+                idBarrierWait_ = 0;
+                if (idRing_.Prepare(device_, idTarget_, 0 /*colour plane*/)) {
+                    idRing_.Enqueue(queue_, idTarget_, StateOf(idTarget_), frameIndex_);
+                }
+            }
         }
         idRing_.Drain([this](const MaskFrame& f) { OnIdBufferReady(f); });
     }
@@ -1986,11 +2086,43 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
                 static_cast<void*>(electedTarget_), barriers);
     }
 
-    const bool canCopy = shadowUsable && armReady;
+    // Once the probe has PROVEN which buffer carries our slots, read that,
+    // regardless of what the depth-stencil election concluded. On a Nanite title
+    // the two are different resources and only one of them has ever contained an
+    // id: measured 100.0% of non-zero texels in the R16G16_UINT's G channel
+    // against 0.0% everywhere else.
+    //
+    ID3D12Resource* const copySource = maskSource_ ? maskSource_ : electedTarget_;
+    const UINT copyPlane = maskSource_ ? 0u : 1u;   // colour target vs stencil plane
 
-    if (!censusOnly_ && !noReadback_ && canCopy && device_ && queue_) {
-        if (readback_.Prepare(device_, electedTarget_, 1 /*stencil plane*/)) {
-            readback_.Enqueue(queue_, electedTarget_, StateOf(electedTarget_), frameIndex_);
+    // The barrier guard applies to WHATEVER we copy, not just to the elected
+    // depth-stencil.
+    //
+    // The first version of this exempted maskSource_ on the reasoning that "the
+    // copy already succeeded during probing, so the state is fine". It is not the
+    // same situation: the probe copies while disarmed, at a different point in
+    // the frame's state history, and a resource can sit in a different state by
+    // the time capture begins. inZOI died on the very first copy after CAPTURE
+    // ARMED -- the exact failure this guard was written to prevent, re-enabled by
+    // an argument rather than by evidence.
+    //
+    // If we have never seen a transition for the source, we do not know its
+    // state, and declaring one is how a StateBefore becomes a lie.
+    const uint64_t sourceBarriers = copySource ? BarriersSeenFor(copySource) : 0;
+    const bool sourceShadowUsable = copySource && sourceBarriers > 0;
+    const bool canCopy = sourceShadowUsable && armReady;
+
+    if (maskSource_ && armReady && !sourceShadowUsable && !warnedMaskSourceUnshadowed_) {
+        warnedMaskSourceUnshadowed_ = true;
+        LogError("capture: id buffer %p carries our ids but ZERO barriers have been observed "
+                 "for it, so its state is unknown and copying would risk a GPU fault. "
+                 "Refusing.",
+                 static_cast<void*>(maskSource_));
+    }
+
+    if (!censusOnly_ && !noReadback_ && canCopy && copySource && device_ && queue_) {
+        if (readback_.Prepare(device_, copySource, copyPlane)) {
+            readback_.Enqueue(queue_, copySource, StateOf(copySource), frameIndex_);
 
             // Remember which slot table was live at submission. Copying a
             // shared_ptr costs nothing per frame; the table itself is only

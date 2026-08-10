@@ -440,7 +440,26 @@ DWORD WINAPI DiscoverThread(LPVOID) {
     // UE5's ~300k calls per second. Census still defaults to skipping it,
     // because census means read-only and hooking is not a read; drop a
     // `segcap.petriage` marker to opt in.
-    if (segcap::Hooks::Get().censusOnly() || segcap::Hooks::Get().probeIdBuffer()) {
+    // ...SECOND UPDATE, and this one is a catch-22 the original design created.
+    //
+    // The id-buffer probe used to be pure reconnaissance: find an integer target
+    // that looks like it holds object ids, without touching the game. That is
+    // why it suppressed ProcessEvent discovery, and therefore all marking.
+    //
+    // The probe has since changed shape. Its question is no longer "does this
+    // buffer look like ids" -- which no amount of staring at a histogram can
+    // answer -- but "does this buffer contain THE SLOTS WE LEASED", which is
+    // decisive and cannot produce a false positive. That question is unanswerable
+    // without marking, so suppressing marking made the probe a no-op: it enabled
+    // itself, waited for marks that could never arrive, and logged nothing at all.
+    //
+    // So the suppression now follows the MARK marker, not the probe marker. Ask
+    // for marking and you get marking; the probe rides along and correlates
+    // against it. A probe run with no mark marker is still the old read-only
+    // recon, unchanged.
+    const bool markingRequested = g_markCustomDepth;
+    if (segcap::Hooks::Get().censusOnly() ||
+        (segcap::Hooks::Get().probeIdBuffer() && !markingRequested)) {
         segcap::LogInfo("%s: skipping ProcessEvent discovery "
                         "(probing vtable slots is not a read-only act)",
                         segcap::Hooks::Get().censusOnly() ? "census mode"

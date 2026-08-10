@@ -439,6 +439,20 @@ private:
     // resource rather than by index because the candidate list is rebuilt every
     // time -- new integer targets appear once the CustomDepth pass first runs.
     std::unordered_set<ID3D12Resource*> idRejected_;
+
+    // When the probe proves which buffer and channel carry our slots, the mask
+    // pipeline is repointed at it. Nanite titles need this: the ids live in a
+    // colour target, not in any depth-stencil's stencil plane.
+    ID3D12Resource* maskSource_ = nullptr;
+    int maskChannel_ = -1;          // index into the probe's channel decomposition
+    uint32_t maskSourceBpp_ = 1;
+    std::vector<uint8_t> maskScratch_;   // channel extracted to 8-bit, reused
+    bool warnedMaskSourceUnshadowed_ = false;
+    // Frames spent waiting for a candidate to transition at least once. A
+    // resource we have never seen transition has an unknown state, and copying
+    // from it is a GPU fault rather than a bad mask.
+    uint32_t idBarrierWait_ = 0;
+    static constexpr uint32_t kIdBarrierWaitFrames = 600;
     bool idChannelFound_ = false;
     bool loggedIdExhausted_ = false;
     // Dumps to spend before giving up on a candidate and advancing. Small,
