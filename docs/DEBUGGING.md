@@ -954,7 +954,135 @@ mid-stride. Character control on inZOI, driven entirely by automation.
 
 ---
 
-## 8. What I would do differently
+## 8. inZOI (UE5): four wrong diagnoses of one bug
+
+This is the longest chain of wrong answers in the project, and every one of them
+was plausible. Worth reading as a sequence rather than as five separate entries,
+because the interesting part is why each wrong answer survived as long as it did.
+
+The symptom: on inZOI, marking worked perfectly (255 live slots, thousands of
+identities, indefinitely stable) but the readback either produced masks with
+nothing of ours in them or killed the game at ~45s.
+
+### 8.1 "It's Enhanced Barriers" — wrong twice, for opposite reasons
+
+The elected target showed zero observed `ResourceBarrier` transitions, so any
+`StateBefore` we declared would be invented, and the guard refused to copy.
+D3D12 has a second barrier API (`ID3D12GraphicsCommandList7::Barrier`); a game
+using it never calls the old one. That fits perfectly.
+
+I dismissed it first because the guard did not fire — it was evaluating a
+different elected target. Then I revived it because the guard did fire — but
+that message printed whenever `shadowUsable` was false, and I had folded
+`armReady` into `shadowUsable`, so a run that was merely *waiting to be armed*
+reported "ZERO ResourceBarrier transitions observed". It was evidence of
+nothing. **A diagnostic that cannot separate two causes will always name the one
+you were already expecting.**
+
+Settled by hooking the API and counting: inZOI calls `Barrier()` **zero** times,
+while a legacy target showed **7,340** transitions. Hypothesis dead, by
+measurement rather than by argument.
+
+### 8.2 "We elected a 128x128 shadow map" — true, but a symptom
+
+Every DSV inZOI creates is 1280x800, 512x512 or 128x128; across 813 `CreateDSV`
+calls there is no 2560x1600 one, because inZOI renders at half resolution and
+upscales. The log showed `rejected: 128x128 != scene 2560x1600` — and yet a
+128x128 target had been *elected*, scoring 260.
+
+That contradiction was the real clue and I nearly filed it as a size-filter bug.
+A target cannot be both rejected by a hard requirement and elected. The only way
+both lines are true is if they describe **different resources at the same
+address at different times**.
+
+### 8.3 The actual cause: address identity
+
+`ID3D12Resource*` is not an identity. D3D12 hands the same address back for a
+different resource the moment the old one is released, and UE5's pooled
+render-target allocator does it constantly — the run that found this logged
+**700 address recycles in 210 seconds**.
+
+`SnapshotTargets` merged only per-frame counters into accumulated evidence:
+
+```cpp
+acc.bindCount = fresh.bindCount;          // refreshed
+acc.clearCount = fresh.clearCount;        // refreshed
+// acc.format, acc.width, acc.height      <- never refreshed
+```
+
+So format and dimensions were fixed at first sighting forever. A dead
+depth-stencil's identity stayed welded to its address while the new occupant's
+binds piled on top of it. The 600-frame staleness prune — written specifically
+against "a destroyed buffer keeps winning on accumulated persistence" — could
+never fire, because the address kept being bound by its *new* owner, so
+`lastSeenFrame` kept refreshing.
+
+Everything falls out of this one fact:
+
+| Symptom | Explanation |
+|---|---|
+| Zero barriers on the elected target | Nothing transitioned it; the thing we scored was gone |
+| D3D12 error 527, StateBefore mismatch | Shadow state belonged to the previous occupant |
+| Readback crash at ~45s | Copying from a resource that was not what we thought |
+| `could not create readback buffer` | Sizing a stencil plane on an `R8G8B8A8_TYPELESS` |
+| A target elected 204 times | It reported `R10G10B10A2_UNORM` by end of session |
+
+The fix needs no `AddRef` and no dangling read. The fresh fingerprint comes from
+a live `GetDesc` in `NoteBind`, so it is always the truth about whatever occupies
+the address *now*. When it disagrees with the accumulated evidence on format or
+dimensions — properties that cannot change without destroy/recreate — the
+previous occupant is gone: discard the evidence, purge the shadow state and
+barrier counts, void the election if it named that address.
+
+**This is the same bug we had already fixed on the UObject side**, where a
+generational handle `(objectIndex, serialNumber)` guards a stored pointer against
+GC slot reuse. I wrote that guard, understood exactly why it was needed, and did
+not think to ask whether the graphics API recycled handles the same way. The
+lesson is not "check D3D12 pointers"; it is that a class of bug fixed in one
+layer is worth re-asking in every other layer that stores a raw handle.
+
+### 8.4 The log line that solved it
+
+One diagnostic broke the deadlock: printing the elected target's **actual**
+`GetDesc` at election time, next to what the election believed about it.
+
+```
+elected target PINNED 0000016D8B7105D0 512x512 fmt=DXGI_FMT_27
+```
+
+Format 27 is `R8G8B8A8_TYPELESS`. A target that had passed a hard
+"must have a stencil plane" requirement was, in reality, not a depth buffer at
+all. There is no way to argue with that line, and every competing hypothesis died
+the moment it appeared. Before it, the log described the *model*; after it, the
+log described the *resource*.
+
+### 8.5 The capture budget was spent on the main menu
+
+Separately: the first run after the fix reached gameplay perfectly and produced
+61 masks — **all of the main menu**. The dump budget is a fixed frame count, and
+the menu satisfied the recording gate at t=49s, so the budget was gone by t=65s,
+two minutes before the world finished loading.
+
+The recording gate was working exactly as designed; the design was wrong. Fixed
+by holding the readback disarmed and having `run_inzoi_play.ps1` arm it itself,
+25s after it clicks play. The script is the only thing that knows where in the
+route it is, and asking a human to drop the arm file is precisely the manual
+step this harness exists to remove.
+
+### 8.6 Result
+
+inZOI, live gameplay, unattended: 61 masks at 1280x800, 508 identities tracked,
+**0 identities ever changed what they name**, no object drifting against scene
+motion. `verify_labels.py` passes. Named regions include `Head` and `Jacket` on
+the Zoi, traffic lights, and instanced static meshes.
+
+Known limitation, not fixed: **63.7% of regions are dithered stipple** from UE's
+dithered LOD/opacity, so many masks are speckled rather than solid. The labels
+are correct; their coverage is perforated. That is a real quality ceiling on this
+title and it is not hidden behind the pass.
+
+
+## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have
    been caught in 12 seconds by the 3-buffer fixture I already had.
@@ -984,3 +1112,14 @@ mid-stride. Character control on inZOI, driven entirely by automation.
    it. Adding a writer is the moment to re-read every global the new thread can
    reach — that review takes minutes, and the crash cost a full run plus the
    diagnosis.
+10. **A handle is not an identity, in any layer.** §8.3 is the same bug as the
+    UObject generational handle, one layer down. I wrote that guard, understood
+    exactly why GC slot reuse breaks a stored pointer, and never asked whether
+    the graphics API recycled handles the same way. When you fix a class of bug
+    in one layer, go and ask the question in every other layer that stores a raw
+    handle — that sweep costs an hour and this one cost four wrong diagnoses.
+11. **Print the object, not your model of it.** Four hypotheses died the instant
+    one log line showed the elected resource's real `GetDesc` next to what the
+    election believed. Every diagnostic before it described my own bookkeeping
+    back to me, so all of them agreed with each other and none of them agreed
+    with the GPU.
