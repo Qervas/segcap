@@ -3,6 +3,10 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "log.h"
 
@@ -32,6 +36,38 @@ bool IsRenderableComponentClass(const std::string& name) {
         if (name == r) return true;
     }
     return false;
+}
+
+// The list above is Stray's. "ToyoSplineMeshComponent" is literally that game's
+// internal prefix, and a title that names its mesh components anything else --
+// which is every other title -- would match nothing and mark nothing.
+//
+// So ask the class hierarchy instead of the class name: anything descending
+// from UMeshComponent renders geometry. The name list stays as an additional
+// accept, because a few renderables (TextRenderComponent, and Stray's
+// SplineRailComponent) derive from UPrimitiveComponent directly rather than
+// from UMeshComponent, and dropping them would be a silent regression on the
+// one game where this is known to work.
+//
+// Memoised on the class NAME, not the object. A gameplay array is ~500k
+// objects across a few hundred distinct classes, so this turns one chain walk
+// per object into one per class.
+bool IsRenderableComponent(ue4::Engine& engine, const ue4::ObjectRef& ref) {
+    if (IsRenderableComponentClass(ref.className)) return true;
+
+    static std::mutex mutex;
+    static std::unordered_map<std::string, bool> cache;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = cache.find(ref.className);
+        if (it != cache.end()) return it->second;
+    }
+    const bool derived = engine.IsDerivedFrom(ref.object, "MeshComponent");
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        cache[ref.className] = derived;
+    }
+    return derived;
 }
 
 }  // namespace
@@ -311,10 +347,27 @@ int CustomDepthMarker::CollectCandidates(ue4::Engine& engine, bool renderableOnl
     int found = 0;
     const int32_t total = engine.NumObjects();
 
+    // What the renderable filter threw away, by class. A filter that can hide
+    // evidence needs a log line upstream of itself -- that rule has been
+    // learned the hard way three times in this project (a format bucket that
+    // hid 800 integer targets, an election filter that hid every depth target,
+    // a census that hid its own scan). Without this, "marked 0" on a new title
+    // is indistinguishable between "nothing renderable exists" and "my
+    // allowlist does not know this game's class names".
+    std::unordered_map<std::string, int> rejectedByClass;
+
     for (int32_t i = 0; i < total; ++i) {
         ue4::ObjectRef ref;
         if (!engine.GetObject(i, ref)) continue;
-        if (renderableOnly && !IsRenderableComponentClass(ref.className)) continue;
+        if (renderableOnly && !IsRenderableComponent(engine, ref)) {
+            // Only *Component classes are worth reporting; the array is mostly
+            // Function/Class/Package metadata and listing that is noise.
+            const std::string& cn = ref.className;
+            if (cn.size() > 9 && cn.compare(cn.size() - 9, 9, "Component") == 0) {
+                ++rejectedByClass[cn];
+            }
+            continue;
+        }
         if (!renderableOnly && !engine.IsDerivedFrom(ref.object, "PrimitiveComponent")) continue;
 
         // Class-default objects are templates, not things in the world; marking
@@ -335,6 +388,22 @@ int CustomDepthMarker::CollectCandidates(ue4::Engine& engine, bool renderableOnl
 
     LogInfo("customdepth: collected %d new candidates (%zu pending, %zu marked)",
             found, pending_.size(), marked_.size());
+
+    // Report the discards once, on the first pass that finds almost nothing.
+    // That is the case where the answer matters and the one where the log is
+    // otherwise silent.
+    if (found < 8 && !reportedRejects_ && !rejectedByClass.empty()) {
+        reportedRejects_ = true;
+        std::vector<std::pair<std::string, int>> top(rejectedByClass.begin(),
+                                                     rejectedByClass.end());
+        std::sort(top.begin(), top.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        LogWarn("customdepth: only %d renderable candidates -- these *Component "
+                "classes were REJECTED as non-renderable:", found);
+        for (size_t i = 0; i < top.size() && i < 15; ++i) {
+            LogWarn("customdepth:   %6d  %s", top[i].second, top[i].first.c_str());
+        }
+    }
     return found;
 }
 

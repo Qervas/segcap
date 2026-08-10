@@ -93,6 +93,27 @@ foreach ($f in @($dll, $injector, $vpad, $gameExe)) {
     if (-not (Test-Path $f)) { throw "missing: $f" }
 }
 
+# Assert the FULL marker state, not just the markers this script sets.
+#
+# These files are the DLL's only configuration channel, they live next to the
+# DLL, and they outlive the run that created them. A run of the inZOI census
+# left segcap.census and segcap.petriage behind, and the next Stray run picked
+# them up and quietly executed as a census: it launched, injected, drove the
+# game, reported "IN-LEVEL confirmed" and exited 0, having marked nothing and
+# captured nothing. Nothing in that output said "census" -- the mode only
+# appeared 10 seconds into the DLL log.
+#
+# Same shape as every other bug in this project that cost real time: a stale
+# piece of state read at the wrong moment, reporting the answer that matched
+# the hypothesis. So every runner now states every marker it depends on.
+foreach ($stale in @("segcap.census", "segcap.petriage")) {
+    $p = Join-Path $root "build\bin\$stale"
+    if (Test-Path $p) {
+        Write-Host "[auto] clearing stale marker: $stale"
+        Remove-Item $p -Force
+    }
+}
+
 # steam_appid.txt is what makes direct launch possible at all. Check rather than
 # assume -- without it the game silently relaunches through Steam and every
 # symptom looks like an injection bug instead of a launch bug.
@@ -493,6 +514,25 @@ Write-Host ("  peak object slots : {0}  -> {1}" -f $peak,
             $(if ($peak -gt 250000) { "IN-LEVEL" } else { "STILL AT MENU" }))
 Write-Host ("  masks / frames / sidecars : {0} / {1} / {2}" -f $masks.Count, $frames.Count, $cars.Count)
 Write-Host ("  log : {0}" -f $snapshot)
+
+# A run that was asked to mark and produced nothing is a FAILED run, and it
+# needs to say so here rather than in the twelfth line of a log nobody reads.
+# The census-marker leak was invisible precisely because this block reported
+# "IN-LEVEL" and stopped talking.
+if (-not $NoMark) {
+    $censusMode = Select-String -Path $snapshot -Pattern "skipping ProcessEvent discovery" -ErrorAction SilentlyContinue
+    $peFound    = Select-String -Path $snapshot -Pattern "ProcessEvent CONFIRMED" -ErrorAction SilentlyContinue
+    if ($censusMode) {
+        Write-Host "  VERDICT: FAILED -- ran in CENSUS mode despite marking being requested."
+        Write-Host "           A stale segcap.census marker was present at launch."
+    } elseif (-not $peFound) {
+        Write-Host "  VERDICT: FAILED -- ProcessEvent was never confirmed, so nothing could be marked."
+    } elseif ($masks.Count -eq 0) {
+        Write-Host "  VERDICT: FAILED -- ProcessEvent found but no masks were written."
+    } else {
+        Write-Host "  VERDICT: ok"
+    }
+}
 Write-Host "======================================"
 Select-String -Path $snapshot -Pattern "CONFIRMED|marked \d+|elected|distinct stencil" -ErrorAction SilentlyContinue |
     Select-Object -Last 12 | ForEach-Object { Write-Host "  $($_.Line)" }

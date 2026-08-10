@@ -144,6 +144,7 @@ private:
     bool UnmarkPrimitive(const MarkedPrimitive& mp);
 
     bool resolved_ = false;
+    bool reportedRejects_ = false;   // the discard histogram is logged once
     ue4::PropertyInfo propRenderCustomDepth_;
     ue4::PropertyInfo propStencilValue_;
 
