@@ -5,10 +5,13 @@
 #include <MinHook.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -681,6 +684,174 @@ void Engine::DumpStructLayout(void* ustruct, const char* label) {
     LogInfo("ue4: --- end probe ---");
 }
 
+namespace {
+
+// Stack bytes reserved by the prologue, from `sub rsp, imm`. MSVC emits the
+// imm8 form for small frames and imm32 for large ones, usually after a run of
+// register pushes. Returns 0 if no such instruction is found in the first few
+// instructions -- which is itself informative, since trivial accessors have no
+// frame at all.
+// Scans the first 40 bytes for `sub rsp, imm` rather than decoding instruction
+// lengths to find it.
+//
+// The first version stepped the prologue instruction by instruction and got the
+// lengths wrong -- `48 89 5C 24 08` (mov [rsp+8], rbx) is five bytes and it
+// stepped four, so the parser desynced and reported frame 0 for almost every
+// slot including the one known to be correct. A length-accurate x64 decoder is
+// a real piece of work; a bounded byte scan is not, and for ranking purposes
+// the exact instruction boundary does not matter.
+uint32_t PrologueFrameSize(uintptr_t fn) {
+    const auto* p = reinterpret_cast<const uint8_t*>(fn);
+    if (!IsReadable(p, 48)) return 0;
+    for (int off = 0; off < 40; ++off) {
+        if (p[off] != 0x48) continue;
+        if (p[off + 1] == 0x83 && p[off + 2] == 0xEC) return p[off + 3];
+        if (p[off + 1] == 0x81 && p[off + 2] == 0xEC) {
+            uint32_t v = 0;
+            std::memcpy(&v, p + off + 3, 4);
+            return v;
+        }
+    }
+    return 0;
+}
+
+// Distance to MSVC's inter-function 0xCC padding. An estimate, not a symbol
+// table -- but the ratio between a 40-byte accessor and a 2 KB dispatcher is
+// large enough that an approximate length still separates them cleanly.
+uint32_t EstimateFunctionLength(uintptr_t fn, uint32_t cap = 16384) {
+    const auto* p = reinterpret_cast<const uint8_t*>(fn);
+    uint32_t run = 0;
+    for (uint32_t i = 0; i < cap; ++i) {
+        if (!IsReadable(p + i, 1)) return i;
+        if (p[i] == 0xCC) {
+            if (++run >= 4) return i - run + 1;
+        } else {
+            run = 0;
+        }
+    }
+    return cap;
+}
+
+}  // namespace
+
+// Everything downstream of this is a read. No hooking, no calling, no writes to
+// the game's memory -- which is the whole point. The previous ProcessEvent
+// search hooked twenty slots blind and called them, and on UE5 that killed the
+// game inside two seconds. This narrows the field before anything is touched.
+std::vector<Engine::VTableSlot> Engine::RankVTableSlots() {
+    // Collect one live object per distinct class.
+    //
+    // This is the signal that actually discriminates. ProcessEvent is declared
+    // on UObject and almost never overridden, so the slot holding it contains
+    // the SAME function pointer in every class's vtable. Class-specific
+    // virtuals differ between them. Size alone put the known answer at rank 7
+    // of 128; "shared by every class AND large" is a far narrower filter, and
+    // it needs nothing but reads.
+    std::vector<uintptr_t*> vtables;
+    std::unordered_set<std::string> classesSeen;
+    const int32_t total = NumObjects();
+    for (int32_t i = 0; i < total && vtables.size() < 40; ++i) {
+        ObjectRef ref;
+        if (!GetObject(i, ref)) continue;
+        if (ref.className.empty() || !classesSeen.insert(ref.className).second) continue;
+        if (!IsReadable(ref.object, 8)) continue;
+        auto* vt = *reinterpret_cast<uintptr_t**>(ref.object);
+        if (!IsReadable(vt, 8)) continue;
+        vtables.push_back(vt);
+    }
+    if (vtables.size() < 4) {
+        LogWarn("vtable probe: only %zu vtables collected; not enough to compare",
+                vtables.size());
+        return {};
+    }
+
+    // Vtable length: the first slot that is not a code pointer in EVERY vtable.
+    // Scanning a fixed 128 previously ran off the end into whatever .rdata
+    // followed, which is why slots 119 and 41 reported the same address -- two
+    // different vtables being read as one.
+    int vtLen = 0;
+    for (; vtLen < 200; ++vtLen) {
+        bool allCode = true;
+        for (auto* vt : vtables) {
+            if (!IsReadable(&vt[vtLen], 8)) { allCode = false; break; }
+            const uintptr_t fn = vt[vtLen];
+            if (fn < textStart_ || fn >= textEnd_) { allCode = false; break; }
+        }
+        if (!allCode) break;
+    }
+    if (vtLen < 8) {
+        LogWarn("vtable probe: vtable length came out as %d; giving up", vtLen);
+        return {};
+    }
+
+    std::vector<VTableSlot> slots;
+    for (int i = 0; i < vtLen; ++i) {
+        std::unordered_set<uintptr_t> distinct;
+        for (auto* vt : vtables) distinct.insert(vt[i]);
+        const uintptr_t fn = vtables[0][i];
+        if (!IsReadable(reinterpret_cast<void*>(fn), 48)) continue;
+        slots.push_back({i, fn, PrologueFrameSize(fn), EstimateFunctionLength(fn),
+                         static_cast<int>(distinct.size())});
+    }
+
+    LogInfo("vtable probe: %zu vtables across distinct classes, vtable length %d",
+            vtables.size(), vtLen);
+
+    // Largest first: the shortlist filter is applied by callers, but the order
+    // is the ranking, so establish it here where the sample size is known.
+    std::sort(slots.begin(), slots.end(),
+              [](const VTableSlot& a, const VTableSlot& b) { return a.len > b.len; });
+    return slots;
+}
+
+std::vector<int> Engine::ProcessEventCandidates() {
+    std::vector<int> out;
+    for (const auto& s : RankVTableSlots()) {
+        if (s.variants == 1 && s.len >= 300) out.push_back(s.idx);
+    }
+    return out;   // already ordered largest-first
+}
+
+void Engine::ProbeVTablePrologues(int knownIndex) {
+    const std::vector<VTableSlot> slots = RankVTableSlots();
+    if (slots.empty()) return;
+
+    std::vector<VTableSlot> shortlist;
+    for (const VTableSlot& s : slots) {
+        if (s.variants == 1 && s.len >= 300) shortlist.push_back(s);
+    }
+
+    LogInfo("vtable probe: SHORTLIST -- same fn in every sampled class, len >= 300");
+    for (size_t i = 0; i < shortlist.size() && i < 12; ++i) {
+        const VTableSlot& s = shortlist[i];
+        LogInfo("vtable probe:   rank %2zu  slot %3d  len %6u  frame %5u  %llX%s",
+                i + 1, s.idx, s.len, s.frame,
+                static_cast<unsigned long long>(s.fn),
+                s.idx == knownIndex ? "   <== KNOWN ProcessEvent" : "");
+    }
+
+    if (knownIndex >= 0) {
+        int rank = -1;
+        for (size_t i = 0; i < shortlist.size(); ++i) {
+            if (shortlist[i].idx == knownIndex) { rank = static_cast<int>(i) + 1; break; }
+        }
+        if (rank > 0) {
+            LogInfo("vtable probe: CALIBRATION -- known slot %d ranks %d of %zu "
+                    "on the shortlist (%zu slots total)",
+                    knownIndex, rank, shortlist.size(), slots.size());
+        } else {
+            LogWarn("vtable probe: CALIBRATION FAILED -- known slot %d is not on the "
+                    "shortlist at all. The filter is wrong, not the engine.",
+                    knownIndex);
+            for (const VTableSlot& s : slots) {
+                if (s.idx != knownIndex) continue;
+                LogWarn("vtable probe:   slot %d: len %u frame %u variants %d",
+                        s.idx, s.len, s.frame, s.variants);
+            }
+        }
+    }
+}
+
 bool Engine::CalibrateFieldLayout() {
     if (fieldLayoutCalibrated_) return true;
     if (!nameBlocks_) return false;
@@ -909,27 +1080,61 @@ ProcessEventFn g_origProcessEvent = nullptr;
 
 std::mutex g_queueMutex;
 std::vector<ProcessEventHook::GameThreadTask> g_queue;
-uint64_t g_validCalls = 0;
-uint64_t g_invalidCalls = 0;
+std::atomic<uint64_t> g_validCalls{0};
+std::atomic<uint64_t> g_invalidCalls{0};
+
+// How many calls a candidate may be validated over before validation switches
+// itself off. THIS IS THE FIX FOR THE UE5 HANG, and it is worth being explicit
+// about why, because the first diagnosis was wrong.
+//
+// The original detour ran IsDerivedFrom -- a shared_mutex acquisition plus a
+// binary search over the module map plus a class-chain walk -- on EVERY call.
+// On Stray that was survivable; UE4's dispatch rate through this slot is a few
+// thousand per second. On UE5 the same slot fires ~300,000 times per second,
+// and the game froze inside two seconds. That looked like memory corruption and
+// was diagnosed as such twice. It was not. It was a hook doing real work at
+// 300 kHz, which no amount of correctness in the work itself would have saved.
+//
+// 2000 samples is far more than the 24 needed to prove a candidate, and it is a
+// fixed cost rather than one scaling with the game's dispatch rate. A title
+// that calls the slot ten million times a second pays exactly the same.
+constexpr uint64_t kValidationBudget = 2000;
+std::atomic<uint64_t> g_validationSpent{0};
+
+// Set once, after a candidate is proven. Read on every call, so it must stay an
+// atomic load and nothing more.
+std::atomic<bool> g_slotProven{false};
+
+// Lets the steady-state path skip the mutex entirely when there is no work,
+// which is the overwhelmingly common case.
+std::atomic<uint32_t> g_queueDepth{0};
 
 void __fastcall ProcessEventDetour(void* self, void* function, void* parms, void* spare) {
-    // The proof: ProcessEvent's second argument is always a UFunction. If this
-    // slot is some other virtual, that argument will be an int, a pointer to
-    // something else, or garbage -- and the class-chain walk will reject it.
-    if (g_engine && g_engine->IsDerivedFrom(function, "Function")) {
-        ++g_validCalls;
-        if (g_hook) {
-            // Drain queued work here: we are on the game thread, inside the
-            // engine's own dispatch, which is exactly the safe point we needed.
+    if (g_slotProven.load(std::memory_order_relaxed)) {
+        // Steady state. The slot is already known to be correct, so there is
+        // nothing left to validate -- re-proving it on every call was pure
+        // overhead. An atomic load, and a lock only when work actually exists.
+        if (g_queueDepth.load(std::memory_order_acquire) != 0 && g_hook && g_engine) {
             std::vector<ProcessEventHook::GameThreadTask> todo;
             {
                 std::lock_guard<std::mutex> lock(g_queueMutex);
                 todo.swap(g_queue);
+                g_queueDepth.store(0, std::memory_order_release);
             }
+            // We are on the game thread, inside the engine's own dispatch,
+            // which is exactly the safe point this hook exists to provide.
             for (auto& task : todo) task(*g_engine);
         }
-    } else {
-        ++g_invalidCalls;
+    } else if (g_validationSpent.fetch_add(1, std::memory_order_relaxed) < kValidationBudget) {
+        // Search mode, and still within budget. The proof: ProcessEvent's
+        // second argument is always a UFunction. If this slot is some other
+        // virtual, that argument will be an int, a pointer to something else,
+        // or garbage -- and the class-chain walk will reject it.
+        if (g_engine && g_engine->IsDerivedFrom(function, "Function")) {
+            g_validCalls.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_invalidCalls.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     g_origProcessEvent(self, function, parms, spare);
 }
@@ -953,8 +1158,10 @@ bool ProcessEventHook::TryIndex(Engine& engine, int index) {
     void* target = vtable[index];
     if (!IsReadable(target, 16)) return false;
 
-    g_validCalls = 0;
-    g_invalidCalls = 0;
+    g_validCalls.store(0);
+    g_invalidCalls.store(0);
+    g_validationSpent.store(0);
+    g_slotProven.store(false);
 
     if (MH_CreateHook(target, reinterpret_cast<void*>(&ProcessEventDetour),
                       reinterpret_cast<void**>(&g_origProcessEvent)) != MH_OK) {
@@ -966,17 +1173,23 @@ bool ProcessEventHook::TryIndex(Engine& engine, int index) {
     }
 
     // Observe. A correct candidate produces a steady stream of calls whose
-    // second argument validates as a UFunction.
-    Sleep(1500);
+    // second argument validates as a UFunction. Poll rather than sleeping the
+    // full window: a hot slot spends its whole 2000-sample budget in a few
+    // milliseconds, and once the budget is gone the extra wait buys nothing.
+    for (int waited = 0; waited < 1500; waited += 50) {
+        if (g_validationSpent.load(std::memory_order_relaxed) >= kValidationBudget) break;
+        Sleep(50);
+    }
 
-    const uint64_t valid = g_validCalls;
-    const uint64_t invalid = g_invalidCalls;
+    const uint64_t valid = g_validCalls.load();
+    const uint64_t invalid = g_invalidCalls.load();
 
     // Accept only on a clear signal: enough proven calls, and overwhelmingly
     // more valid than invalid. A slot that is called often with arguments that
     // do not validate is a different virtual, not a noisy ProcessEvent.
     const bool accept = valid >= kProofThreshold && valid > invalid * 4;
-    LogInfo("ue4: PE candidate %d -> %llu valid, %llu invalid %s", index, valid, invalid,
+    LogInfo("ue4: PE candidate %d -> %llu valid, %llu invalid (%llu sampled) %s",
+            index, valid, invalid, g_validationSpent.load(),
             accept ? "ACCEPTED" : "(rejected)");
 
     if (!accept) {
@@ -988,6 +1201,9 @@ bool ProcessEventHook::TryIndex(Engine& engine, int index) {
 
     vtableIndex_ = index;
     verified_ = true;
+    // Only now does the detour stop validating. Ordering matters: set this
+    // after verified_ so no call can see a half-committed state.
+    g_slotProven.store(true, std::memory_order_release);
     return true;
 }
 
@@ -1001,10 +1217,38 @@ bool ProcessEventHook::Install(Engine& engine) {
     g_engine = &engine;
     g_hook = this;
 
+    // Read-only triage first. This costs nothing and cannot crash anything: it
+    // reads vtables from ~40 live objects and measures each slot. On Stray it
+    // takes 78 slots down to 3 with the known answer among them, so the blind
+    // 60..80 sweep below is now a fallback rather than the plan.
+    //
+    // The slot numbers themselves do not transfer between engine versions --
+    // that was the original mistake. What transfers is the property: the slot
+    // holding ProcessEvent contains the same function pointer in every class's
+    // vtable, and that function is large. Measure the property, not the index.
+    std::vector<int> candidates = engine.ProcessEventCandidates();
+    if (!candidates.empty()) {
+        std::string list;
+        for (int c : candidates) list += " " + std::to_string(c);
+        LogInfo("ue4: triage shortlisted %zu slot(s) for ProcessEvent:%s",
+                candidates.size(), list.c_str());
+        for (int i : candidates) {
+            if (TryIndex(engine, i)) {
+                gameThreadId_ = GetCurrentThreadId();  // provisional; corrected on first call
+                LogInfo("ue4: ProcessEvent CONFIRMED at vtable index %d (from triage)", i);
+                return true;
+            }
+        }
+        LogWarn("ue4: no shortlisted slot validated; falling back to the blind sweep");
+    } else {
+        LogWarn("ue4: triage produced no candidates; falling back to the blind sweep");
+    }
+
     LogInfo("ue4: searching vtable slots %d..%d for ProcessEvent",
             kProcessEventCandidateFirst, kProcessEventCandidateLast);
 
     for (int i = kProcessEventCandidateFirst; i <= kProcessEventCandidateLast; ++i) {
+        if (std::find(candidates.begin(), candidates.end(), i) != candidates.end()) continue;
         if (TryIndex(engine, i)) {
             gameThreadId_ = GetCurrentThreadId();  // provisional; corrected on first call
             LogInfo("ue4: ProcessEvent CONFIRMED at vtable index %d", i);
@@ -1033,6 +1277,9 @@ void ProcessEventHook::CallFunction(void* object, void* function, void* params) 
 void ProcessEventHook::RunOnGameThread(GameThreadTask task) {
     std::lock_guard<std::mutex> lock(g_queueMutex);
     g_queue.push_back(std::move(task));
+    // Published after the push, and read with acquire in the detour, so a
+    // non-zero depth always implies the task is visible.
+    g_queueDepth.store(static_cast<uint32_t>(g_queue.size()), std::memory_order_release);
 }
 
 ProcessEventHook& GetProcessEventHook() {

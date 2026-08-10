@@ -304,6 +304,43 @@ public:
     // keeps whichever decodes a chain of DISTINCT names. Distinctness matters:
     // one candidate offset decoded eight links that were all the same name,
     // which a count-only test would have accepted.
+    // Ranks UObject vtable slots as ProcessEvent candidates WITHOUT hooking or
+    // calling any of them.
+    //
+    // The existing search hooks slots 60..80 one at a time and calls whatever
+    // occupies each with ProcessEvent's signature. That is brute force, and on
+    // UE5 it killed inZOI: it landed on a function called ~500,000 times in a
+    // second and a half, and the hook ran IsReadable -- a shared_mutex plus a
+    // binary search -- on every one of those calls.
+    //
+    // This narrows the field first, using only reads:
+    //
+    //   size    ProcessEvent is one of the largest functions in the UObject
+    //           vtable, typically 1-3 KB. Most neighbouring virtuals are
+    //           accessors of a few dozen bytes. Length is estimated by scanning
+    //           forward to MSVC's 0xCC inter-function padding.
+    //   frame   it allocates a substantial stack frame to marshal parameters,
+    //           visible as `sub rsp, imm` in the prologue.
+    //
+    // Neither is proof. Both are safe, and together they should turn "hook
+    // twenty and hope" into "hook one and verify". The heuristic is calibrated
+    // against Stray, where ProcessEvent is known to be slot 68, before it is
+    // trusted anywhere else.
+    void ProbeVTablePrologues(int knownIndex = -1);
+
+    // The same analysis, returning the shortlist instead of logging it, so the
+    // ProcessEvent search can try three candidates rather than twenty.
+    std::vector<int> ProcessEventCandidates();
+
+    // One UObject vtable slot, as seen across many classes.
+    struct VTableSlot {
+        int idx = 0;
+        uintptr_t fn = 0;
+        uint32_t frame = 0;     // bytes reserved by `sub rsp, imm`
+        uint32_t len = 0;       // estimated, to 0xCC padding
+        int variants = 0;       // distinct fn pointers across sampled classes
+    };
+
     bool CalibrateFieldLayout();
     size_t fieldNameOffset() const { return fieldNameOffset_; }
     size_t fieldNextOffset() const { return fieldNextOffset_; }
@@ -325,6 +362,11 @@ public:
     void RefreshMemoryMap();
 
 private:
+    // Reads UObject vtables from up to 40 distinct classes and measures each
+    // slot. Shared by the diagnostic dump and the ProcessEvent shortlist so the
+    // two can never disagree about what the candidates are.
+    std::vector<VTableSlot> RankVTableSlots();
+
     bool FindObjectArray();
     bool FindNamePool();
     bool ValidateArrayCandidate(const FChunkedFixedUObjectArray* candidate) const;
