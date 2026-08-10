@@ -116,9 +116,9 @@ Write-Host "[play] input desktop: $([SS2]::Desktop())"
 
 # --- markers ------------------------------------------------------------------
 $bin = Join-Path $root "build\bin"
-Remove-Item (Join-Path $bin "segcap.census")   -ErrorAction SilentlyContinue
-Remove-Item (Join-Path $bin "segcap.petriage") -ErrorAction SilentlyContinue
-Remove-Item (Join-Path $bin "segcap.abtest")   -ErrorAction SilentlyContinue
+# One authoritative reset, then assert only what this run wants. See
+# tools/reset_markers.ps1 for why the list does not live here.
+& (Join-Path $root "tools\reset_markers.ps1") -Bin $bin
 if ($NoMark) {
     Remove-Item (Join-Path $bin "segcap.mark") -ErrorAction SilentlyContinue
     Write-Host "[play] mark marker ABSENT -- read-only run"

@@ -106,7 +106,13 @@ foreach ($f in @($dll, $injector, $vpad, $gameExe)) {
 # Same shape as every other bug in this project that cost real time: a stale
 # piece of state read at the wrong moment, reporting the answer that matched
 # the hypothesis. So every runner now states every marker it depends on.
-foreach ($stale in @("segcap.census", "segcap.petriage")) {
+# The list lives in tools/reset_markers.ps1, not here. A per-script list cannot
+# stay complete: this one held two entries while six more markers were added, and
+# a leftover segcap.idbuf made a Stray regression run enable the id-buffer probe
+# and kill the game -- reported as "no masks were written", cause in neither the
+# code under test nor the game.
+& (Join-Path $root "tools\reset_markers.ps1") -Bin (Join-Path $root "build\bin")
+foreach ($stale in @()) {
     $p = Join-Path $root "build\bin\$stale"
     if (Test-Path $p) {
         Write-Host "[auto] clearing stale marker: $stale"
