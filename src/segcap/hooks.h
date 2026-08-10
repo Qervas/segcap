@@ -49,7 +49,12 @@ struct TargetFingerprint {
     uint32_t height = 0;
     uint32_t sampleCount = 0;
     uint32_t bindCount = 0;        // times bound this frame
-    uint32_t clearCount = 0;       // times cleared this frame
+    uint32_t clearCount = 0;       // times cleared this frame (depth OR stencil)
+    // Times the STENCIL plane specifically was cleared this frame. Tracked apart
+    // from clearCount because every depth target has its depth cleared, so
+    // clearCount barely discriminates; clearing stencil implies someone intends
+    // to write stencil, which is exactly the CustomDepth signature.
+    uint32_t stencilClearCount = 0;
     uint32_t firstBindOrdinal = 0; // call ordinal within the frame
     D3D12_RESOURCE_STATES lastState = D3D12_RESOURCE_STATE_COMMON;
     bool everBoundAsDepth = false;
@@ -202,6 +207,24 @@ private:
         D3D12_HEAP_FLAGS heapFlags, const D3D12_RESOURCE_DESC* desc,
         D3D12_RESOURCE_STATES initialState, const D3D12_CLEAR_VALUE* clearValue,
         REFIID riid, void** resource);
+    // PLACED resources are the UE4-vs-UE5 asymmetry. UE4.27 allocates render
+    // targets as committed resources, so hooking the committed path alone was
+    // sufficient for Stray. UE5's RDG transient allocator carves render targets
+    // out of pooled heaps as PLACED resources that ALIAS one another within a
+    // frame -- so on inZOI the entire render-target population was invisible to
+    // the state shadow, to the address-recycling guard (which lives in
+    // CreateCommittedResource_ and so never fired), and to the AddRef pin (which
+    // keeps the ID3D12Resource object alive but cannot stop the heap memory
+    // underneath being handed to another pass).
+    static HRESULT STDMETHODCALLTYPE CreatePlacedResource_(
+        ID3D12Device* self, ID3D12Heap* heap, UINT64 heapOffset,
+        const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initialState,
+        const D3D12_CLEAR_VALUE* clearValue, REFIID riid, void** resource);
+    // Bookkeeping shared by both creation paths: a new resource at a known
+    // address invalidates everything we believed about that address.
+    void NoteResourceCreated(ID3D12Resource* res, const D3D12_RESOURCE_DESC& desc,
+                             D3D12_RESOURCE_STATES initialState, bool placed,
+                             ID3D12Heap* heap, UINT64 heapOffset);
     static void STDMETHODCALLTYPE ClearDepthStencilView_(ID3D12GraphicsCommandList* self,
                                                          D3D12_CPU_DESCRIPTOR_HANDLE dsv,
                                                          D3D12_CLEAR_FLAGS flags,
@@ -213,7 +236,7 @@ private:
     void OnColourReady(const MaskFrame& frame);
     void WriteSidecar(const MaskFrame& frame) const;
     void NoteBind(ID3D12Resource* res, bool asDepth);
-    void NoteClear(ID3D12Resource* res);
+    void NoteClear(ID3D12Resource* res, bool clearedStencil);
     void OnMaskReady(const MaskFrame& frame);
     void OnIdBufferReady(const MaskFrame& frame);
 
@@ -328,6 +351,10 @@ private:
     // menu should not open a session).
     bool recording_ = false;
     bool warnedForeignStencil_ = false;   // "that stencil is not ours", said once
+    // "those VALUES are not ours" -- the stronger claim, checked against the
+    // slots the sidecar actually leased. Said once so a permanently-wrong target
+    // does not write the message every frame.
+    bool warnedUnleasedIds_ = false;
     uint32_t consecutiveContent_ = 0;
     uint32_t consecutiveEmpty_ = 0;
     uint64_t recordedFrames_ = 0;
@@ -361,6 +388,28 @@ private:
     D3D12_RESOURCE_DESC electedDesc_ = {};
     uint64_t addressRecycles_ = 0;
     uint64_t electedRecycles_ = 0;
+
+    // Where a placed resource lives. Two placed resources at the same
+    // (heap, offset) are two names for the same bytes -- which is how UE5's
+    // transient allocator reuses render-target memory within a frame, and how a
+    // correctly-identified CustomDepth target can yield another pass's contents.
+    struct AliasRange {
+        ID3D12Heap* heap = nullptr;
+        UINT64 offset = 0;
+        UINT64 width = 0;
+        UINT height = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    };
+    std::unordered_map<ID3D12Resource*, AliasRange> aliasRanges_;
+    uint64_t aliasCollisions_ = 0;
+    uint64_t electedAliased_ = 0;
+
+    using CreatePlacedFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Heap*, UINT64,
+                                                       const D3D12_RESOURCE_DESC*,
+                                                       D3D12_RESOURCE_STATES,
+                                                       const D3D12_CLEAR_VALUE*, REFIID,
+                                                       void**);
+    CreatePlacedFn origCreatePlaced_ = nullptr;
     bool warnedUnshadowed_ = false;
     ID3D12Resource* lastUnshadowedTarget_ = nullptr;
     bool loggedArmedOk_ = false;
@@ -379,6 +428,24 @@ private:
     Readback idRing_;
     ID3D12Resource* idTarget_ = nullptr;
     uint32_t idDumped_ = 0;
+    // The probe walks every scene-scale integer target rather than picking one
+    // by area and never reconsidering. On a Nanite title the per-object stencil
+    // lives in a COLOUR target (PF_R16G16_UINT CombinedCustomStencil), so the
+    // "largest area" rule reliably selected the wrong buffer and the right one
+    // was never read once in 1,397 sightings.
+    std::vector<ID3D12Resource*> idCandidates_;
+    size_t idCandidateIndex_ = 0;
+    // Candidates already tested and found not to contain our slots. Keyed by
+    // resource rather than by index because the candidate list is rebuilt every
+    // time -- new integer targets appear once the CustomDepth pass first runs.
+    std::unordered_set<ID3D12Resource*> idRejected_;
+    bool idChannelFound_ = false;
+    bool loggedIdExhausted_ = false;
+    // Dumps to spend before giving up on a candidate and advancing. Small,
+    // because the leased-slot test is decisive on the first frame that has any
+    // marks at all -- extra frames only cost time.
+    static constexpr uint32_t kIdProbeAttemptsPerCandidate = 3;
+    static constexpr uint32_t kIdProbeDumpBudget = 6;
     uint32_t maxCaptures_ = 150;
     uint64_t captureStride_ = 60;
 };

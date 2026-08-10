@@ -60,6 +60,9 @@ constexpr uint64_t kCaptureStride = 60;
 constexpr uint64_t kAbCaptureStride = 120;   // ~2s at 60fps -> ~300s of coverage
 
 constexpr int kCreateCommittedResourceSlot = 27; // ID3D12Device::CreateCommittedResource
+// ID3D12Device vtable order after CreateCommittedResource(27) is
+// CreateHeap(28), CreatePlacedResource(29), CreateReservedResource(30).
+constexpr int kCreatePlacedResourceSlot = 29;    // ID3D12Device::CreatePlacedResource
 constexpr int kResourceBarrierSlot = 26;     // ID3D12GraphicsCommandList::ResourceBarrier
 
 // ID3D12GraphicsCommandList7::Barrier -- the Enhanced Barriers entry point.
@@ -243,6 +246,9 @@ bool Hooks::AcquireVTables() {
              CreateHook(deviceVT, kCreateCommittedResourceSlot,
                         reinterpret_cast<void*>(&Hooks::CreateCommittedResource_),
                         reinterpret_cast<void**>(&origCreateCommitted_)) &&
+             CreateHook(deviceVT, kCreatePlacedResourceSlot,
+                        reinterpret_cast<void*>(&Hooks::CreatePlacedResource_),
+                        reinterpret_cast<void**>(&origCreatePlaced_)) &&
              CreateHook(listVT, kResourceBarrierSlot,
                         reinterpret_cast<void*>(&Hooks::ResourceBarrier_),
                         reinterpret_cast<void**>(&origBarrier_)) &&
@@ -604,8 +610,75 @@ HRESULT STDMETHODCALLTYPE Hooks::CreateCommittedResource_(
                                               initialState, clearValue, riid, resource);
     if (SUCCEEDED(hr) && resource && *resource && desc &&
         desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-        auto* res = static_cast<ID3D12Resource*>(*resource);
-        std::lock_guard<std::mutex> lock(h.mutex_);
+        h.NoteResourceCreated(static_cast<ID3D12Resource*>(*resource), *desc, initialState,
+                              false, nullptr, 0);
+    }
+    return hr;
+}
+
+// UE5's RDG transient allocator takes this path, not the committed one, for
+// render targets. Hooking it is what makes the whole state shadow apply on UE5
+// at all -- before this, every render target inZOI used was created invisibly,
+// so StateOf() returned COMMON for all of them and the recycling guard could
+// never fire.
+HRESULT STDMETHODCALLTYPE Hooks::CreatePlacedResource_(
+    ID3D12Device* self, ID3D12Heap* heap, UINT64 heapOffset,
+    const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initialState,
+    const D3D12_CLEAR_VALUE* clearValue, REFIID riid, void** resource) {
+    Hooks& h = Get();
+    const HRESULT hr = h.origCreatePlaced_(self, heap, heapOffset, desc, initialState,
+                                           clearValue, riid, resource);
+    if (SUCCEEDED(hr) && resource && *resource && desc &&
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        h.NoteResourceCreated(static_cast<ID3D12Resource*>(*resource), *desc, initialState,
+                              true, heap, heapOffset);
+    }
+    return hr;
+}
+
+void Hooks::NoteResourceCreated(ID3D12Resource* res, const D3D12_RESOURCE_DESC& desc,
+                                D3D12_RESOURCE_STATES initialState, bool placed,
+                                ID3D12Heap* heap, UINT64 heapOffset) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Hooks& h = *this;
+
+        // ---- MEMORY ALIASING --------------------------------------------------
+        //
+        // A placed resource does not own its memory; it is a view onto a range of
+        // a heap. Two placed resources at the same (heap, offset) are two names
+        // for the SAME BYTES, and UE5's transient allocator does this on purpose
+        // to keep the render-target pool small. So a second placed resource
+        // covering a range we are tracking means our target's contents are now
+        // someone else's to write.
+        //
+        // This is the mechanism behind the inZOI failure: the readback copied a
+        // correctly-identified CustomDepth resource, with a correctly-computed
+        // plane-1 footprint, and got back a 2-channel fp16 velocity buffer --
+        // because by Present the heap range had been reissued to another pass.
+        if (placed && heap) {
+            const AliasRange incoming{heap, heapOffset, desc.Width, desc.Height, desc.Format};
+            for (auto it = aliasRanges_.begin(); it != aliasRanges_.end();) {
+                if (it->second.heap == heap && it->second.offset == heapOffset &&
+                    it->first != res) {
+                    ++aliasCollisions_;
+                    if (it->first == electedTarget_) {
+                        ++electedAliased_;
+                        LogWarn("elected target %p SHARES HEAP MEMORY with a new placed "
+                                "resource %p (heap %p offset %llu). Its contents are no "
+                                "longer ours to read; election voided (alias #%llu)",
+                                static_cast<void*>(it->first), static_cast<void*>(res),
+                                static_cast<void*>(heap), heapOffset, electedAliased_);
+                        electedTarget_ = nullptr;
+                        electedProducedContent_ = false;
+                    }
+                    it = aliasRanges_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            aliasRanges_[res] = incoming;
+        }
 
         // ---- ADDRESS RECYCLING ------------------------------------------------
         //
@@ -649,7 +722,6 @@ HRESULT STDMETHODCALLTYPE Hooks::CreateCommittedResource_(
 
         h.resourceState_[res] = initialState;
     }
-    return hr;
 }
 
 void STDMETHODCALLTYPE Hooks::ClearDepthStencilView_(ID3D12GraphicsCommandList* self,
@@ -658,7 +730,19 @@ void STDMETHODCALLTYPE Hooks::ClearDepthStencilView_(ID3D12GraphicsCommandList* 
                                                      UINT8 stencil, UINT numRects,
                                                      const D3D12_RECT* rects) {
     Hooks& h = Get();
-    if (ID3D12Resource* res = h.ResolveDescriptor(dsv.ptr)) h.NoteClear(res);
+    // The FLAGS matter and were previously discarded. D3D12_CLEAR_FLAG_DEPTH and
+    // D3D12_CLEAR_FLAG_STENCIL are independent bits, and every depth target in a
+    // frame gets its DEPTH cleared -- so "was cleared" carries almost no
+    // information. "Had its STENCIL cleared" is a far sharper signal, because a
+    // target nobody writes stencil into has no reason to clear stencil.
+    //
+    // This is not academic. On inZOI five 1280x800 stencil-capable targets reach
+    // scoring, two are rejected as most-bound scene depth, and the remaining
+    // three are separated ONLY by this +30. A counter that cannot see the
+    // stencil flag was deciding a three-way tie.
+    if (ID3D12Resource* res = h.ResolveDescriptor(dsv.ptr)) {
+        h.NoteClear(res, (flags & D3D12_CLEAR_FLAG_STENCIL) != 0);
+    }
     h.origClearDSV_(self, dsv, flags, depth, stencil, numRects, rects);
 }
 
@@ -717,6 +801,27 @@ std::vector<ElectionScore> Hooks::ScoreTargets(
     uint64_t sceneW = 0;
     uint32_t sceneH = 0;
     if (backbufferWidth_ != 0 && backbufferHeight_ != 0) {
+        // "Largest aspect-matching target" was wrong, and it failed exactly the
+        // way a max-of-set rule always fails: ONE outlier redefines the answer
+        // for everything else. inZOI produces an occasional 2560x1600
+        // depth-stencil (a full-res pass over the upscaled image); the instant
+        // it appeared, sceneW became 2560 and every real 1280x800 candidate was
+        // hard-rejected as "1280x800 != scene 2560x1600". The election then held
+        // an empty target for fifteen straight rounds, logged as "incumbent but
+        // no content yet".
+        //
+        // The scene resolution is better defined as THE RESOLUTION THE GAME DOES
+        // MOST OF ITS DEPTH RENDERING AT. Scene depth is bound far more than
+        // anything else, so summing bind counts per resolution and taking the
+        // maximum identifies it robustly -- and a rare full-res pass bound once
+        // or twice cannot outvote the main depth buffer bound 15 times a frame.
+        struct ResVotes {
+            uint64_t width = 0;
+            uint32_t height = 0;
+            uint64_t binds = 0;
+            uint32_t seen = 0;
+        };
+        std::vector<ResVotes> votes;
         for (const TargetFingerprint& t : targets) {
             if (!HasStencilPlane(t.format) || t.width == 0 || t.height == 0) continue;
             // Aspect match within 2%, done in integer arithmetic to avoid
@@ -725,8 +830,28 @@ std::vector<ElectionScore> Hooks::ScoreTargets(
             const uint64_t rhs = static_cast<uint64_t>(t.height) * backbufferWidth_;
             const uint64_t diff = lhs > rhs ? lhs - rhs : rhs - lhs;
             if (rhs == 0 || diff * 50 > rhs) continue;      // > 2% off: not the scene
-            if (t.width > sceneW) { sceneW = t.width; sceneH = t.height; }
+            bool merged = false;
+            for (ResVotes& v : votes) {
+                if (v.width == t.width && v.height == t.height) {
+                    v.binds += t.bindCount;
+                    ++v.seen;
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) votes.push_back({t.width, t.height, t.bindCount, 1});
         }
+        const ResVotes* best = nullptr;
+        for (const ResVotes& v : votes) {
+            // Most depth work wins; ties go to the resolution more targets share,
+            // then to the larger one so the rule stays deterministic.
+            if (!best || v.binds > best->binds ||
+                (v.binds == best->binds &&
+                 (v.seen > best->seen || (v.seen == best->seen && v.width > best->width)))) {
+                best = &v;
+            }
+        }
+        if (best) { sceneW = best->width; sceneH = best->height; }
     }
 
     std::vector<ElectionScore> out;
@@ -768,7 +893,21 @@ std::vector<ElectionScore> Hooks::ScoreTargets(
         // Cleared every frame is characteristic: UE clears CustomDepth even
         // when nothing renders into it, which is exactly how the candidate was
         // spotted in the RenderDoc capture.
-        if (t.clearCount > 0) score += 30;
+        //
+        // But WHICH plane was cleared is the discriminating part. Every depth
+        // target gets its depth cleared, so a flag-blind clear counter is nearly
+        // free information -- and on inZOI it was deciding a three-way tie
+        // between identically-shaped 1280x800 targets, because it was the only
+        // term separating them. Clearing STENCIL is the signal that someone
+        // intends to write stencil, so it is scored far above a bare clear.
+        if (t.stencilClearCount > 0) {
+            score += 80;
+            _snprintf_s(detail, _TRUNCATE, "%s; STENCIL cleared %ux", detail,
+                        t.stencilClearCount);
+        } else if (t.clearCount > 0) {
+            score += 10;
+            _snprintf_s(detail, _TRUNCATE, "%s; depth-only clear", detail);
+        }
 
         // The most-bound target in the frame is the scene depth buffer, whose
         // stencil UE4 fully owns -- sandbox bit, lighting channels, receive-decal
@@ -912,7 +1051,7 @@ void Hooks::NoteBind(ID3D12Resource* res, bool asDepth) {
     ++bindOrdinal_;
 }
 
-void Hooks::NoteClear(ID3D12Resource* res) {
+void Hooks::NoteClear(ID3D12Resource* res, bool clearedStencil) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& t = targets_[res];
     if (t.resource == nullptr) {
@@ -924,6 +1063,7 @@ void Hooks::NoteClear(ID3D12Resource* res) {
         t.sampleCount = d.SampleDesc.Count;
     }
     ++t.clearCount;
+    if (clearedStencil) ++t.stencilClearCount;
 }
 
 // Folds this frame's observations into the accumulated evidence and returns the
@@ -997,6 +1137,7 @@ std::vector<TargetFingerprint> Hooks::SnapshotTargets() {
             // long-lived CustomDepth pass as the most-bound target.
             acc.bindCount = fresh.bindCount;
             acc.clearCount = fresh.clearCount;
+            acc.stencilClearCount = fresh.stencilClearCount;
             acc.firstBindOrdinal = fresh.firstBindOrdinal;
             acc.everBoundAsDepth = acc.everBoundAsDepth || fresh.everBoundAsDepth;
         }
@@ -1083,7 +1224,61 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     // "The buffer has content" and "the content is content we produced" are
     // different claims, and only the second one justifies writing a mask.
     const size_t ourMarks = GetMarker().markedCount();
-    const bool hasContent = distinctIds >= kMinIdsToStart && ourMarks > 0;
+
+    // ...and FIFTH time, worse again, because this one survived a PASS from the
+    // validator. On inZOI the buffer was full of plausible-looking ids and every
+    // check above was satisfied: 255 distinct values, 187 primitives marked. The
+    // pixels were a 2-channel fp16 velocity buffer read through an 8-bit stencil
+    // footprint -- another render target's memory entirely.
+    //
+    // "We marked something" and "these pixel values are the ones we handed out"
+    // are STILL different claims. The sidecar knows exactly which slots were
+    // leased, so the buffer can be checked against it directly: a value we never
+    // leased cannot be ours, whatever it looks like.
+    //
+    // Stray measures 0% unleased. inZOI measured 5-23%, swinging frame to frame.
+    // A tolerance is needed rather than zero because a primitive that hands its
+    // slot back keeps drawing for a frame or two until its proxy is rebuilt
+    // (see SlotBinding::released), so a small unleased fraction is legitimate.
+    uint32_t unleasedIds = 0;
+    uint64_t unleasedPixels = 0;
+    uint64_t labelledPixels = 0;
+    bool leaseCheckPossible = false;
+    if (auto sc = GetMarker().publishedSidecar()) {
+        bool leased[256] = {};
+        for (const auto& b : sc->bindings) {
+            if (b.slot > 0 && b.slot < 256) leased[b.slot] = true;
+        }
+        leaseCheckPossible = !sc->bindings.empty();
+        for (int i = 1; i < 256; ++i) {
+            if (seen[i] && !leased[i]) ++unleasedIds;
+        }
+        for (uint32_t y = 0; y < frame.height; ++y) {
+            const uint8_t* row = frame.data + static_cast<size_t>(y) * frame.rowPitch;
+            for (uint32_t x = 0; x < frame.width; ++x) {
+                const uint8_t v = row[x];
+                if (!v) continue;
+                ++labelledPixels;
+                if (!leased[v]) ++unleasedPixels;
+            }
+        }
+    }
+    const double unleasedFrac =
+        labelledPixels ? static_cast<double>(unleasedPixels) / static_cast<double>(labelledPixels)
+                       : 0.0;
+    constexpr double kMaxUnleasedFraction = 0.02;
+    const bool idsAreOurs = !leaseCheckPossible || unleasedFrac <= kMaxUnleasedFraction;
+
+    const bool hasContent = distinctIds >= kMinIdsToStart && ourMarks > 0 && idsAreOurs;
+
+    if (leaseCheckPossible && !idsAreOurs && !warnedUnleasedIds_) {
+        warnedUnleasedIds_ = true;
+        LogError("capture: REFUSING to record -- %.1f%% of labelled pixels carry stencil "
+                 "values we never leased (%u distinct unleased ids of %u present). Whatever "
+                 "this buffer is, it is not our CustomDepth output. Elected target %p.",
+                 100.0 * unleasedFrac, unleasedIds, distinctIds,
+                 static_cast<void*>(electedTarget_));
+    }
 
     if (distinctIds >= kMinIdsToStart && ourMarks == 0 && !warnedForeignStencil_) {
         warnedForeignStencil_ = true;
@@ -1215,19 +1410,127 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
 // A PGM is written alongside, colouring by value hash, because a histogram
 // cannot show whether the regions line up with objects and a picture can.
 void Hooks::OnIdBufferReady(const MaskFrame& frame) {
-    if (idDumped_ >= 6) return;
-    if (frame.bytesPerPixel != 4) {
-        LogWarn("idbuf: expected 4 bytes/pixel, got %u", frame.bytesPerPixel);
+    // 1, 2 and 4 bytes per pixel are all legitimate id-buffer widths and this
+    // used to reject everything but 4. inZOI presents an R8_UINT at exactly
+    // scene resolution, bound once per frame -- an 8-bit single-channel integer
+    // target whose range is precisely our 1..255 slot range, i.e. the single
+    // most promising candidate in the whole census -- and the width check would
+    // have discarded it with a one-line warning.
+    if (frame.bytesPerPixel != 1 && frame.bytesPerPixel != 2 && frame.bytesPerPixel != 4) {
+        LogWarn("idbuf: unsupported %u bytes/pixel", frame.bytesPerPixel);
         return;
     }
     ++idDumped_;
 
+    // ---- does THIS candidate hold OUR ids? ---------------------------------
+    //
+    // The whole reason to enumerate candidates is to answer this by measurement.
+    // A 4-byte integer texel is read three ways -- as R16 (low half), as G16
+    // (high half), and as the whole 32-bit value -- because which channel
+    // carries the stencil depends on the format and on the platform's channel
+    // order. UE's Nanite export puts the custom stencil in .g on D3D.
+    //
+    // The test is the same one that guards the mask path: a value we never
+    // leased cannot be ours. A channel where most labelled texels ARE leased
+    // slots is the id channel, and that is a conclusion, not a guess.
+    if (auto sc = GetMarker().publishedSidecar()) {
+        // Bit-packed (8 KB) rather than a 64 KB bool array: this runs on the
+        // render thread, and 64 KB of stack per frame is not worth the risk.
+        std::vector<bool> leased(65536, false);
+        size_t leasedCount = 0;
+        for (const auto& b : sc->bindings) {
+            if (b.slot > 0 && b.slot < 65536) {
+                if (!leased[b.slot]) ++leasedCount;
+                leased[b.slot] = true;
+            }
+        }
+        if (leasedCount > 0) {
+            uint64_t nonZero[3] = {0, 0, 0};
+            uint64_t hit[3] = {0, 0, 0};
+            const uint32_t bpp = frame.bytesPerPixel;
+            for (uint32_t y = 0; y < frame.height; ++y) {
+                const uint8_t* row = frame.data + static_cast<size_t>(y) * frame.rowPitch;
+                for (uint32_t x = 0; x < frame.width; ++x) {
+                    const uint8_t* p = row + static_cast<size_t>(x) * bpp;
+                    // Decompose the texel every way an id could plausibly be
+                    // stored at this width. Which channel actually carries the
+                    // stencil depends on format and platform channel order --
+                    // UE's Nanite export puts it in .g on D3D -- so all of them
+                    // are measured and the data picks the winner.
+                    uint32_t chan[3] = {0, 0, 0};
+                    if (bpp == 1) {
+                        chan[0] = p[0];
+                    } else if (bpp == 2) {
+                        chan[0] = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
+                        chan[1] = p[0];
+                        chan[2] = p[1];
+                    } else {
+                        const uint32_t v = static_cast<uint32_t>(p[0]) |
+                                           (static_cast<uint32_t>(p[1]) << 8) |
+                                           (static_cast<uint32_t>(p[2]) << 16) |
+                                           (static_cast<uint32_t>(p[3]) << 24);
+                        chan[0] = v & 0xFFFFu;
+                        chan[1] = (v >> 16) & 0xFFFFu;
+                        chan[2] = v;
+                    }
+                    for (int c = 0; c < 3; ++c) {
+                        if (!chan[c]) continue;
+                        ++nonZero[c];
+                        if (chan[c] < 65536 && leased[chan[c]]) ++hit[c];
+                    }
+                }
+            }
+            const char* names1[3] = {"R8", "-", "-"};
+            const char* names2[3] = {"R16", "byte0", "byte1"};
+            const char* names4[3] = {"R16(low)", "G16(high)", "R32(whole)"};
+            const char* const* names = bpp == 1 ? names1 : (bpp == 2 ? names2 : names4);
+            int bestChan = -1;
+            double bestFrac = 0.0;
+            for (int c = 0; c < 3; ++c) {
+                const double frac =
+                    nonZero[c] ? static_cast<double>(hit[c]) / static_cast<double>(nonZero[c])
+                               : 0.0;
+                LogInfo("idbuf   channel %-10s: %llu non-zero texels, %.1f%% carry a slot we "
+                        "leased",
+                        names[c], nonZero[c], 100.0 * frac);
+                if (frac > bestFrac) { bestFrac = frac; bestChan = c; }
+            }
+            // A channel of unrelated data will land near zero; genuine ids land
+            // high. Half is a wide margin between those two outcomes.
+            constexpr double kIdChannelThreshold = 0.50;
+            if (bestChan >= 0 && bestFrac >= kIdChannelThreshold) {
+                LogWarn("idbuf: FOUND OUR IDS in %p channel %s (%.1f%% of non-zero texels are "
+                        "leased slots, %zu slots leased). This is the per-object id buffer.",
+                        static_cast<void*>(idTarget_), names[bestChan], 100.0 * bestFrac,
+                        leasedCount);
+                idChannelFound_ = true;
+            } else if (idDumped_ >= kIdProbeAttemptsPerCandidate) {
+                // Abandon this candidate permanently and pick another next
+                // frame. Recorded in idRejected_ rather than by index, because
+                // the candidate list is rebuilt each time and an index would
+                // point at a different resource once new targets appear.
+                LogInfo("idbuf: candidate %p holds none of our slots (best %.1f%% over %zu "
+                        "leased); rejected, will try another",
+                        static_cast<void*>(idTarget_), 100.0 * bestFrac, leasedCount);
+                idRejected_.insert(idTarget_);
+                idTarget_ = nullptr;
+                idDumped_ = 0;
+            }
+        }
+    }
+
     std::unordered_map<uint32_t, uint32_t> hist;
     hist.reserve(4096);
     for (uint32_t y = 0; y < frame.height; ++y) {
-        const auto* row =
-            reinterpret_cast<const uint32_t*>(frame.data + static_cast<size_t>(y) * frame.rowPitch);
-        for (uint32_t x = 0; x < frame.width; ++x) ++hist[row[x]];
+        const uint8_t* row = frame.data + static_cast<size_t>(y) * frame.rowPitch;
+        for (uint32_t x = 0; x < frame.width; ++x) {
+            const uint8_t* p = row + static_cast<size_t>(x) * frame.bytesPerPixel;
+            uint32_t v = 0;
+            for (uint32_t b = 0; b < frame.bytesPerPixel; ++b) {
+                v |= static_cast<uint32_t>(p[b]) << (8 * b);
+            }
+            ++hist[v];
+        }
     }
 
     std::vector<std::pair<uint32_t, uint32_t>> top(hist.begin(), hist.end());
@@ -1489,19 +1792,75 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     // where no CustomDepth candidate is ever elected -- which is exactly the
     // situation that makes this route interesting -- nesting it would mean the
     // probe silently never runs.
-    if (probeIdBuffer_ && device_ && queue_ && idDumped_ < 6) {
+    // SIXTH time the shutter would have fired at the wrong moment, and I wrote
+    // this one while reading the comment listing the previous five.
+    //
+    // The probe's entire budget was spent at t=22.8s, in the main menu, before a
+    // single primitive had been marked. With no leased slots the channel test
+    // has nothing to compare against and silently does nothing, and the budget
+    // was gone for the rest of the process.
+    //
+    // The probe's only question is "does this buffer contain the slots WE
+    // leased", so it is meaningless until we have leased some. Gate on that
+    // rather than on a frame count -- the same fix as dumping on CONTENT rather
+    // than on frame number, applied to the buffer that identifies the content.
+    const bool haveMarksToTestAgainst = GetMarker().markedCount() > 0;
+    if (probeIdBuffer_ && device_ && queue_ && haveMarksToTestAgainst && !idChannelFound_ &&
+        !loggedIdExhausted_) {
+        // ENUMERATE, do not guess.
+        //
+        // This used to take the largest-area integer target with a strict `>`,
+        // pick it once, and never reconsider. On inZOI that always resolved to a
+        // 1280x800 R32_UINT, which is why the "integer route is closed" verdict
+        // was recorded -- while a 1280x800 R16G16_UINT sat in the same census,
+        // observed 1,397 times, never once read.
+        //
+        // That R16G16_UINT matters: on UE 5.6 / PC D3D12 the Nanite CustomDepth
+        // export takes the pixel-shader path (UseComputeDepthExport() requires
+        // console-only GRHISupportsExplicitHTile), which writes depth to
+        // CombinedCustomDepth and the STENCIL VALUE to a separate
+        // CombinedCustomStencil of format PF_R16G16_UINT. So on a Nanite title
+        // the per-object ids are in a COLOUR target, and the depth-stencil we
+        // were electing never has its stencil plane written at all.
+        //
+        // Rather than swapping one hardcoded guess for another, collect every
+        // scene-scale integer candidate and step through them: a candidate that
+        // fails to contain any slot we leased is abandoned for the next one.
+        // The leased-slot test is the same one that now guards the mask path, so
+        // "which buffer holds our ids" is answered by measurement.
         if (!idTarget_) {
-            uint64_t bestArea = 0;
+            // Rebuilt every time we need a candidate, NOT once. The Nanite
+            // CombinedCustomStencil does not exist during the menu -- it is
+            // allocated when something actually requests the CustomDepth pass --
+            // so a list built at startup cannot contain the one buffer this
+            // probe exists to find. Targets already rejected stay rejected via
+            // idRejected_.
+            idCandidates_.clear();
             for (const TargetFingerprint& t : snapshot) {
                 if (!IsIntegerFormat(t.format)) continue;
                 // Scene-scale, not thumbnail. Nanite's culling and hierarchy
                 // buffers are integer targets too, and are 32x32 to 224x128.
                 if (backbufferWidth_ && t.width < backbufferWidth_ / 4) continue;
-                const uint64_t area = t.width * static_cast<uint64_t>(t.height);
-                if (area > bestArea) { bestArea = area; idTarget_ = t.resource; }
+                if (idRejected_.count(t.resource)) continue;
+                idCandidates_.push_back(t.resource);
             }
-            if (idTarget_) {
-                LogInfo("idbuf: probing integer target %p", static_cast<void*>(idTarget_));
+            // Deterministic order so a re-run probes the same sequence, and so
+            // "candidate 2 of 5" in the log means the same thing twice.
+            std::sort(idCandidates_.begin(), idCandidates_.end());
+            idCandidateIndex_ = 0;
+            if (idCandidateIndex_ < idCandidates_.size()) {
+                idTarget_ = idCandidates_[idCandidateIndex_];
+                D3D12_RESOURCE_DESC d = idTarget_->GetDesc();
+                LogInfo("idbuf: probing candidate %zu of %zu: %p %llux%u %s",
+                        idCandidateIndex_ + 1, idCandidates_.size(),
+                        static_cast<void*>(idTarget_), d.Width, d.Height,
+                        FormatName(d.Format));
+            } else if (!idRejected_.empty()) {
+                loggedIdExhausted_ = true;
+                LogWarn("idbuf: every scene-scale integer target present has been tested "
+                        "(%zu rejected); none contained a stencil slot we leased. The "
+                        "per-object ids are not in an integer render target on this title.",
+                        idRejected_.size());
             }
         }
         if (idTarget_ && idRing_.Prepare(device_, idTarget_, 0 /*colour plane*/)) {
@@ -1696,9 +2055,10 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
         // printed whatever its format, and an unexpected format shows up as
         // "other" rather than as silence.
         if (!HasStencilPlane(t.format) && !t.everBoundAsDepth) continue;
-        LogInfo("  DS %p %-22s %llux%u samples=%u binds=%u clears=%u depth=%s state=0x%X",
+        LogInfo("  DS %p %-22s %llux%u samples=%u binds=%u clears=%u sclears=%u depth=%s "
+                "state=0x%X",
                 static_cast<void*>(t.resource), FormatName(t.format), t.width, t.height,
-                t.sampleCount, t.bindCount, t.clearCount,
+                t.sampleCount, t.bindCount, t.clearCount, t.stencilClearCount,
                 t.everBoundAsDepth ? "yes" : "NO", StateOf(t.resource));
     }
 

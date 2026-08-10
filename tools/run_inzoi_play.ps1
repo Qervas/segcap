@@ -46,7 +46,16 @@ param(
     [switch]$NoReadback,
     # Turn on the D3D12 validation layer. Slow, and for diagnosis only -- never
     # for a capture run. Needs the "Graphics Tools" optional Windows feature.
-    [switch]$D3DDebug
+    [switch]$D3DDebug,
+    # Probe scene-scale INTEGER render targets for per-object ids, testing each
+    # against the stencil slots we actually leased.
+    #
+    # This is the Nanite route. On UE 5.6 / PC D3D12 the Nanite CustomDepth
+    # export writes depth to CombinedCustomDepth and the stencil VALUE to a
+    # separate CombinedCustomStencil of format PF_R16G16_UINT -- a COLOUR
+    # target. On such a title the depth-stencil we elect never has its stencil
+    # plane written, which is exactly what inZOI's masks showed.
+    [switch]$IdBuf = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -110,6 +119,15 @@ if ($D3DDebug) {
     Write-Host "[play] D3D12 VALIDATION LAYER ON -- diagnosis run, expect it to be slow"
 } else {
     Remove-Item $ddMarker -ErrorAction SilentlyContinue
+}
+
+$idbMarker = Join-Path $bin "segcap.idbuf"
+if ($IdBuf) {
+    Set-Content -Path $idbMarker -Value "1" -NoNewline
+    Write-Host "[play] ID-BUFFER PROBE on -- will walk scene-scale integer targets and test"
+    Write-Host "       each against the slots we leased (the Nanite CombinedCustomStencil route)"
+} else {
+    Remove-Item $idbMarker -ErrorAction SilentlyContinue
 }
 
 $nrMarker = Join-Path $bin "segcap.noreadback"
