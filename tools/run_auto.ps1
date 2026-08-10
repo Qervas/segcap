@@ -326,7 +326,10 @@ Get-Process -Name "Stray*" -ErrorAction SilentlyContinue | ForEach-Object {
 Start-Sleep -Seconds 3
 
 Remove-Item $log -ErrorAction SilentlyContinue
-Get-ChildItem (Join-Path $root "build\bin") -Filter "segcap_mask_*" -ErrorAction SilentlyContinue | Remove-Item -Force
+# Archive rather than delete. This line used to be a Remove-Item, and running
+# the Stray regression check destroyed a verified inZOI gameplay session that
+# had cost three attempts and twenty minutes of game time to produce.
+& (Join-Path $root "tools\archive_capture.ps1") -Title "prev" -Bin (Join-Path $root "build\bin")
 Get-ChildItem (Join-Path $root "build\bin") -Filter "segcap_frame_*" -ErrorAction SilentlyContinue | Remove-Item -Force
 
 if ($NoMark) {

@@ -143,7 +143,7 @@ Get-Process -Name "inZOI*","vpad" -ErrorAction SilentlyContinue | ForEach-Object
 }
 Start-Sleep -Seconds 3
 Remove-Item $log -ErrorAction SilentlyContinue
-Get-ChildItem (Join-Path $bin "segcap_mask_*") -ErrorAction SilentlyContinue | Remove-Item -Force
+& (Join-Path $root "tools\archive_capture.ps1") -Title "inzoi" -Bin $bin
 
 # --- launch suspended + inject ------------------------------------------------
 $appidFile = Join-Path $gameDir "steam_appid.txt"

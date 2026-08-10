@@ -1069,18 +1069,56 @@ by holding the readback disarmed and having `run_inzoi_play.ps1` arm it itself,
 route it is, and asking a human to drop the arm file is precisely the manual
 step this harness exists to remove.
 
-### 8.6 Result
+### 8.6 Result: the fix was real, the win was not
 
-inZOI, live gameplay, unattended: 61 masks at 1280x800, 508 identities tracked,
-**0 identities ever changed what they name**, no object drifting against scene
-motion. `verify_labels.py` passes. Named regions include `Head` and `Jacket` on
-the Zoi, traffic lights, and instanced static meshes.
+The address-identity fix is correct and Stray improved measurably with it (94
+masks against 21-31 before). But the inZOI result reported alongside it was
+wrong, and it is worth recording exactly how a wrong result got signed off.
 
-Known limitation, not fixed: **63.7% of regions are dithered stipple** from UE's
-dithered LOD/opacity, so many masks are speckled rather than solid. The labels
-are correct; their coverage is perforated. That is a real quality ceiling on this
-title and it is not hidden behind the pass.
+`verify_labels.py` returned PASS: 508 identities, none ever changing what they
+name, no object drifting against scene motion. I reported that as inZOI working.
+Then a follow-up probe -- built to characterise what looked like dithering --
+measured 99.87% of the buffer labelled, every one of the 255 possible byte values
+present, per-slot areas all within a factor of two of each other, and centroids
+collapsed into 0.073 of the image diagonal.
 
+Rendering the mask settled it in one look: **static**. No object shapes at all,
+just faint horizontal banding. The inZOI masks are noise.
+
+The PASS was structurally incapable of failing here:
+
+  * identity consistency reads names from the SIDECAR, not from the pixels, so
+    it is true no matter what the pixels contain
+  * temporal coherence tracks region centroids, and the centroid of a uniform
+    random scatter sits in the middle of its area and does not move -- so noise
+    is maximally "coherent"
+
+The file says so itself, in its own output: *"These checks are NECESSARY, not
+sufficient."* I read that line, quoted it to the user, and still treated the PASS
+as confirmation.
+
+What the readback is NOT doing wrong: `GetCopyableFootprints` resolves plane 1 as
+`R8_TYPELESS`, pitch 1536 for width 1280 -- the correct stencil plane, one byte
+per pixel. The plane selection, the pitch and the dimensions are all right. The
+bytes are simply not a per-object stencil.
+
+The leading explanation is the one the address-recycling work already pointed at:
+UE5 allocates render targets from pooled heaps, and transient resources **alias**
+each other's memory within a frame. Copying at Present means copying long after
+the CustomDepth pass ended, by which time that memory can have been handed to a
+different pass. Correct plane, correct resource, wrong moment.
+
+That makes the next job a change of timing rather than of target: issue the copy
+at the point in the command stream where the CustomDepth pass ends -- observable
+as the transition of that target out of `DEPTH_WRITE` -- instead of at Present.
+
+Two tools now exist so this class of failure cannot be signed off again:
+`tools/mask_sanity.py` (area distribution, centroid spread, id count) and
+`tools/dither_probe.py` / `dither_phase.py` (lattice occupancy and phase). The
+first version of `mask_sanity.py` flagged "coverage ~100%" as proof of noise and
+**the known-good Stray control failed it** -- full coverage is normal, because
+every pixel legitimately carries a stencil value. Running a new criterion against
+a title known to work is what caught it, and is now the rule.
 
 ## 9. What I would do differently
 
