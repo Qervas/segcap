@@ -307,11 +307,77 @@ bool Hooks::AcquireSwapChainVTable() {
     return ok;
 }
 
+void Hooks::AttachInfoQueue() {
+    if (!d3dDebug_ || !device_ || infoQueue_) return;
+    ID3D12InfoQueue* iq = nullptr;
+    if (FAILED(device_->QueryInterface(IID_PPV_ARGS(&iq))) || !iq) {
+        LogWarn("info queue unavailable -- validation messages cannot be read");
+        return;
+    }
+    // Deliberately NOT setting break-on-severity. A breakpoint in someone
+    // else's process is an unrecoverable hang with no message, which is the
+    // exact failure mode being diagnosed. Messages are pulled and logged
+    // instead, so the game keeps running long enough to produce them.
+    iq->SetMuteDebugOutput(FALSE);
+    infoQueue_ = iq;
+    LogInfo("D3D12 info queue attached");
+}
+
+// Called once per present. Drains whatever validation has accumulated into our
+// own log, so the errors sit in the same timeline as the readback that caused
+// them rather than in a debugger we are not attached to.
+void Hooks::DrainInfoQueue() {
+    if (!infoQueue_) return;
+    const UINT64 n = infoQueue_->GetNumStoredMessages();
+    for (UINT64 i = 0; i < n; ++i) {
+        SIZE_T len = 0;
+        if (FAILED(infoQueue_->GetMessage(i, nullptr, &len)) || len == 0) continue;
+        std::vector<char> buf(len);
+        auto* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+        if (FAILED(infoQueue_->GetMessage(i, msg, &len))) continue;
+        if (msg->Severity > D3D12_MESSAGE_SEVERITY_WARNING) continue;  // skip info/message
+        const char* sev = msg->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION ? "CORRUPTION"
+                        : msg->Severity == D3D12_MESSAGE_SEVERITY_ERROR      ? "ERROR"
+                                                                             : "WARNING";
+        LogError("D3D12 %s [id %d]: %.*s", sev, static_cast<int>(msg->ID),
+                 static_cast<int>(msg->DescriptionByteLength), msg->pDescription);
+        ++d3dMessagesLogged_;
+    }
+    infoQueue_->ClearStoredMessages();
+}
+
 bool Hooks::Install() {
     if (installed_) return true;
 
     LogInfo("mode: %s", censusOnly_ ? "CENSUS ONLY (no GPU work issued)"
                                     : "capture (readback enabled)");
+
+    // The D3D12 debug layer, if asked for.
+    //
+    // This MUST happen before the game creates its device, which is the one
+    // thing injection actually gives us: the injector launches suspended and
+    // waits for hooks to report ready before resuming the main thread, so we
+    // are reliably ahead of the first D3D call.
+    //
+    // Why bother: inZOI dies 0.5-1.5s after the first readback, and everything
+    // known about it so far is inferred from a corpse -- the log simply stops.
+    // The debug layer turns "the copy kills it" into the actual reason, which
+    // is the difference between a diagnosis and a good guess.
+    if (d3dDebug_) {
+        ID3D12Debug* dbg = nullptr;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg))) && dbg) {
+            dbg->EnableDebugLayer();
+            dbg->Release();
+            LogWarn("D3D12 DEBUG LAYER ENABLED -- this is slow and is for "
+                    "diagnosis only, never for a capture run");
+        } else {
+            // Not fatal, but say so loudly: a silent failure here would make
+            // the absence of validation errors look like a clean bill of health.
+            LogError("D3D12 debug layer requested but D3D12GetDebugInterface "
+                     "failed -- the Graphics Tools optional feature is probably "
+                     "not installed. NO validation is active this run.");
+        }
+    }
 
     if (MH_Initialize() != MH_OK) {
         LogError("MH_Initialize failed");
@@ -354,6 +420,7 @@ void STDMETHODCALLTYPE Hooks::ExecuteCommandLists_(ID3D12CommandQueue* self, UIN
                     // outlives us and we only need the pointer for identity.
                     h.device_->Release();
                     LogInfo("resolved device %p from queue", static_cast<void*>(h.device_));
+                    h.AttachInfoQueue();
                 }
             }
         }
@@ -1180,6 +1247,10 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     // Readback runs every frame; only the logging is periodic. Draining first
     // means a copy issued on frame N is collected here on frame N+2 or later,
     // which is what keeps the render thread off the GPU's critical path.
+    // Before the readback, so anything the previous frame's copy provoked is
+    // already in the log by the time this frame's copy is submitted.
+    DrainInfoQueue();
+
     readback_.Drain([this](const MaskFrame& f) { OnMaskReady(f); });
 
     // Election runs every frame too. It is cheap (a handful of targets) and the

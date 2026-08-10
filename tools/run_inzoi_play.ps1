@@ -43,7 +43,10 @@ param(
     # Isolation run: mark normally, but issue no GPU work at all. Note that
     # -Captures 0 does NOT do this -- it only zeroes the dump budget, while the
     # copy still runs every frame.
-    [switch]$NoReadback
+    [switch]$NoReadback,
+    # Turn on the D3D12 validation layer. Slow, and for diagnosis only -- never
+    # for a capture run. Needs the "Graphics Tools" optional Windows feature.
+    [switch]$D3DDebug
 )
 
 $ErrorActionPreference = "Stop"
@@ -101,6 +104,14 @@ if ($NoMark) {
     Set-Content -Path (Join-Path $bin "segcap.mark") -Value "1" -NoNewline
     Write-Host "[play] mark marker SET -- THIS RUN WILL WRITE bRenderCustomDepth"
 }
+$ddMarker = Join-Path $bin "segcap.d3ddebug"
+if ($D3DDebug) {
+    Set-Content -Path $ddMarker -Value "1" -NoNewline
+    Write-Host "[play] D3D12 VALIDATION LAYER ON -- diagnosis run, expect it to be slow"
+} else {
+    Remove-Item $ddMarker -ErrorAction SilentlyContinue
+}
+
 $nrMarker = Join-Path $bin "segcap.noreadback"
 if ($NoReadback) {
     Set-Content -Path $nrMarker -Value "1" -NoNewline

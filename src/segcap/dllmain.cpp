@@ -155,6 +155,16 @@ DWORD WINAPI InitThread(LPVOID) {
                             "ProcessEvent discovery on the triage shortlist", pt.c_str());
         }
 
+        // Read before Install(), which is before the game's device exists.
+        std::wstring dd(marker);
+        const size_t dotd = dd.find_last_of(L'.');
+        if (dotd != std::wstring::npos) dd = dd.substr(0, dotd);
+        dd += L".d3ddebug";
+        if (GetFileAttributesW(dd.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            segcap::Hooks::Get().SetD3DDebug(true);
+            segcap::LogInfo("d3d-debug marker %ls: PRESENT -- validation layer on", dd.c_str());
+        }
+
         std::wstring nr(marker);
         const size_t dotn = nr.find_last_of(L'.');
         if (dotn != std::wstring::npos) nr = nr.substr(0, dotn);

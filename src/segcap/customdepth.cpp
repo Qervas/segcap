@@ -420,14 +420,23 @@ int CustomDepthMarker::CollectCandidates(ue4::Engine& engine, bool renderableOnl
     // Report the discards once, on the first pass that finds almost nothing.
     // That is the case where the answer matters and the one where the log is
     // otherwise silent.
-    if (found < 8 && !reportedRejects_ && !rejectedByClass.empty()) {
+    // Require a non-trivial number of rejects before reporting, not just a low
+    // `found`. The first version fired during inZOI's main menu, where nothing
+    // renderable exists yet and nothing was rejected either, and printed a
+    // header promising a list followed by no list at all -- a log line that
+    // announces evidence and delivers none is worse than silence, because the
+    // next reader spends time deciding whether the empty list means something.
+    size_t rejectedTotal = 0;
+    for (const auto& kv : rejectedByClass) rejectedTotal += static_cast<size_t>(kv.second);
+
+    if (found < 8 && rejectedTotal >= 50 && !reportedRejects_) {
         reportedRejects_ = true;
         std::vector<std::pair<std::string, int>> top(rejectedByClass.begin(),
                                                      rejectedByClass.end());
         std::sort(top.begin(), top.end(),
                   [](const auto& a, const auto& b) { return a.second > b.second; });
-        LogWarn("customdepth: only %d renderable candidates -- these *Component "
-                "classes were REJECTED as non-renderable:", found);
+        LogWarn("customdepth: only %d renderable candidates, but %zu *Component "
+                "objects were REJECTED as non-renderable:", found, rejectedTotal);
         for (size_t i = 0; i < top.size() && i < 15; ++i) {
             LogWarn("customdepth:   %6d  %s", top[i].second, top[i].first.c_str());
         }

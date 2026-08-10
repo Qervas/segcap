@@ -98,6 +98,9 @@ public:
     void SetNoReadback(bool on) { noReadback_ = on; }
     bool noReadback() const { return noReadback_; }
 
+    // Must be set before Install(), i.e. before the game creates its device.
+    void SetD3DDebug(bool on) { d3dDebug_ = on; }
+
     // A/B mode: capture colour frames on a fixed stride regardless of whether a
     // mask was kept, so the "marking off" condition produces frames at all.
     void SetAbTest(bool on) { abTest_ = on; }
@@ -328,6 +331,12 @@ private:
     bool censusOnly_ = false;
     bool noReadback_ = false;
     bool warnedNoReadback_ = false;
+
+    bool d3dDebug_ = false;
+    ID3D12InfoQueue* infoQueue_ = nullptr;
+    uint64_t d3dMessagesLogged_ = 0;
+    void AttachInfoQueue();
+    void DrainInfoQueue();
     bool abTest_ = false;
     bool probeIdBuffer_ = false;
     Readback idRing_;
