@@ -155,6 +155,16 @@ DWORD WINAPI InitThread(LPVOID) {
                             "ProcessEvent discovery on the triage shortlist", pt.c_str());
         }
 
+        std::wstring nr(marker);
+        const size_t dotn = nr.find_last_of(L'.');
+        if (dotn != std::wstring::npos) nr = nr.substr(0, dotn);
+        nr += L".noreadback";
+        if (GetFileAttributesW(nr.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            segcap::Hooks::Get().SetNoReadback(true);
+            segcap::LogInfo("no-readback marker %ls: PRESENT -- marking runs, "
+                            "no GPU work is issued", nr.c_str());
+        }
+
         std::wstring mk(marker);
         const size_t dot2 = mk.find_last_of(L'.');
         if (dot2 != std::wstring::npos) mk = mk.substr(0, dot2);

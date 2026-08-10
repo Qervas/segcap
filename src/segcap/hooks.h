@@ -92,6 +92,12 @@ public:
     void SetCensusOnly(bool on) { censusOnly_ = on; }
     bool censusOnly() const { return censusOnly_; }
 
+    // Suppress the readback copy only. Unlike census mode this leaves marking,
+    // reflection and ProcessEvent running, so it isolates GPU work from engine
+    // work as a single variable.
+    void SetNoReadback(bool on) { noReadback_ = on; }
+    bool noReadback() const { return noReadback_; }
+
     // A/B mode: capture colour frames on a fixed stride regardless of whether a
     // mask was kept, so the "marking off" condition produces frames at all.
     void SetAbTest(bool on) { abTest_ = on; }
@@ -320,6 +326,8 @@ private:
     // Set from SEGCAP_CENSUS_ONLY=1. Suppresses all GPU work so an unfamiliar
     // title can be observed before anything is submitted on its queue.
     bool censusOnly_ = false;
+    bool noReadback_ = false;
+    bool warnedNoReadback_ = false;
     bool abTest_ = false;
     bool probeIdBuffer_ = false;
     Readback idRing_;

@@ -39,7 +39,11 @@ param(
     [int]$Stride = 20,
     # Skip marking -- same route into gameplay, but read-only. Use this to
     # re-check the route without touching the game's objects.
-    [switch]$NoMark
+    [switch]$NoMark,
+    # Isolation run: mark normally, but issue no GPU work at all. Note that
+    # -Captures 0 does NOT do this -- it only zeroes the dump budget, while the
+    # copy still runs every frame.
+    [switch]$NoReadback
 )
 
 $ErrorActionPreference = "Stop"
@@ -96,6 +100,13 @@ if ($NoMark) {
 } else {
     Set-Content -Path (Join-Path $bin "segcap.mark") -Value "1" -NoNewline
     Write-Host "[play] mark marker SET -- THIS RUN WILL WRITE bRenderCustomDepth"
+}
+$nrMarker = Join-Path $bin "segcap.noreadback"
+if ($NoReadback) {
+    Set-Content -Path $nrMarker -Value "1" -NoNewline
+    Write-Host "[play] NO-READBACK: marking runs, zero GPU work -- isolation run"
+} else {
+    Remove-Item $nrMarker -ErrorAction SilentlyContinue
 }
 Set-Content -Path (Join-Path $bin "segcap.captures") -Value "$Captures" -NoNewline
 Set-Content -Path (Join-Path $bin "segcap.stride")   -Value "$Stride"   -NoNewline

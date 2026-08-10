@@ -1230,7 +1230,31 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     // submitted on the game's queue. Used for first contact with an unfamiliar
     // title, where a wrong shadowed state would show up as a GPU hang rather
     // than an error message. Observe first, then act.
-    if (!censusOnly_ && electedTarget_ && device_ && queue_) {
+    // A separate switch from census mode, and the distinction is the whole
+    // point of it.
+    //
+    // Census suppresses the GPU work AND the engine work, so a census run
+    // proves nothing about which of the two kills a game. inZOI died 0.5-1.5s
+    // after RECORDING STARTED in four consecutive marking runs (110.59/~111,
+    // 109.52/~110.3, 110.00/~110.5, 44.63/~45.6) while census runs survived the
+    // identical load -- but that comparison changes two variables at once.
+    //
+    // `-Captures 0` was the first attempt at isolating it and was not an
+    // isolation at all: it zeroes the DUMP budget, which is CPU-side work on
+    // already-read-back data, while the copy below still runs every frame. The
+    // run died at 45.56s against the previous run's 45.6s, i.e. the independent
+    // variable never moved.
+    //
+    // This suppresses exactly one thing: the copy, its two barriers, and the
+    // submission on the game's queue. Marking, reflection and ProcessEvent all
+    // stay live. Survive with this set and the readback is the culprit; die
+    // anyway and it is not.
+    if (noReadback_ && electedTarget_ && !warnedNoReadback_) {
+        warnedNoReadback_ = true;
+        LogWarn("readback SUPPRESSED by marker -- marking stays live, no GPU work "
+                "is issued. Isolation run: this is the only variable.");
+    }
+    if (!censusOnly_ && !noReadback_ && electedTarget_ && device_ && queue_) {
         if (readback_.Prepare(device_, electedTarget_, 1 /*stencil plane*/)) {
             readback_.Enqueue(queue_, electedTarget_, StateOf(electedTarget_), frameIndex_);
 
