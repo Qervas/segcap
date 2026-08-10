@@ -155,6 +155,16 @@ DWORD WINAPI InitThread(LPVOID) {
                             "ProcessEvent discovery on the triage shortlist", pt.c_str());
         }
 
+        std::wstring ar(marker);
+        const size_t dota = ar.find_last_of(L'.');
+        if (dota != std::wstring::npos) ar = ar.substr(0, dota);
+        ar += L".requirearm";
+        if (GetFileAttributesW(ar.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            segcap::Hooks::Get().SetRequireArm(true);
+            segcap::LogInfo("require-arm marker PRESENT -- readback holds until "
+                            "segcap.arm appears");
+        }
+
         // Read before Install(), which is before the game's device exists.
         std::wstring dd(marker);
         const size_t dotd = dd.find_last_of(L'.');

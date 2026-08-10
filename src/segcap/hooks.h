@@ -101,6 +101,8 @@ public:
     // Must be set before Install(), i.e. before the game creates its device.
     void SetD3DDebug(bool on) { d3dDebug_ = on; }
 
+    void SetRequireArm(bool on) { requireArm_ = on; }
+
     // A/B mode: capture colour frames on a fixed stride regardless of whether a
     // mask was kept, so the "marking off" condition produces frames at all.
     void SetAbTest(bool on) { abTest_ = on; }
@@ -335,6 +337,12 @@ private:
     std::unordered_map<ID3D12Resource*, uint64_t> barriersSeen_;
     uint64_t BarriersSeenFor(ID3D12Resource* res);
     bool warnedUnshadowed_ = false;
+    ID3D12Resource* lastUnshadowedTarget_ = nullptr;
+    bool loggedArmedOk_ = false;
+
+    // Hold the readback until a segcap.arm file appears next to the DLL.
+    bool requireArm_ = false;
+    bool armed_ = false;
 
     bool d3dDebug_ = false;
     ID3D12InfoQueue* infoQueue_ = nullptr;

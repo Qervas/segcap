@@ -1355,18 +1355,74 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     // the runtime took it as a promise, and inZOI died 0.5-1.5s later every
     // time. Refusing costs a title we could not have captured correctly anyway,
     // and it says why instead of taking the process down.
-    const bool shadowUsable = electedTarget_ && BarriersSeenFor(electedTarget_) > 0;
-    if (electedTarget_ && !shadowUsable && !censusOnly_ && !noReadback_ && !warnedUnshadowed_) {
-        warnedUnshadowed_ = true;
-        LogError("readback REFUSED: elected target %p has been bound as a render target "
-                 "but we have observed ZERO ResourceBarrier transitions for it, so any "
-                 "StateBefore we declare is invented. Likely Enhanced Barriers "
-                 "(ID3D12GraphicsCommandList7::Barrier), which this build does not hook. "
-                 "Capture is off; marking is unaffected.",
+    // Runtime arming.
+    //
+    // Every other marker is read once, at injection. This one cannot be: the
+    // whole point is to open the shutter at a moment only a human watching the
+    // screen can identify -- "the save has loaded and I am standing in the
+    // world". The readback carries a fuse on inZOI (a cross-queue race that
+    // kills the process within seconds), so spending it on menu frames wastes
+    // the only window we get. The previous attempt burned all 24 masks between
+    // t=22s and t=45s and never reached gameplay at all.
+    //
+    // Polled, not watched, and only while disarmed -- an existence check every
+    // 60 frames costs nothing and stops entirely once armed.
+    if (requireArm_ && !armed_ && (frameIndex_ % 60) == 0) {
+        wchar_t self[MAX_PATH] = {};
+        GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), self, MAX_PATH);
+        std::wstring p(self);
+        const size_t dot = p.find_last_of(L'.');
+        if (dot != std::wstring::npos) p = p.substr(0, dot);
+        p += L".arm";
+        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            armed_ = true;
+            LogWarn("CAPTURE ARMED at frame %llu -- readback begins now", frameIndex_);
+        }
+    }
+
+    // Two independent reasons the readback may not run, reported separately.
+    //
+    // The first version folded both into one boolean and printed the barrier
+    // message for either -- so a run that was merely waiting to be armed
+    // reported "we have observed ZERO ResourceBarrier transitions", and I read
+    // that as evidence for Enhanced Barriers. It was evidence of nothing. A
+    // diagnostic that cannot tell two causes apart will always name the one you
+    // were already expecting.
+    //
+    // Also no longer one-shot: the elected target CHANGES during a session
+    // (menu target, then gameplay target), and a latched warning describes
+    // whichever came first forever. It reports per target instead, which is the
+    // thing the question is actually about.
+    const bool armReady = !requireArm_ || armed_;
+    const uint64_t barriers = electedTarget_ ? BarriersSeenFor(electedTarget_) : 0;
+    const bool shadowUsable = electedTarget_ && barriers > 0;
+
+    if (electedTarget_ && !censusOnly_ && !noReadback_ && armReady && !shadowUsable
+        && electedTarget_ != lastUnshadowedTarget_) {
+        lastUnshadowedTarget_ = electedTarget_;
+        LogError("readback REFUSED for target %p: ARMED and elected, but ZERO "
+                 "ResourceBarrier transitions have been observed for it, so any "
+                 "StateBefore we declare would be invented. Consistent with Enhanced "
+                 "Barriers (ID3D12GraphicsCommandList7::Barrier), which this build does "
+                 "not hook. Marking is unaffected.",
                  static_cast<void*>(electedTarget_));
     }
 
-    if (!censusOnly_ && !noReadback_ && shadowUsable && device_ && queue_) {
+    // Say plainly when we are simply waiting, so silence is never ambiguous.
+    if (requireArm_ && !armed_ && electedTarget_ && (frameIndex_ % 600) == 0) {
+        LogInfo("readback holding: DISARMED (target %p, %llu barriers observed so far)",
+                static_cast<void*>(electedTarget_), barriers);
+    }
+
+    if (armReady && electedTarget_ && shadowUsable && !loggedArmedOk_) {
+        loggedArmedOk_ = true;
+        LogInfo("readback ENABLED for target %p (%llu barriers observed)",
+                static_cast<void*>(electedTarget_), barriers);
+    }
+
+    const bool canCopy = shadowUsable && armReady;
+
+    if (!censusOnly_ && !noReadback_ && canCopy && device_ && queue_) {
         if (readback_.Prepare(device_, electedTarget_, 1 /*stencil plane*/)) {
             readback_.Enqueue(queue_, electedTarget_, StateOf(electedTarget_), frameIndex_);
 
