@@ -32,6 +32,9 @@ HMODULE g_self = nullptr;
 bool g_markCustomDepth = false;
 bool g_peTriageInCensus = false;
 
+// True while a marking pass is queued but not yet drained on the game thread.
+std::atomic<bool> g_markPassPending{false};
+
 // Read-only introspection dump, from a "segcap.introspect" marker file. Each
 // non-empty line names a class whose reflected properties should be logged.
 bool g_introspect = false;
@@ -594,12 +597,108 @@ DWORD WINAPI MarkLoopThread(LPVOID) {
     segcap::GetPerception().StartPublishing();
 
     int tick = 0;
+    int32_t lastObjectCount = 0;
+    int stableTicks = 0;
+    constexpr int kStableTicksRequired = 12;   // 12 x 250ms = 3s of a quiet array
+
     for (;;) {
         Sleep(250);
         ++tick;
 
         auto& pe = segcap::ue4::GetProcessEventHook();
-        if (!pe.verified() || !g_marker.ready()) continue;
+        if (!pe.verified()) continue;
+
+        // ---- world-stability gate ------------------------------------------
+        //
+        // Do not touch UObjects while the world is being torn down and rebuilt.
+        //
+        // inZOI reproducibly died ~25 seconds into loading a save, every time,
+        // with the log ending mid-sentence and no error. Census runs survived
+        // the identical load, so it was not injection, the D3D12 hooks, or
+        // ProcessEvent -- the only difference was that marking runs call into
+        // components and write to them. The generational handle check added
+        // alongside this fixed a genuine use-after-free (it reported 106
+        // objects destroyed under us in one pass, then 252 stale of 300
+        // scanned) and the game still died, which says the remaining problem is
+        // not stale pointers but reaching into an engine that is mid-transition
+        // at all.
+        //
+        // So infer "the world is settled" from the thing that actually moves:
+        // the object array's size. During a transition it swings continuously
+        // as one level is destroyed and the next streams in. Three seconds of
+        // it changing by less than 0.5% is a level that has finished arriving.
+        //
+        // Measured, not assumed -- no hardcoded "is this a menu" test and
+        // nothing specific to either title. Stray sits in a stable array while
+        // in a level, so it clears the gate immediately and behaves as before.
+        //
+        // Everything below this point touches the engine, including the
+        // resolve retry's array walk, so the gate goes first.
+        {
+            const int32_t count = g_engine.NumObjects();
+            const int32_t delta = count > lastObjectCount ? count - lastObjectCount
+                                                          : lastObjectCount - count;
+            if (lastObjectCount > 0 && delta * 200 < lastObjectCount) {
+                ++stableTicks;
+            } else {
+                if (stableTicks >= kStableTicksRequired) {
+                    segcap::LogInfo("customdepth: world is changing (%d -> %d objects) "
+                                    "-- pausing marking until it settles",
+                                    lastObjectCount, count);
+                }
+                stableTicks = 0;
+            }
+            lastObjectCount = count;
+            if (stableTicks < kStableTicksRequired) continue;
+            if (stableTicks == kStableTicksRequired) {
+                segcap::LogInfo("customdepth: world settled at %d objects -- marking", count);
+            }
+        }
+
+        // Keep trying to resolve, instead of spinning forever on a decision
+        // made too early.
+        //
+        // This is the fourth time this exact bug has appeared in this project,
+        // and the first line of RESUME.md's trap list warns about it: anything
+        // checked once, at startup, will be checked at the wrong moment.
+        //
+        // On inZOI the field-layout calibration ran 12 seconds after injection,
+        // while a 35 GB title was still loading, and reported
+        // "FindClass(PrimitiveComponent): only found 1 candidate(s), all with
+        // null property chains". Calibration correctly refused to guess and
+        // returned false -- and nothing ever asked it again. Resolve() then
+        // failed for the same reason, ready() stayed false, and this loop ran
+        // for the rest of the session doing nothing at all. The capture
+        // pipeline meanwhile happily dumped the game's OWN stencil buffer,
+        // 154 distinct values of it, which looks exactly like a working
+        // segmentation mask until you check whether anything was ever marked.
+        if (!g_marker.ready()) {
+            if (tick % 20 == 0) {   // every ~5s
+                if (!g_engine.fieldLayoutCalibrated()) {
+                    if (g_engine.CalibrateFieldLayout()) {
+                        segcap::LogInfo("customdepth: field layout calibrated on retry "
+                                        "(tick %d) -- classes were not loaded at startup",
+                                        tick);
+                    }
+                }
+                if (g_engine.fieldLayoutCalibrated()) {
+                    // Resolve on the game thread (it chases UObject pointers),
+                    // but NOT the collection pass -- that walks all ~500,000
+                    // array slots, and doing that inside the engine's dispatch
+                    // would stall a frame for seconds. It is read-only CPU
+                    // work, so it belongs on this thread, which is where the
+                    // original install path already ran it.
+                    pe.RunOnGameThread([](segcap::ue4::Engine& e) { g_marker.Resolve(e); });
+                    Sleep(500);   // give the queued task a tick to drain
+                    if (g_marker.ready()) {
+                        segcap::LogInfo("customdepth: RESOLVED on retry at tick %d -- "
+                                        "collecting candidates", tick);
+                        g_marker.CollectCandidates(g_engine, true);
+                    }
+                }
+            }
+            continue;
+        }
 
         pe.RunOnGameThread([](segcap::ue4::Engine& e) {
             auto& p = segcap::GetPerception();
@@ -610,8 +709,21 @@ DWORD WINAPI MarkLoopThread(LPVOID) {
             p.Publish(s);
         });
 
-        pe.RunOnGameThread([](segcap::ue4::Engine& e) { g_marker.RefreshVisibility(e, 120); });
-        pe.RunOnGameThread([](segcap::ue4::Engine& e) { g_marker.MarkBatch(e, 300); });
+        // Do not queue another marking pass while one is still waiting.
+        //
+        // This loop queues on a 250ms timer, but the queue only drains when the
+        // game thread reaches ProcessEvent -- and during streaming it can stall
+        // for seconds and then drain everything at once. That is how four
+        // MarkBatch passes ran inside 15 milliseconds and took the working set
+        // from 0 to 255 in one frame. Rate-limiting the producer is not enough
+        // if the consumer batches; the flag makes the pass self-limiting.
+        if (!g_markPassPending.exchange(true, std::memory_order_acq_rel)) {
+            pe.RunOnGameThread([](segcap::ue4::Engine& e) {
+                g_marker.RefreshVisibility(e, 120);
+                g_marker.MarkBatch(e, 300);
+                g_markPassPending.store(false, std::memory_order_release);
+            });
+        }
 
         // Re-walk the object array periodically. Level streaming adds and
         // removes primitives throughout a session, so a pool collected once

@@ -811,7 +811,33 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     // the same -- a trigger condition that is technically satisfied long before
     // the thing it is meant to detect is actually happening.
     constexpr uint32_t kMinIdsToStart = 24;
-    const bool hasContent = distinctIds >= kMinIdsToStart;
+
+    // ...and the ids in the buffer must be OURS.
+    //
+    // Fourth time, and the worst of the four, because this one produced output
+    // that looked right. On inZOI the marker never resolved -- UE5's property
+    // chains were not populated when it looked -- so segcap marked exactly zero
+    // primitives. The elected target still had a stencil plane, because the
+    // engine uses stencil for its own purposes, and this gate happily counted
+    // 154 distinct values in it and started recording. The result was
+    // 2560x1600 masks with a clean-looking 0..153 id range that were entirely
+    // the game's own stencil bits and contained no object identity whatsoever.
+    //
+    // Every downstream tool would have accepted them. The sidecar would have
+    // been empty or wrong, which is the only reason it was caught.
+    //
+    // "The buffer has content" and "the content is content we produced" are
+    // different claims, and only the second one justifies writing a mask.
+    const size_t ourMarks = GetMarker().markedCount();
+    const bool hasContent = distinctIds >= kMinIdsToStart && ourMarks > 0;
+
+    if (distinctIds >= kMinIdsToStart && ourMarks == 0 && !warnedForeignStencil_) {
+        warnedForeignStencil_ = true;
+        LogWarn("capture: elected target holds %u distinct stencil values but WE HAVE "
+                "MARKED NOTHING -- this is the engine's own stencil, not object ids. "
+                "Not recording. (Marker resolved? see 'customdepth:' lines.)",
+                distinctIds);
+    }
 
     // ---- recording gate ----------------------------------------------------
     //

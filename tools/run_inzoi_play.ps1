@@ -138,21 +138,11 @@ Start-Sleep -Seconds $MenuWait
 # Measured on 2560x1600. act.ps1 is DPI-aware and takes physical pixels, so the
 # fractions are resolved against the real window rect at click time.
 function Click([double]$fx, [double]$fy, [double]$wait, [string]$what) {
-    $p = Get-Process -Name "inZOI-Win64-Shipping" -ErrorAction SilentlyContinue
-    if (-not $p) { throw "game exited before: $what" }
-    $r = & powershell -NoProfile -Command "
-        Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;
-        public class W{[DllImport(\"user32.dll\")]public static extern bool SetProcessDPIAware();
-        [DllImport(\"user32.dll\")]public static extern bool GetWindowRect(IntPtr h,out RECT r);
-        public struct RECT{public int L,T,R,B;}}'
-        [W]::SetProcessDPIAware()|Out-Null
-        `$h=(Get-Process -Id $($p.Id)).MainWindowHandle
-        `$rc=New-Object W+RECT; [W]::GetWindowRect(`$h,[ref]`$rc)|Out-Null
-        Write-Output ((`$rc.R-`$rc.L)); Write-Output ((`$rc.B-`$rc.T))"
-    $w = [int]$r[0]; $h = [int]$r[1]
-    $x = [int]($w * $fx); $y = [int]($h * $fy)
-    Write-Host "[play] $what -> click ($x,$y) of ${w}x${h}"
-    & $act -ClickX $x -ClickY $y -Wait $wait | Select-Object -Last 1
+    if (-not (Get-Process -Name "inZOI-Win64-Shipping" -ErrorAction SilentlyContinue)) {
+        throw "game exited before: $what"
+    }
+    Write-Host "[play] $what"
+    & $act -ClickFx $fx -ClickFy $fy -Wait $wait | ForEach-Object { Write-Host "       $_" }
 }
 
 Click 0.0883 0.2169 4  "Continue"

@@ -291,7 +291,6 @@ bool CustomDepthMarker::UnmarkPrimitive(const MarkedPrimitive& mp) {
 }
 
 int CustomDepthMarker::RefreshVisibility(ue4::Engine& engine, int limit) {
-    (void)engine;
     if (!resolved_ || !fnWasRecentlyRendered_) return 0;
     if (marked_.empty()) return 0;
 
@@ -301,6 +300,35 @@ int CustomDepthMarker::RefreshVisibility(ue4::Engine& engine, int limit) {
     for (size_t i = 0; i < n; ++i) {
         if (refreshCursor_ >= marked_.size()) refreshCursor_ = 0;
         const MarkedPrimitive mp = marked_[refreshCursor_];
+
+        // Is this object still there? MarkedPrimitive has carried objectIndex
+        // and serialNumber since the first commit, under a comment saying they
+        // "guard against GC slot reuse" -- and nothing ever read them. The data
+        // was collected and the check was never written.
+        //
+        // It went unnoticed because on Stray the marker only ever ran inside
+        // one already-loaded level. Marking in inZOI's main menu and then
+        // loading a save destroys all 122 marked components at once, and the
+        // next visibility sweep called WasRecentlyRendered on every freed
+        // pointer -- through ProcessEvent, on the game thread, during a level
+        // transition. The game died at t=89 with nothing in the log.
+        //
+        // Drop it without unmarking: the object is gone, so there is nothing
+        // left to restore, and touching it to "clean up" is the crash itself.
+        if (!engine.StillLive(mp.component, mp.objectIndex, mp.serialNumber)) {
+            {
+                std::lock_guard<std::mutex> lock(identityMutex_);
+                identity_.ReleaseSlot(mp.stencilValue);
+            }
+            slotTable_.erase(mp.stencilValue);
+            alreadyMarked_.erase(mp.component);
+            pooled_.erase(mp.component);
+            marked_.erase(marked_.begin() + static_cast<ptrdiff_t>(refreshCursor_));
+            ++released;
+            ++slotsReleased_;
+            ++staleDropped_;
+            continue;   // erase shifted the next element into this cursor
+        }
 
         // A tolerance wider than the one used for acquisition, on purpose.
         // Equal thresholds make an object hovering at the edge of visibility
@@ -408,7 +436,6 @@ int CustomDepthMarker::CollectCandidates(ue4::Engine& engine, bool renderableOnl
 }
 
 int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
-    (void)engine;
     if (!resolved_) return 0;
 
     // Take only as many candidates as there are FREE slots.
@@ -463,8 +490,37 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
     int skippedInvisible = 0;
     int skippedAlready = 0;
 
+    // Cap how many primitives are newly opted in per pass.
+    //
+    // Marking is not a cheap write. SetRenderCustomDepth dirties the render
+    // state, which makes the engine tear down and rebuild that component's
+    // scene proxy. Doing that to 255 components inside a single frame is a
+    // burst of proxy recreation on the render thread, and on UE5 with Nanite
+    // it killed inZOI every time -- the log showed four MarkBatch passes
+    // landing within 15 milliseconds ("marked 70 / 14 / 84 / 87", 0 to 255
+    // live slots), with the process gone about two seconds later.
+    //
+    // Stray never hit this only because its scenes hand back one to seven
+    // newly-visible primitives per pass; the burst was always latent. Filling
+    // the working set over ~8 seconds instead of one frame costs nothing --
+    // the slots are held once acquired -- and turns a spike into a trickle.
+    constexpr int kMaxNewMarksPerPass = 8;
+
+    int skippedStale = 0;
     for (const Candidate& c : batch) {
         if (freeSlots == 0) break;
+        if (assigned >= kMaxNewMarksPerPass) break;
+
+        // The candidate pool is walked round-robin and re-collected only every
+        // ~30 seconds, so entries routinely outlive the objects they name --
+        // level streaming alone guarantees it. Validate the generational handle
+        // before calling into the component, for the same reason as in
+        // RefreshVisibility: the alternative is a ProcessEvent call on freed
+        // memory.
+        if (!engine.StillLive(c.component, c.index, c.serial)) {
+            ++skippedStale;
+            continue;
+        }
 
         // Already holds a slot: nothing to do, and re-leasing would only churn.
         if (alreadyMarked_.find(c.component) != alreadyMarked_.end()) {
@@ -532,13 +588,14 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
     // Only log when something happened. The sweep runs several times a second
     // and a line per sweep buried the interesting events under thousands of
     // "marked 0" entries last time.
-    if (assigned > 0 || refused > 0) {
+    if (assigned > 0 || refused > 0 || skippedStale > 0) {
         std::lock_guard<std::mutex> lock(identityMutex_);
-        LogInfo("customdepth: marked %d (refused %d, invisible %d, already %d of %zu scanned); "
-                "%zu live slots, %llu identities, %llu evictions, visible %llu/%llu tested",
-                assigned, refused, skippedInvisible, skippedAlready, batch.size(),
-                identity_.liveSlots(), identity_.totalIdentities(), identity_.evictions(),
-                visibilityHits_, visibilityTested_);
+        LogInfo("customdepth: marked %d (refused %d, invisible %d, already %d, stale %d "
+                "of %zu scanned); %zu live slots, %llu identities, %llu evictions, "
+                "%llu dropped-destroyed, visible %llu/%llu tested",
+                assigned, refused, skippedInvisible, skippedAlready, skippedStale,
+                batch.size(), identity_.liveSlots(), identity_.totalIdentities(),
+                identity_.evictions(), staleDropped_, visibilityHits_, visibilityTested_);
     }
     return assigned;
 }

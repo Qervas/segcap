@@ -218,6 +218,15 @@ public:
     // normal in a live array.
     bool GetObject(int32_t index, ObjectRef& out) const;
 
+    // Is the object we recorded still the object living in that array slot?
+    //
+    // UE reuses array slots after garbage collection and bumps the slot's
+    // serial number when it does. A stored raw pointer is therefore only
+    // meaningful together with the (index, serial) it was captured at -- which
+    // is exactly what a generational handle is, and exactly what makes it safe
+    // to call into an object we last saw minutes ago.
+    bool StillLive(void* obj, int32_t index, int32_t serial) const;
+
     // Resolves an FName comparison index to text.
     std::string NameToString(uint32_t comparisonIndex) const;
 
@@ -381,6 +390,11 @@ private:
     size_t fieldNameOffset_ = FFieldLayout::kNamePrivate;
     size_t fieldNextOffset_ = FFieldLayout::kNext;
     bool fieldLayoutCalibrated_ = false;
+
+public:
+    bool fieldLayoutCalibrated() const { return fieldLayoutCalibrated_; }
+
+private:
 
     uintptr_t moduleBase_ = 0;
     size_t moduleSize_ = 0;

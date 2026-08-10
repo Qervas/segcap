@@ -216,6 +216,7 @@ private:
     uint64_t visibilityTested_ = 0;
     uint64_t visibilityHits_ = 0;
     uint64_t slotsReleased_ = 0;
+    uint64_t staleDropped_ = 0;   // marked objects that were destroyed under us
 
     // Rebuilt and republished whenever the slot table changes. Guarded by
     // identityMutex_ because the render thread reads it while the marking

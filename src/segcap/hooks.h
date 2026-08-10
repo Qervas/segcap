@@ -311,6 +311,7 @@ private:
     // content frame does not start one (a stray marked object visible behind a
     // menu should not open a session).
     bool recording_ = false;
+    bool warnedForeignStencil_ = false;   // "that stencil is not ours", said once
     uint32_t consecutiveContent_ = 0;
     uint32_t consecutiveEmpty_ = 0;
     uint64_t recordedFrames_ = 0;

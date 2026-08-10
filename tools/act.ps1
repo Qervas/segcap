@@ -31,6 +31,10 @@ param(
     [double]$Scale = 0.62,
     # Click at this point in the window, physical pixels from its top-left.
     [int]$ClickX = -1,
+    # Same click, as a fraction of the window. Prefer these: pixel coordinates
+    # measured on one window size click empty space on any other.
+    [double]$ClickFx = -1,
+    [double]$ClickFy = -1,
     [int]$ClickY = -1
 )
 
@@ -112,6 +116,30 @@ if (-not $focused) {
     Write-Host "WARNING: could not focus $Process -- input will go elsewhere"
 }
 
+# Fractional click. Resolved here, inside the one process that is already
+# DPI-aware and already holds the window handle.
+#
+# The first version of this lived in the caller and shelled out to a nested
+# `powershell -Command` to fetch the window rect. The escaping broke, the query
+# returned 0x0, and every click in the sequence landed on (0,0) -- while the
+# script cheerfully printed a click for each step. Coordinates measured on one
+# window size are not portable, but neither is a rect fetched by a subshell
+# that can fail silently.
+if ($ClickFx -ge 0 -and $ClickFy -ge 0) {
+    $wr = New-Object Act+RECT
+    if (-not [Act]::GetWindowRect($g.MainWindowHandle, [ref]$wr)) {
+        throw "GetWindowRect failed; refusing to click at a guessed position"
+    }
+    $ww = $wr.Right - $wr.Left
+    $wh = $wr.Bottom - $wr.Top
+    if ($ww -le 0 -or $wh -le 0) {
+        throw "window measured ${ww}x${wh}; refusing to click at a guessed position"
+    }
+    $ClickX = [int]($ww * $ClickFx)
+    $ClickY = [int]($wh * $ClickFy)
+    Write-Host "fractional click ($ClickFx, $ClickFy) of ${ww}x${wh}"
+}
+
 if ($ClickX -ge 0 -and $ClickY -ge 0) {
     [Act]::ClickAt($g.MainWindowHandle, $ClickX, $ClickY)
     Write-Host "clicked at window-relative ($ClickX, $ClickY)"
@@ -149,6 +177,17 @@ Start-Sleep -Seconds $Wait
 $r = New-Object Act+RECT
 [Act]::GetWindowRect($g.MainWindowHandle, [ref]$r) | Out-Null
 $w = $r.Right - $r.Left; $h = $r.Bottom - $r.Top
+
+# A window can legitimately measure 0x0 for a moment -- inZOI's handle goes
+# invalid while a save loads and the swapchain is rebuilt. Constructing a
+# Bitmap with those dimensions throws "Parameter is not valid", which killed
+# the whole driving script mid-sequence and left the game running unattended.
+# The screenshot is diagnostic; failing to take one is not worth aborting for.
+if ($w -le 0 -or $h -le 0) {
+    Write-Host "shot: SKIPPED -- window measured ${w}x${h} (loading or minimised?)"
+    return
+}
+
 $bmp = New-Object System.Drawing.Bitmap $w, $h
 $gr = [System.Drawing.Graphics]::FromImage($bmp)
 $gr.CopyFromScreen($r.Left, $r.Top, 0, 0, $bmp.Size)

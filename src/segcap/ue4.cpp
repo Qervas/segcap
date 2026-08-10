@@ -852,6 +852,13 @@ void Engine::ProbeVTablePrologues(int knownIndex) {
     }
 }
 
+bool Engine::StillLive(void* obj, int32_t index, int32_t serial) const {
+    if (!obj) return false;
+    ObjectRef ref;
+    if (!GetObject(index, ref)) return false;
+    return ref.object == obj && ref.serialNumber == serial;
+}
+
 bool Engine::CalibrateFieldLayout() {
     if (fieldLayoutCalibrated_) return true;
     if (!nameBlocks_) return false;
