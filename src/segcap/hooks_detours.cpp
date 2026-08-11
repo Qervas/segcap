@@ -59,7 +59,32 @@ void STDMETHODCALLTYPE Hooks::ExecuteCommandLists_(ID3D12CommandQueue* self, UIN
             }
         }
     }
+    // Claim any injected copies carried by these lists BEFORE forwarding.
+    //
+    // Taken first because a Reset on another thread could otherwise steal the
+    // token out from under us; signalled AFTER, because a fence signalled before
+    // ExecuteCommandLists can complete ahead of the copy and Drain would map a
+    // buffer the GPU has not written yet.
+    Readback::InjectToken claimed[8];
+    UINT claimedCount = 0;
+    if (h.foreignInject_ && lists && count) {
+        std::lock_guard<std::mutex> lock(h.listMutex_);
+        for (UINT i = 0; i < count && claimedCount < 8; ++i) {
+            auto it = h.listState_.find(reinterpret_cast<ID3D12GraphicsCommandList*>(lists[i]));
+            if (it == h.listState_.end() || !it->second.pendingToken.valid) continue;
+            claimed[claimedCount++] = it->second.pendingToken;
+            // Cleared so a list submitted twice does not signal the same slot
+            // twice -- the second signal would retire a slot whose buffer is
+            // about to be overwritten by the re-execution.
+            it->second.pendingToken = Readback::InjectToken{};
+        }
+    }
+
     h.origExecute_(self, count, lists);
+
+    for (UINT i = 0; i < claimedCount; ++i) {
+        if (h.maskInjectRing_.NotifySubmitted(self, claimed[i])) ++h.injSubmitted_;
+    }
 }
 void STDMETHODCALLTYPE Hooks::CreateRenderTargetView_(ID3D12Device* self, ID3D12Resource* res,
                                                       const D3D12_RENDER_TARGET_VIEW_DESC* desc,
@@ -127,6 +152,17 @@ void STDMETHODCALLTYPE Hooks::OMSetRenderTargets_(ID3D12GraphicsCommandList* sel
 void STDMETHODCALLTYPE Hooks::ResourceBarrier_(ID3D12GraphicsCommandList* self, UINT count,
                                                const D3D12_RESOURCE_BARRIER* barriers) {
     Hooks& h = Get();
+
+    // Read the injection gate FIRST and without a lock. This is the hottest hook
+    // in the process -- UE calls it from every parallel command-list recording
+    // thread -- and when nothing is armed (Stray always, inZOI until the id
+    // probe converges) the entire added cost is this load and a branch.
+    ID3D12Resource* const want = h.injectTarget_.load(std::memory_order_relaxed);
+
+    bool inject = false;
+    D3D12_RESOURCE_STATES injectState = D3D12_RESOURCE_STATE_COMMON;
+    UINT injectSub = 0;
+
     if (barriers) {
         std::lock_guard<std::mutex> lock(h.mutex_);
         for (UINT i = 0; i < count; ++i) {
@@ -138,9 +174,120 @@ void STDMETHODCALLTYPE Hooks::ResourceBarrier_(ID3D12GraphicsCommandList* self, 
             // debug-layer error at best and a GPU hang at worst.
             h.resourceState_[b.Transition.pResource] = b.Transition.StateAfter;
             ++h.barriersSeen_[b.Transition.pResource];
+
+            if (!want || b.Transition.pResource != want || inject) continue;
+            ++h.injAttempts_;
+
+            // A BEGIN_ONLY split barrier leaves the subresource neither readable
+            // nor writable until its matching END_ONLY, and the only legal
+            // intervening barrier is that END_ONLY. Injecting into that window
+            // is a device removal.
+            if (b.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE) {
+                ++h.injRefusedFlags_;
+                continue;
+            }
+            // Mirror the subresource; anything else would invent a StateBefore
+            // for subresources this barrier did not name.
+            if (b.Transition.Subresource != 0 &&
+                b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
+                ++h.injRefusedSubresource_;
+                continue;
+            }
+            // Only WRITE -> READ. Half of a render target's transitions go INTO a
+            // write state, and copying there captures the PREVIOUS frame or an
+            // undefined transient. The transition out of the export pass is the
+            // one moment the buffer is both finished and readable.
+            constexpr D3D12_RESOURCE_STATES kWrite =
+                D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
+                D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_STREAM_OUT |
+                D3D12_RESOURCE_STATE_RESOLVE_DEST | D3D12_RESOURCE_STATE_COPY_DEST;
+            if ((b.Transition.StateBefore & kWrite) == 0 ||
+                (b.Transition.StateAfter & kWrite) != 0) {
+                ++h.injRefusedNotWriteToRead_;
+                continue;
+            }
+            inject = true;
+            injectState = b.Transition.StateAfter;
+            injectSub = b.Transition.Subresource;
         }
     }
+
+    // Forward the game's barrier BEFORE recording ours, so the state we declare
+    // is genuinely the state now established in this list. mutex_ is released by
+    // here on purpose: it must never be held across a D3D12 call, or every
+    // recording thread in the game serialises on us.
     h.origBarrier_(self, count, barriers);
+
+    if (inject) h.TryInjectCopy(self, want, injectState, injectSub);
+}
+
+// Render-pass nesting is tracked THREAD-LOCAL, not in a shared map.
+//
+// A D3D12 command list is a single-threaded object: its BeginRenderPass,
+// EndRenderPass, ResourceBarrier and CopyTextureRegion all happen on the one
+// thread currently recording it. So "am I inside a render pass on this list" and
+// "am I inside a render pass on this thread" are the same question, and the
+// thread-local answer needs no lock and no hash lookup.
+//
+// The first version used a global mutex plus an unordered_map lookup on every
+// BeginRenderPass and EndRenderPass. UE records with many parallel translate
+// threads and issues many passes per frame, so that serialised the engine's
+// hottest path through one lock -- and inZOI died in DRY-RUN mode, which records
+// no GPU work at all, i.e. the instrumentation was the problem rather than
+// anything it was instrumenting.
+thread_local uint32_t g_renderPassDepth = 0;
+
+void STDMETHODCALLTYPE Hooks::BeginRenderPass_(ID3D12GraphicsCommandList4* self,
+                                               UINT numRenderTargets, const void* renderTargets,
+                                               const void* depthStencil, UINT flags) {
+    ++g_renderPassDepth;
+    Get().origBeginRenderPass_(self, numRenderTargets, renderTargets, depthStencil, flags);
+}
+
+void STDMETHODCALLTYPE Hooks::EndRenderPass_(ID3D12GraphicsCommandList4* self) {
+    if (g_renderPassDepth) --g_renderPassDepth;
+    Get().origEndRenderPass_(self);
+}
+
+void Hooks::TryInjectCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* target,
+                          D3D12_RESOURCE_STATES stateAfter, UINT subresource) {
+    // Inside a render pass, ResourceBarrier is legal but CopyTextureRegion makes
+    // the runtime remove the command list -- which surfaces as the GAME's own
+    // Close() failing and UE turning that into a fatal check. So the barrier
+    // reaching us is not evidence the copy is safe here.
+    if (g_renderPassDepth > 0) {
+        ++injRefusedRenderPass_;
+        return;
+    }
+
+    if (injectDryRun_) {
+        if (injRecorded_ < 4) {
+            LogWarn("inject DRY RUN: would copy %p on list %p at StateAfter=0x%X sub=%u "
+                    "(no GPU work recorded)",
+                    static_cast<void*>(target), static_cast<void*>(list),
+                    static_cast<unsigned>(stateAfter), subresource);
+        }
+        ++injRecorded_;
+        return;
+    }
+
+    const Readback::InjectToken token = maskInjectRing_.RecordInto(
+        list, target, stateAfter, subresource,
+        injectFrame_.load(std::memory_order_relaxed), origBarrier_);
+    if (!token.valid) {
+        ++injRefusedNoSlot_;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(listMutex_);
+        listState_[list].pendingToken = token;
+    }
+    ++injRecorded_;
+    if (injRecorded_ == 1) {
+        LogWarn("inject: FIRST copy recorded into the game's own command list %p "
+                "(StateBefore=0x%X taken from the game's barrier, not from our shadow)",
+                static_cast<void*>(list), static_cast<unsigned>(stateAfter));
+    }
 }
 // Resources carry an initial state that no ResourceBarrier ever announces. A
 // depth buffer created in DEPTH_WRITE and never transitioned would otherwise

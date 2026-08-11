@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <vector>
 
 namespace segcap {
@@ -73,6 +74,48 @@ public:
     // signalled are simply left for a later call.
     void Drain(const MaskCallback& onMask);
 
+    // ---- foreign mode: record into a command list we do not own -------------
+    //
+    // The owned path above declares a StateBefore taken from our own resource
+    // shadow. That shadow cannot be trusted on UE5: it updates when a barrier is
+    // RECORDED while the GPU executes later, and the RDG transient allocator uses
+    // placed resources that alias, so a resource inherits state records left by a
+    // previous tenant of its address. inZOI died twice on that, both times with
+    // the "we have observed a barrier for this resource" guard satisfied.
+    //
+    // Foreign mode removes the guess entirely. Standing inside the game's own
+    // ResourceBarrier call, StateAfter is declared in the struct in front of us,
+    // so our StateBefore is that value BY CONSTRUCTION -- aliasing and staleness
+    // cannot break an equality we copied rather than inferred. The runtime
+    // validates transitions at ExecuteCommandLists and removes the device on a
+    // mismatch; this makes a mismatch impossible rather than unlikely.
+    //
+    // Per-slot fences, not the shared one: values are assigned when the game
+    // submits, not when we record, so a single monotonic counter would make
+    // Drain's "fenceValue <= completed" test unsound.
+    struct InjectToken {
+        uint32_t slot = 0;
+        bool valid = false;
+    };
+
+    using RecordBarrierFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT,
+                                                     const D3D12_RESOURCE_BARRIER*);
+
+    // Records transition -> copy -> transition-back onto `list`. `stateAfter` and
+    // `subresource` MUST be copied from the game barrier we are standing in.
+    // Returns an invalid token if no slot is free or the ring is not prepared.
+    InjectToken RecordInto(ID3D12GraphicsCommandList* list, ID3D12Resource* target,
+                           D3D12_RESOURCE_STATES stateAfter, UINT subresource,
+                           uint64_t frameIndex, RecordBarrierFn origBarrier);
+
+    // The list carrying `token` has been submitted on `queue`. Signals that
+    // slot's fence AFTER the caller has forwarded ExecuteCommandLists.
+    bool NotifySubmitted(ID3D12CommandQueue* queue, const InjectToken& token);
+
+    // A recorded token whose list was never submitted would hold its slot for
+    // ever. Reclaims any slot recorded more than `maxAge` frames ago.
+    void ReclaimStaleRecordings(uint64_t currentFrame, uint64_t maxAge);
+
     void Shutdown();
 
     uint64_t submitted() const { return submitted_; }
@@ -87,12 +130,26 @@ private:
         uint64_t fenceValue = 0;
         uint64_t frameIndex = 0;
         bool pending = false;
+        // ---- foreign mode only ----
+        // Recorded into a game list but not yet submitted. Distinct from
+        // `pending`, which means submitted and awaiting the GPU: a recorded slot
+        // must not be reused, but its fence has no value yet because the game
+        // chooses when (and whether) to submit.
+        bool recorded = false;
+        uint64_t recordedFrame = 0;
+        ID3D12Fence* ownFence = nullptr;   // per-slot; see the note on RecordInto
     };
 
     void ReleaseResources();
 
     Slot slots_[kRingDepth];
     ID3D12Fence* fence_ = nullptr;
+    // Foreign mode is entered from ResourceBarrier, which UE calls from many
+    // parallel command-list recording threads at once. The owned path is
+    // Present-thread-only and takes no lock; this one must.
+    std::mutex foreignMutex_;
+    bool foreignMode_ = false;
+    uint64_t foreignSignalValue_ = 0;
     ID3D12Device* device_ = nullptr;
     ID3D12Resource* preparedFor_ = nullptr;
 

@@ -135,6 +135,26 @@ public:
     // game, so it is opt-in.
     void SetIntervene(bool on);
 
+    // ---- foreign-list copy injection ---------------------------------------
+    //
+    // Record our copy into the GAME's command list, at the moment the game
+    // itself transitions the buffer out of a write state. There StateAfter is
+    // declared in the barrier struct we are standing in, so our StateBefore is
+    // that value by construction -- which is the only way to be right about the
+    // state of a UE5 transient resource from outside the engine.
+    //
+    // OFF by default and gated twice: this marker, and the resource having been
+    // PROVEN to carry our leased slots. Stray reaches neither, and without the
+    // marker the extra vtable hooks are not installed at all, so its process
+    // gains no new code on any hot path.
+    void SetForeignInject(bool on) { foreignInject_ = on; }
+    bool foreignInject() const { return foreignInject_; }
+    // Observe render passes, barrier flags and list types, and log what WOULD
+    // have been injected -- without recording a single GPU command. Answers
+    // "does this title use BeginRenderPass" before that question can remove the
+    // device.
+    void SetInjectDryRun(bool on) { injectDryRun_ = on; }
+
     // Capture profile, read from marker files at startup.
     //
     // These are a genuine trade-off rather than a tuning knob, which is why
@@ -208,6 +228,16 @@ private:
     static void STDMETHODCALLTYPE Barrier_(ID3D12GraphicsCommandList7* self,
                                            UINT32 numGroups,
                                            const D3D12_BARRIER_GROUP* groups);
+    // Render-pass scope. CopyTextureRegion recorded between BeginRenderPass and
+    // EndRenderPass causes the runtime to REMOVE THE COMMAND LIST, while
+    // ResourceBarrier is explicitly legal there -- so the injection point can be
+    // a place where the barrier is fine and the copy is fatal. Tracked per list
+    // so injection can refuse inside a pass.
+    static void STDMETHODCALLTYPE BeginRenderPass_(ID3D12GraphicsCommandList4* self,
+                                                   UINT numRenderTargets,
+                                                   const void* renderTargets,
+                                                   const void* depthStencil, UINT flags);
+    static void STDMETHODCALLTYPE EndRenderPass_(ID3D12GraphicsCommandList4* self);
     static HRESULT STDMETHODCALLTYPE CreateCommittedResource_(
         ID3D12Device* self, const D3D12_HEAP_PROPERTIES* heapProps,
         D3D12_HEAP_FLAGS heapFlags, const D3D12_RESOURCE_DESC* desc,
@@ -465,6 +495,53 @@ private:
     // resource nobody writes to any more.
     uint32_t maskSourceMissing_ = 0;
     static constexpr uint32_t kMaskSourceMissingLimit = 120;
+
+    // ---- foreign-list copy injection ---------------------------------------
+    bool foreignInject_ = false;
+    bool injectDryRun_ = false;
+    Readback maskInjectRing_;
+    // The one resource injection is permitted to touch, published by OnPresent
+    // and read by ResourceBarrier_ on every recording thread. An atomic rather
+    // than a lock because ResourceBarrier is the hottest hook in the process and
+    // is called concurrently from every UE parallel-translate thread; when this
+    // is null -- Stray always, inZOI until the probe converges -- the added cost
+    // is one relaxed load and a branch not taken.
+    std::atomic<ID3D12Resource*> injectTarget_{nullptr};
+    std::atomic<uint64_t> injectFrame_{0};
+
+    // Only the injected-copy token lives here. Render-pass nesting is
+    // thread-local (see hooks_detours.cpp): a command list is a single-threaded
+    // object, so a shared map for that was pure contention on the engine's
+    // hottest path.
+    struct ListState {
+        Readback::InjectToken pendingToken{};
+    };
+    // Separate from mutex_ and NEVER nested with it: mutex_ is already held
+    // across the barrier bookkeeping loop, and taking a second lock there would
+    // serialise every recording thread in the game on us.
+    std::mutex listMutex_;
+    std::unordered_map<ID3D12GraphicsCommandList*, ListState> listState_;
+
+    using BeginRenderPassFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList4*, UINT,
+                                                       const void*, const void*, UINT);
+    using EndRenderPassFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList4*);
+    BeginRenderPassFn origBeginRenderPass_ = nullptr;
+    EndRenderPassFn origEndRenderPass_ = nullptr;
+    bool renderPassHooked_ = false;
+
+    // Why an injection was declined, so a run that produces nothing says which
+    // precondition failed instead of going quiet.
+    uint64_t injAttempts_ = 0;
+    uint64_t injRefusedRenderPass_ = 0;
+    uint64_t injRefusedFlags_ = 0;
+    uint64_t injRefusedSubresource_ = 0;
+    uint64_t injRefusedNotWriteToRead_ = 0;
+    uint64_t injRefusedNoSlot_ = 0;
+    uint64_t injRecorded_ = 0;
+    uint64_t injSubmitted_ = 0;
+    bool loggedInjectArmed_ = false;
+    void TryInjectCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* target,
+                       D3D12_RESOURCE_STATES stateAfter, UINT subresource);
 
     // ---- ground truth by intervention --------------------------------------
     //

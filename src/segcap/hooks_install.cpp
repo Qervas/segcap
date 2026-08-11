@@ -36,6 +36,13 @@ constexpr int kResourceBarrierSlot = 26;     // ID3D12GraphicsCommandList::Resou
 // runtime before trusting slot 80. Guessing a vtable index is exactly the
 // mistake that cost days on ProcessEvent; this one is derived and verified.
 constexpr int kEnhancedBarrierSlot = 80;
+
+// ID3D12GraphicsCommandList4 begins at 68 on the same arithmetic that anchors
+// kEnhancedBarrierSlot: GCL4 occupies 68..76 (nine methods, BeginRenderPass and
+// EndRenderPass first), GCL5 77..78, GCL6 79, GCL7 80. That the chain lands
+// exactly on the Barrier slot already proven in this file is the check.
+constexpr int kBeginRenderPassSlot = 68;
+constexpr int kEndRenderPassSlot = 69;
 constexpr int kOMSetRenderTargetsSlot = 46;  // ID3D12GraphicsCommandList::OMSetRenderTargets
 constexpr int kClearDSVSlot = 47;            // ID3D12GraphicsCommandList::ClearDepthStencilView
 void** VTableOf(void* obj) { return *reinterpret_cast<void***>(obj); }
@@ -149,6 +156,49 @@ bool Hooks::AcquireVTables() {
         } else {
             LogInfo("ID3D12GraphicsCommandList7 not available; this runtime predates "
                     "Enhanced Barriers, so ResourceBarrier sees everything");
+        }
+
+        // Render-pass scope, installed ONLY when foreign-list injection is
+        // enabled. CopyTextureRegion recorded between BeginRenderPass and
+        // EndRenderPass makes the runtime remove the command list, while
+        // ResourceBarrier is legal there -- so without this the injection point
+        // can be somewhere the barrier is fine and the copy is fatal.
+        //
+        // Gated so a title that never asks for injection (Stray) gains no extra
+        // vtable patches and no new code on any hot path at all.
+        if (foreignInject_) {
+            ID3D12GraphicsCommandList4* gcl4 = nullptr;
+            if (SUCCEEDED(dummyList->QueryInterface(IID_PPV_ARGS(&gcl4))) && gcl4) {
+                auto** vt4 = *reinterpret_cast<void***>(gcl4);
+                // Same anchor discipline as above: both interfaces are the same
+                // object and must share a vtable prefix. Not skipped just
+                // because slot 80 already worked -- GCL4 is a different QI.
+                const bool anchorOk = vt4[kResourceBarrierSlot] == listVT[kResourceBarrierSlot];
+                if (!anchorOk) {
+                    LogError("GraphicsCommandList4 slot %d disagrees with the base list -- "
+                             "refusing to hook render-pass slots on unconfirmed numbering",
+                             kResourceBarrierSlot);
+                } else if (CreateHook(vt4, kBeginRenderPassSlot,
+                                      reinterpret_cast<void*>(&Hooks::BeginRenderPass_),
+                                      reinterpret_cast<void**>(&origBeginRenderPass_)) &&
+                           CreateHook(vt4, kEndRenderPassSlot,
+                                      reinterpret_cast<void*>(&Hooks::EndRenderPass_),
+                                      reinterpret_cast<void**>(&origEndRenderPass_))) {
+                    renderPassHooked_ = true;
+                    LogInfo("render-pass scope hooked (slots %d/%d) -- copy injection will "
+                            "refuse inside a render pass",
+                            kBeginRenderPassSlot, kEndRenderPassSlot);
+                } else {
+                    LogError("failed to hook BeginRenderPass/EndRenderPass; injection will "
+                             "stay disabled because a copy inside a render pass removes the "
+                             "command list");
+                }
+                gcl4->Release();
+            } else {
+                LogWarn("ID3D12GraphicsCommandList4 not available -- no render passes exist "
+                        "on this runtime, so injection cannot hit that hazard");
+                renderPassHooked_ = true;   // hazard cannot occur
+            }
         }
     } else {
         LogError("could not create dummy command allocator/list");

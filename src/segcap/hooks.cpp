@@ -84,6 +84,21 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     DrainInfoQueue();
 
     readback_.Drain([this](const MaskFrame& f) { OnMaskReady(f); });
+    if (foreignInject_) {
+        injectFrame_.store(frameIndex_, std::memory_order_relaxed);
+        // One ring serves both phases. While the probe is still deciding which
+        // buffer carries our ids, completed copies go to the channel test; once
+        // a buffer is proven, the same ring feeds the mask writer.
+        if (maskSource_) {
+            maskInjectRing_.Drain([this](const MaskFrame& f) { OnMaskReady(f); });
+        } else {
+            maskInjectRing_.Drain([this](const MaskFrame& f) { OnIdBufferReady(f); });
+        }
+        // A list we recorded into can be Reset or simply abandoned without ever
+        // being submitted; without reclaiming, the ring starves to nothing and
+        // capture stops with no error anywhere.
+        maskInjectRing_.ReclaimStaleRecordings(frameIndex_, 240);
+    }
 
     // Election runs every frame too. It is cheap (a handful of targets) and the
     // elected target can legitimately change -- resolution changes, or a pass
@@ -216,7 +231,15 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
         // Waiting costs nothing: a render target the game actually uses gets
         // transitioned within a frame or two, so a candidate that never does is
         // one we could not have copied safely anyway.
-        if (idTarget_) {
+        // With foreign injection on, the probe does NOT copy at Present either.
+        // The probe's own copy is what killed inZOI at t=46.8s in the dry run --
+        // the same unknowable-state problem as the capture path, just reached
+        // earlier. One rule for the whole process: on this engine, every copy
+        // out of a transient resource is recorded into the game's own list.
+        // OnPresent publishes the probe candidate as injectTarget_ below.
+        if (foreignInject_) {
+            // nothing to do here; injection drives it
+        } else if (idTarget_) {
             const uint64_t candidateBarriers = BarriersSeenFor(idTarget_);
             if (candidateBarriers == 0) {
                 if (++idBarrierWait_ > kIdBarrierWaitFrames) {
@@ -433,7 +456,51 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
                  static_cast<void*>(maskSource_));
     }
 
-    if (!censusOnly_ && !noReadback_ && canCopy && copySource && device_ && queue_) {
+    // Foreign-list injection takes over ONLY for the proven id buffer. Stray and
+    // the depth-stencil path below are byte-for-byte unchanged.
+    //
+    // Note it does NOT require `canCopy`: that gate exists because the
+    // Present-time path has to declare a StateBefore from our shadow, and it
+    // refuses when the shadow has no evidence. Injection declares a StateBefore
+    // copied out of the game's own barrier, so the gate it was protecting
+    // against does not apply -- the arm/census/noReadback conditions still do.
+    // Injection covers BOTH phases: the probe's candidate before a buffer is
+    // proven, and the proven buffer afterwards. Whichever it is, the copy is
+    // recorded into the game's list rather than issued here.
+    ID3D12Resource* const injectWant = maskSource_ ? maskSource_ : idTarget_;
+    // The probe reads colour targets (plane 0); so does the proven id buffer.
+    const UINT injectPlane = maskSource_ ? copyPlane : 0u;
+    // Probing must not wait for the capture arm -- it has to converge BEFORE
+    // capture can begin, which is the ordering the whole id-buffer route needs.
+    const bool injectArmOk = maskSource_ ? armReady : true;
+
+    const bool useInject = foreignInject_ && injectWant &&
+                           (maskSource_ ? copySource == maskSource_ : true);
+    if (useInject) {
+        if (!censusOnly_ && !noReadback_ && injectArmOk && device_ &&
+            maskInjectRing_.Prepare(device_, injectWant, injectPlane)) {
+            // Publish the gate ResourceBarrier_ reads. Written every frame so a
+            // dropped maskSource_ (staleness, aliasing, recycling) disarms
+            // injection on the very next Present.
+            injectTarget_.store(injectWant, std::memory_order_relaxed);
+            if (!loggedInjectArmed_) {
+                loggedInjectArmed_ = true;
+                LogWarn("inject ARMED for %p (%s) -- the copy will be recorded into the "
+                        "game's own command list, with StateBefore taken from the game's "
+                        "barrier rather than from our shadow",
+                        static_cast<void*>(injectWant),
+                        maskSource_ ? "proven id buffer" : "probe candidate");
+            }
+        } else {
+            injectTarget_.store(nullptr, std::memory_order_relaxed);
+        }
+        if (auto sc = GetMarker().publishedSidecar()) {
+            sidecarHistory_.emplace_back(frameIndex_, std::move(sc));
+            while (sidecarHistory_.size() > 16) sidecarHistory_.pop_front();
+        }
+        frameStamps_.emplace_back(frameIndex_, NowMs());
+        while (frameStamps_.size() > 16) frameStamps_.pop_front();
+    } else if (!censusOnly_ && !noReadback_ && canCopy && copySource && device_ && queue_) {
         if (readback_.Prepare(device_, copySource, copyPlane)) {
             readback_.Enqueue(queue_, copySource, StateOf(copySource), frameIndex_);
 
@@ -487,6 +554,18 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
             readback_.submitted(), readback_.delivered(), readback_.dropped());
     LogInfo("    recording=%s  captured=%llu  skipped(menu/empty)=%llu",
             recording_ ? "YES" : "no", recordedFrames_, skippedFrames_);
+    if (foreignInject_) {
+        // Every refusal reason, so a run that injects nothing says WHICH
+        // precondition failed instead of going quiet. Silence has cost this
+        // project several runs.
+        LogInfo("    inject: attempts=%llu recorded=%llu submitted=%llu | refused: "
+                "renderpass=%llu flags=%llu subres=%llu not-write-to-read=%llu noslot=%llu "
+                "| ring submitted=%llu delivered=%llu dropped=%llu",
+                injAttempts_, injRecorded_, injSubmitted_, injRefusedRenderPass_,
+                injRefusedFlags_, injRefusedSubresource_, injRefusedNotWriteToRead_,
+                injRefusedNoSlot_, maskInjectRing_.submitted(), maskInjectRing_.delivered(),
+                maskInjectRing_.dropped());
+    }
 
     for (const TargetFingerprint& t : snapshot) {
         // Only depth-stencil targets matter for the mask route; logging every

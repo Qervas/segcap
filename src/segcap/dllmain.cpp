@@ -221,6 +221,31 @@ DWORD WINAPI InitThread(LPVOID) {
         // exactly its pixels to vanish. This MUTATES the game (it clears one
         // primitive's CustomDepth flag), so it is opt-in like segcap.mark, and
         // it is the only check here that a coherently-wrong mask cannot pass.
+        // Foreign-list copy injection. Read BEFORE Hooks::Install(), because it
+        // decides whether the render-pass hooks are installed at all.
+        //
+        // Two markers, and the dry run exists for a specific reason: whether
+        // UE5.6 uses BeginRenderPass on this path is unknown, and finding out by
+        // recording a copy inside one removes the command list. The dry run
+        // answers it by observation, at zero risk.
+        std::wstring inj(marker);
+        const size_t dot7 = inj.find_last_of(L'.');
+        if (dot7 != std::wstring::npos) inj = inj.substr(0, dot7);
+        const std::wstring injDry = inj + L".injectdry";
+        const std::wstring injArm = inj + L".inject";
+        if (GetFileAttributesW(injDry.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            segcap::Hooks::Get().SetForeignInject(true);
+            segcap::Hooks::Get().SetInjectDryRun(true);
+            segcap::LogWarn("FOREIGN-LIST INJECTION: DRY RUN -- observes render passes and "
+                            "barrier shapes and logs what WOULD be injected. No GPU work is "
+                            "recorded into any game command list.");
+        } else if (GetFileAttributesW(injArm.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            segcap::Hooks::Get().SetForeignInject(true);
+            segcap::Hooks::Get().SetInjectDryRun(false);
+            segcap::LogWarn("FOREIGN-LIST INJECTION ARMED -- copies will be recorded into the "
+                            "game's own command lists");
+        }
+
         std::wstring gt(marker);
         const size_t dot6 = gt.find_last_of(L'.');
         if (dot6 != std::wstring::npos) gt = gt.substr(0, dot6);

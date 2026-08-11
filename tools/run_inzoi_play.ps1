@@ -68,7 +68,16 @@ param(
     # list at a point where its state is known exactly -- see HANDOFF.md. Until
     # then this stays opt-in for diagnosis, because it identifies the right buffer
     # and is the only thing that does.
-    [switch]$IdBuf
+    [switch]$IdBuf,
+    # Observe render passes and barrier shapes around the id buffer and log what
+    # WOULD be injected, recording nothing. Answers "does this title use
+    # BeginRenderPass on this path" -- which matters because a CopyTextureRegion
+    # recorded inside a render pass makes the runtime remove the command list.
+    [switch]$InjectDry,
+    # Record the copy into the game's own command list, taking StateBefore from
+    # the game's own barrier instead of from our resource shadow. Implies -IdBuf,
+    # since injection only ever targets the buffer the probe proved.
+    [switch]$Inject
 )
 
 $ErrorActionPreference = "Stop"
@@ -132,6 +141,16 @@ if ($D3DDebug) {
     Write-Host "[play] D3D12 VALIDATION LAYER ON -- diagnosis run, expect it to be slow"
 } else {
     Remove-Item $ddMarker -ErrorAction SilentlyContinue
+}
+
+if ($InjectDry) {
+    Set-Content -Path (Join-Path $bin "segcap.injectdry") -Value "1" -NoNewline
+    Write-Host "[play] INJECT DRY RUN -- observes render passes and barrier shapes only"
+    $IdBuf = $true
+} elseif ($Inject) {
+    Set-Content -Path (Join-Path $bin "segcap.inject") -Value "1" -NoNewline
+    Write-Host "[play] INJECT ARMED -- copies recorded into the game's own command lists"
+    $IdBuf = $true
 }
 
 $idbMarker = Join-Path $bin "segcap.idbuf"

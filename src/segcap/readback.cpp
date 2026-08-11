@@ -124,6 +124,20 @@ bool Readback::Prepare(ID3D12Device* device, ID3D12Resource* target, uint32_t pl
         return false;
     }
 
+    // One fence per slot for foreign mode. Cheap, and it makes each slot's
+    // completion test exact rather than relying on a shared ordering the game
+    // controls. Created unconditionally so a ring can be switched into foreign
+    // mode without a re-Prepare.
+    for (uint32_t i = 0; i < kRingDepth; ++i) {
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                       IID_PPV_ARGS(&slots_[i].ownFence)))) {
+            LogError("readback: per-slot CreateFence failed for slot %u", i);
+            ReleaseResources();
+            return false;
+        }
+    }
+    foreignSignalValue_ = 0;
+
     nextFenceValue_ = 1;
     nextSlot_ = 0;
     readyForLayout_ = true;
@@ -200,6 +214,112 @@ bool Readback::Enqueue(ID3D12CommandQueue* queue, ID3D12Resource* target,
     return true;
 }
 
+Readback::InjectToken Readback::RecordInto(ID3D12GraphicsCommandList* list,
+                                           ID3D12Resource* target,
+                                           D3D12_RESOURCE_STATES stateAfter, UINT subresource,
+                                           uint64_t frameIndex, RecordBarrierFn origBarrier) {
+    InjectToken token;
+    if (!list || !target || !readyForLayout_ || !origBarrier) return token;
+
+    std::lock_guard<std::mutex> lock(foreignMutex_);
+
+    // Find a slot that is neither awaiting the GPU nor already recorded into
+    // some list we have not seen submitted yet.
+    uint32_t chosen = kRingDepth;
+    for (uint32_t i = 0; i < kRingDepth; ++i) {
+        const uint32_t idx = (nextSlot_ + i) % kRingDepth;
+        if (!slots_[idx].pending && !slots_[idx].recorded) { chosen = idx; break; }
+    }
+    if (chosen == kRingDepth) {
+        ++dropped_;
+        return token;
+    }
+    Slot& s = slots_[chosen];
+    if (!s.buffer || !s.ownFence) return token;
+
+    // The state we are about to declare is the state the game's own barrier just
+    // established, in this same list, one call ago. That is the whole point: the
+    // runtime validates StateBefore against the previous transition's StateAfter
+    // at ExecuteCommandLists and removes the device on a mismatch, and an
+    // equality copied out of the caller's struct cannot be wrong.
+    const bool needsTransition = (stateAfter & D3D12_RESOURCE_STATE_COPY_SOURCE) == 0;
+
+    D3D12_RESOURCE_BARRIER toCopy = {};
+    toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toCopy.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    toCopy.Transition.pResource = target;
+    // MIRRORED from the game's barrier, never ALL_SUBRESOURCES by default. The
+    // owned path hardcodes ALL_SUBRESOURCES while copying a single plane, which
+    // invents a StateBefore for every subresource the game did not name -- the
+    // exact class of bug this mode exists to escape.
+    toCopy.Transition.Subresource = subresource;
+    toCopy.Transition.StateBefore = stateAfter;
+    toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    if (needsTransition) origBarrier(list, 1, &toCopy);
+
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource = target;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = planeSlice_;
+
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = s.buffer;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = footprint_;
+
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    // Put it back exactly where the game left it, so the game's own subsequent
+    // barriers still line up. Without this every later transition of this
+    // resource would mismatch and the device would be removed anyway.
+    if (needsTransition) {
+        D3D12_RESOURCE_BARRIER back = toCopy;
+        back.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        back.Transition.StateAfter = stateAfter;
+        origBarrier(list, 1, &back);
+    }
+
+    s.recorded = true;
+    s.recordedFrame = frameIndex;
+    s.frameIndex = frameIndex;
+    token.slot = chosen;
+    token.valid = true;
+    return token;
+}
+
+bool Readback::NotifySubmitted(ID3D12CommandQueue* queue, const InjectToken& token) {
+    if (!queue || !token.valid || token.slot >= kRingDepth) return false;
+    std::lock_guard<std::mutex> lock(foreignMutex_);
+    Slot& s = slots_[token.slot];
+    if (!s.recorded || !s.ownFence) return false;
+
+    // Per-slot fence. A single shared counter would be assigned at record time
+    // but signalled at submit time, and the game decides the submit order -- so
+    // "fenceValue <= completed" could pass for a slot whose copy had not run.
+    s.fenceValue = ++foreignSignalValue_;
+    if (FAILED(queue->Signal(s.ownFence, s.fenceValue))) return false;
+
+    s.recorded = false;
+    s.pending = true;
+    ++submitted_;
+    nextSlot_ = (token.slot + 1) % kRingDepth;
+    return true;
+}
+
+void Readback::ReclaimStaleRecordings(uint64_t currentFrame, uint64_t maxAge) {
+    std::lock_guard<std::mutex> lock(foreignMutex_);
+    for (uint32_t i = 0; i < kRingDepth; ++i) {
+        Slot& s = slots_[i];
+        // A list we recorded into may be Reset or simply abandoned without ever
+        // being submitted. Without this the slot is held for the rest of the
+        // process and the ring silently starves to nothing.
+        if (s.recorded && currentFrame > s.recordedFrame + maxAge) {
+            s.recorded = false;
+            ++dropped_;
+        }
+    }
+}
+
 void Readback::Drain(const MaskCallback& onMask) {
     if (!fence_) return;
 
@@ -209,7 +329,12 @@ void Readback::Drain(const MaskCallback& onMask) {
 
     for (uint32_t i = 0; i < kRingDepth; ++i) {
         Slot& s = slots_[i];
-        if (!s.pending || s.fenceValue > completed) continue;
+        if (!s.pending) continue;
+        // Foreign mode signals a per-slot fence, because the game decides submit
+        // order and a shared monotonic value would let one slot's completion
+        // vouch for another's.
+        const uint64_t done = s.ownFence ? s.ownFence->GetCompletedValue() : completed;
+        if (s.fenceValue > done) continue;
 
         void* mapped = nullptr;
         const D3D12_RANGE readRange = {0, static_cast<SIZE_T>(requiredSize_)};
@@ -242,6 +367,8 @@ void Readback::Drain(const MaskCallback& onMask) {
 void Readback::ReleaseResources() {
     for (uint32_t i = 0; i < kRingDepth; ++i) {
         Slot& s = slots_[i];
+        s.recorded = false;
+        SafeRelease(s.ownFence);
         SafeRelease(s.list);
         SafeRelease(s.allocator);
         SafeRelease(s.buffer);
