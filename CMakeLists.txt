@@ -69,9 +69,24 @@ set_target_properties(injector PROPERTIES
 # ---------------------------------------------------------------------------
 add_library(segcap SHARED
   src/segcap/dllmain.cpp
+  # hooks.cpp was 2332 lines doing hook installation, ten D3D12 detours, the
+  # resource-state shadow, target election, the id-buffer probe and mask writing.
+  # These remain ONE class Hooks across several translation units rather than
+  # becoming separate classes, deliberately: a single non-recursive mutex spans
+  # them in both directions (NoteResourceCreated and SnapshotTargets each erase
+  # the other's maps inside one lock, and that atomicity IS the address-recycling
+  # invariant), and the election reads state the capture path writes. Extracting
+  # classes would turn that documented coupling into lock-ordering rules and
+  # back-pointers rather than remove it. So hooks.h is untouched.
   src/segcap/hooks.cpp
+  src/segcap/hooks_install.cpp
+  src/segcap/hooks_detours.cpp
+  src/segcap/hooks_election.cpp
+  src/segcap/hooks_capture.cpp
+  src/segcap/hooks_idprobe.cpp
   src/segcap/readback.cpp
   src/segcap/ue4.cpp
+  src/segcap/ue4_processevent.cpp
   src/segcap/customdepth.cpp
   src/segcap/identity.cpp
   src/segcap/perception.cpp
