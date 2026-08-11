@@ -92,6 +92,16 @@ add_library(segcap SHARED
   src/segcap/perception.cpp
 )
 target_link_libraries(segcap PRIVATE minhook d3d12 dxgi psapi)
+
+# Ship a PDB even in Release. /Zi emits debug info without changing codegen --
+# /O2 /Ob2 still apply -- so this costs nothing at runtime and only a file on
+# disk. Earned the hard way: when inZOI crashed with segcap on the stack, there
+# was no PDB, so turning "segcap.dll+0xff17" into "hooks_detours.cpp:232" took
+# parsing the PE's .pdata table, matching string cross-references, and hand-
+# disassembling the function. With a PDB it is one command. Every crash from
+# here on symbolicates immediately.
+target_compile_options(segcap PRIVATE /Zi)
+target_link_options(segcap PRIVATE /DEBUG /OPT:REF /OPT:ICF)
 set_target_properties(segcap PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

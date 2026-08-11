@@ -420,8 +420,23 @@ private:
     // intend to copy from it; the counters record how often the game recycled
     // an address we were tracking, which is the signal that told us the
     // election had been scoring a destroyed resource.
+    // Drop every reference we own to a resource that has been DESTROYED, without
+    // calling Release on any of them. Once D3D12 has reissued an address, the
+    // object our AddRef referred to is gone and our count went with it; the
+    // pointer now names a live, game-owned resource. Releasing it then steals a
+    // reference the game still needs -- see the comment above pinnedTarget_.
+    void AbandonOwnedRefs(ID3D12Resource* dead, const char* why);
+
+    // OWNED, but only conditionally: see AbandonOwnedRefs. An AddRef on this
+    // pointer is worth nothing once the address has been recycled, so the ONLY
+    // safe response to a recycle is to forget it, never to release it.
     ID3D12Resource* pinnedTarget_ = nullptr;
     D3D12_RESOURCE_DESC electedDesc_ = {};
+    // Times the top-scoring candidate was refused because it was last seen in an
+    // earlier frame. A high count means evidence_ is outliving its resources.
+    uint64_t pinRefusedStale_ = 0;
+    // Times a recycled address forced us to abandon an owned reference.
+    uint64_t refsAbandoned_ = 0;
     uint64_t addressRecycles_ = 0;
     uint64_t electedRecycles_ = 0;
 

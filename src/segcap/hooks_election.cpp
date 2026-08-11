@@ -297,6 +297,14 @@ std::vector<TargetFingerprint> Hooks::SnapshotTargets() {
                         FormatName(acc.format), fresh.width, fresh.height,
                         FormatName(fresh.format), acc.framesSeen, addressRecycles_);
             }
+            // An identity change at a fixed address is address recycling seen
+            // from the other direction: same pointer, different resource. It is
+            // the same proof of destruction that NoteResourceCreated acts on, so
+            // it must drop our owned references the same way -- by forgetting
+            // them. This site was missed in the first pass at the inZOI crash;
+            // it did not fire in that run, but it is the identical stolen
+            // Release waiting for a run where the recycle is noticed here first.
+            AbandonOwnedRefs(kv.first, "the resource at this address changed identity");
             if (kv.first == electedTarget_) {
                 ++electedRecycles_;
                 LogWarn("the ELECTED target %p is the one that changed identity; "

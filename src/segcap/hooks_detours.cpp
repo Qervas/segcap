@@ -406,6 +406,14 @@ void Hooks::NoteResourceCreated(ID3D12Resource* res, const D3D12_RESOURCE_DESC& 
         // This is the identical bug we already fixed on the UObject side with
         // generational handles. Creation at a known address IS the generation
         // bump; it is observable, so use it rather than inventing one.
+        // BEFORE the bookkeeping: creation at this address proves the previous
+        // occupant was destroyed, so any reference we still hold to it is void.
+        // Forget those references without releasing them -- releasing would
+        // decrement the count of the resource being created right now. This runs
+        // unconditionally, not under the hadState/hadEvidence guard below: we can
+        // hold a pin on a resource whose maps have already been pruned.
+        h.AbandonOwnedRefs(res, "a new resource was created at this address");
+
         const size_t hadState = h.resourceState_.erase(res);
         const size_t hadBarriers = h.barriersSeen_.erase(res);
         const size_t hadLayout = h.textureLayout_.erase(res);

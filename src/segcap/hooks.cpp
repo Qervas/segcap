@@ -39,10 +39,70 @@ long long NowMs() {
     return static_cast<long long>(u.QuadPart / 10000ULL) - 11644473600000LL;
 }
 
-
-
-
 }  // namespace
+
+// ---- abandoning a reference to a destroyed resource -------------------------
+//
+// There are exactly two things you can do with an owned COM pointer, and the
+// usual one is wrong here.
+//
+// We AddRef two resources: the elected depth-stencil (pinnedTarget_) and the
+// proven id buffer (maskSource_). When D3D12 creates a NEW resource at an
+// address we hold, that is proof the old occupant was destroyed -- a live
+// reference makes address reuse impossible. So our count is already gone with
+// it, and the pointer now names somebody else's live object.
+//
+// Release() at that point does not free our reference. It decrements the GAME'S,
+// on a resource the game is still using. That is what killed inZOI at t=254.359:
+// we released 0x1DFA4016C40 thirty-one milliseconds after the game created it,
+// then faulted inside the NVIDIA driver while forwarding the game's own barrier
+// for that very resource (nvwgf2umx `test byte [r10+0x3c],1`, r10 = 0 because the
+// backing allocation was gone). The full chain is in the comment at the pin site.
+//
+// The correct response to "the object you referenced was destroyed" is to forget
+// the pointer. Never to release it.
+//
+// NOTE the deliberate omission: heap ALIASING is not destruction. An aliased
+// resource is still a live COM object and our reference is still genuinely ours,
+// so the alias path in NoteResourceCreated must keep releasing normally. Calling
+// this from there would leak.
+void Hooks::AbandonOwnedRefs(ID3D12Resource* dead, const char* why) {
+    if (!dead) return;
+
+    if (pinnedTarget_ == dead) {
+        ++refsAbandoned_;
+        LogWarn("abandoning (NOT releasing) our pin on %p: %s. The AddRef we took is "
+                "already gone with the object; releasing now would steal a reference "
+                "from the resource that inherited this address (abandon #%llu)",
+                static_cast<void*>(dead), why, refsAbandoned_);
+        pinnedTarget_ = nullptr;
+        electedDesc_ = {};
+    }
+
+    if (maskSource_ == dead) {
+        ++refsAbandoned_;
+        LogWarn("abandoning (NOT releasing) the id buffer %p: %s. Re-opening the probe "
+                "(abandon #%llu)",
+                static_cast<void*>(dead), why, refsAbandoned_);
+        maskSource_ = nullptr;
+        maskChannel_ = -1;
+        maskSourceMissing_ = 0;
+        idChannelFound_ = false;
+        idDumped_ = 0;
+        loggedIdExhausted_ = false;
+        idRejected_.clear();
+        warnedUnleasedIds_ = false;
+        warnedMaskSourceUnshadowed_ = false;
+    }
+
+    // Borrowed pointers -- no reference to abandon, but still dangling, and
+    // idTarget_ in particular was fed to Readback::Prepare -> GetDesc() every
+    // frame for 197 s after its last sighting.
+    if (idTarget_ == dead) idTarget_ = nullptr;
+    ID3D12Resource* expected = dead;
+    injectTarget_.compare_exchange_strong(expected, nullptr);
+}
+
 
 
 
@@ -106,8 +166,34 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     // mean reading a stale or never-set target for 299 frames out of 300.
     const std::vector<TargetFingerprint> snapshot = SnapshotTargets();
     const std::vector<ElectionScore> ranked = ScoreTargets(snapshot);
-    ID3D12Resource* const winner =
+    ID3D12Resource* const scored =
         (!ranked.empty() && ranked.front().score > 0) ? ranked.front().resource : nullptr;
+
+    // A candidate is only real if we saw it THIS frame. SnapshotTargets returns
+    // evidence_, which keeps entries for 600 frames after last sighting, so the
+    // top-scoring address can name a resource the game destroyed long ago.
+    // Electing one means GetDesc and CopyTextureRegion on freed memory; pinning
+    // one means an AddRef that holds nothing and a later Release that steals a
+    // reference from whoever inherits the address. Both happened -- see below.
+    bool winnerSeenThisFrame = false;
+    if (scored) {
+        for (const TargetFingerprint& t : snapshot) {
+            if (t.resource == scored) {
+                winnerSeenThisFrame = (t.lastSeenFrame == frameIndex_);
+                break;
+            }
+        }
+        if (!winnerSeenThisFrame) {
+            ++pinRefusedStale_;
+            if (pinRefusedStale_ <= 8 || (pinRefusedStale_ % 200) == 0) {
+                LogWarn("election: top candidate %p was NOT observed this frame -- refusing to "
+                        "elect, pin or even GetDesc it; it may already be destroyed "
+                        "(refusal #%llu)",
+                        static_cast<void*>(scored), pinRefusedStale_);
+            }
+        }
+    }
+    ID3D12Resource* const winner = winnerSeenThisFrame ? scored : nullptr;
     const bool electionChanged = (winner != electedTarget_);
     if (electionChanged) {
         // A new target has produced nothing yet by definition, so it starts
@@ -123,8 +209,25 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
         // cost is one full-res depth-stencil kept alive (~5 MB); pinning every
         // tracked target instead would pin hundreds and cost gigabytes.
         //
-        // Safe to AddRef here: the winner was bound or cleared during this
-        // frame, so the game held a reference to it moments ago on this thread.
+        // WRONG, and it cost a crash. The winner comes from SnapshotTargets(),
+        // which returns evidence_ -- and evidence_ retains an entry for up to
+        // kStaleAfterFrames = 600 frames after the resource was last seen
+        // (hooks_election.cpp). So the winner may have been destroyed ten
+        // seconds ago, and this AddRef lands on freed memory and holds nothing.
+        //
+        // The proof it held nothing is that D3D12 then reissued the address --
+        // impossible while a real reference is outstanding. What followed:
+        //   t=250.984  AddRef 0x1DFA4016C40                       (log:13339)
+        //   t=254.328  address recycled, electedTarget_ nulled     (log:14123)
+        //   t=254.359  pinnedTarget_->Release() on the NEW owner   <- theft
+        //   +ms        game barriers 0x1DFA4016C40; allocation gone
+        //              nvwgf2umx: test byte [r10+0x3c],1  with r10 = 0
+        // We destroyed a resource the game had created 31 ms earlier, then
+        // faulted inside the driver while forwarding the game's own barrier.
+        //
+        // So `winner` above is already gated on being observed this frame, and
+        // the second half of the repair lives in AbandonOwnedRefs: once an
+        // address is recycled the pin must be FORGOTTEN, never released.
         if (pinnedTarget_) {
             pinnedTarget_->Release();
             pinnedTarget_ = nullptr;

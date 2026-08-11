@@ -192,8 +192,14 @@ Get-Process -Name "inZOI*","vpad" -ErrorAction SilentlyContinue | ForEach-Object
     Stop-Process -Id $_.Id -Force
 }
 Start-Sleep -Seconds 3
-Remove-Item $log -ErrorAction SilentlyContinue
+# ARCHIVE FIRST, THEN DELETE. These two lines were the other way round, which
+# meant the previous run's segcap.log was destroyed a moment before the archiver
+# came to collect it -- so every crashed run left behind captures but no log, and
+# the one artefact that explains a crash was the one artefact we always deleted.
+# Found while diagnosing the t=254s inZOI crash, whose log survived only because
+# it happened to still be sitting in build\bin when nothing had re-run since.
 & (Join-Path $root "tools\archive_capture.ps1") -Title "inzoi" -Bin $bin
+Remove-Item $log -ErrorAction SilentlyContinue
 
 # --- launch suspended + inject ------------------------------------------------
 $appidFile = Join-Path $gameDir "steam_appid.txt"
