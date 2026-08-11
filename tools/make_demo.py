@@ -36,6 +36,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from overlay import palette, read_pgm  # noqa: E402
+from mask_align import align_mask_to_frame  # noqa: E402
 
 
 def find_ffmpeg():
@@ -369,9 +370,14 @@ def compose(frame_path, mask_path, index, scale, font, hud_font, tracked, opts,
             inputs=None):
     base = Image.open(frame_path).convert("RGB")
     mask = read_pgm(mask_path)
+    # Upscale the MASK to the frame, exactly, by integer replication -- never
+    # shrink the frame to the mask, which is what this did and which quietly
+    # threw away three quarters of the video on any title that renders its
+    # scene below the present resolution (inZOI: 1280x800 scene, 2560x1600
+    # present). See mask_align for why nearest-neighbour is mandatory, not a
+    # preference. Must run before pal[mask] turns ids into colours.
+    mask = align_mask_to_frame(mask, base.size)
     h, w = mask.shape
-    if base.size != (w, h):
-        base = base.resize((w, h))
 
     pal = palette()
     rgb = pal[mask]

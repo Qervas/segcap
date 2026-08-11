@@ -33,6 +33,8 @@ import sys
 import numpy as np
 from PIL import Image
 
+from mask_align import AlignmentError, align_mask_to_frame
+
 
 def read_pgm(path):
     """Binary PGM (P5). Parsed by hand -- Pillow's PGM support is fine but the
@@ -140,18 +142,24 @@ def main():
                  r["centroid"][0], r["centroid"][1], names.get(r["id"], "")))
 
     # ---- render ----------------------------------------------------------
+    # The mask is upscaled to the frame, never the reverse -- see mask_align.
+    # This has to happen BEFORE the palette lookup: pal[mask] turns ids into
+    # colours, and once they are colours a resize would blend across object
+    # boundaries with nothing to complain about it.
+    if args.frame:
+        base = Image.open(args.frame).convert("RGB")
+        try:
+            mask = align_mask_to_frame(mask, base.size)
+        except AlignmentError as exc:
+            print("\nERROR: %s" % exc)
+            return 1
+        h, w = mask.shape
+
     pal = palette()
     rgb = pal[mask]                              # (h, w, 3)
     alpha = np.where(mask > 0, 255, 0).astype(np.uint8)
 
     if args.frame:
-        base = Image.open(args.frame).convert("RGB")
-        if base.size != (w, h):
-            print("\nNOTE: frame is %dx%d but mask is %dx%d -- resizing the frame."
-                  % (base.size[0], base.size[1], w, h))
-            print("      A size mismatch usually means they are not the same frame;")
-            print("      alignment cannot be trusted if this triggers.")
-            base = base.resize((w, h))
         arr = np.asarray(base).astype(np.float32)
         a = (alpha[..., None] / 255.0) * args.alpha
         # Unmarked pixels stay fully transparent, so a misaligned mask shows as
