@@ -273,6 +273,34 @@ void Hooks::TryInjectCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* targe
         return;
     }
 
+    // DIRECT lists only.
+    //
+    // We mirror the game's StateBefore straight out of its barrier, and on this
+    // title that is routinely 0xC0 = NON_PIXEL_SHADER_RESOURCE|PIXEL_SHADER_
+    // RESOURCE. PIXEL_SHADER_RESOURCE is NOT a legal state on a COMPUTE command
+    // list -- D3D12 restricts compute lists to a subset that excludes it -- so
+    // recording that transition there is an invalid argument. Like every other
+    // invalid recorded command it returns void, gets latched into the list, and
+    // detonates in the GAME's Close() as E_INVALIDARG (docs/DEBUGGING.md 8.7).
+    //
+    // Suspected because the crash tracks WHICH resource we target: runs that
+    // probed the R32_UINT candidate survived 83 and 128 copies, while every run
+    // that reached the R16G16_UINT Nanite CombinedCustomStencil died within
+    // milliseconds of `inject: ON`. Nanite's export runs on the compute path, so
+    // its barriers arrive on a different list type than the ones we had been
+    // injecting into successfully.
+    const D3D12_COMMAND_LIST_TYPE listType = list->GetType();
+    if (listType != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        ++injRefusedListType_;
+        if (injRefusedListType_ == 1) {
+            LogWarn("inject: REFUSED -- command list %p is type %d, not DIRECT. The game's "
+                    "StateBefore=0x%X cannot legally be declared on this list type.",
+                    static_cast<void*>(list), static_cast<int>(listType),
+                    static_cast<unsigned>(stateAfter));
+        }
+        return;
+    }
+
     if (injectDryRun_) {
         if (injRecorded_ < 4) {
             LogWarn("inject DRY RUN: would copy %p on list %p at StateAfter=0x%X sub=%u "
@@ -289,6 +317,9 @@ void Hooks::TryInjectCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* targe
         injectFrame_.load(std::memory_order_relaxed), origBarrier_);
     if (!token.valid) {
         ++injRefusedNoSlot_;
+        // RecordInto can fail after it has already issued barriers, so there may
+        // be validation to read even on the path that records no copy.
+        DrainInfoQueue();
         return;
     }
     {
@@ -302,6 +333,16 @@ void Hooks::TryInjectCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* targe
                 "(StateBefore=0x%X taken from the game's barrier, not from our shadow)",
                 static_cast<void*>(list), static_cast<unsigned>(stateAfter));
     }
+    // Read the debug layer HERE, on the recording thread, not on the next Present.
+    //
+    // D3D12's recording methods return void; an invalid CopyTextureRegion is
+    // latched into the command list and only surfaces when the GAME calls Close(),
+    // as E_INVALIDARG, which UE turns into a fatal check. That is exactly how the
+    // 11:46 run died -- and because the drain lived only on the Present path, the
+    // messages naming the invalid argument were still sitting in the info queue
+    // when the process went down. There is no "next Present" after the call that
+    // kills you. Costs nothing when the debug layer is off: infoQueue_ is null.
+    DrainInfoQueue();
 }
 // Resources carry an initial state that no ResourceBarrier ever announces. A
 // depth buffer created in DEPTH_WRITE and never transitioned would otherwise

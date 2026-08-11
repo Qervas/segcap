@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <set>
 #include <string>
 
@@ -288,6 +289,33 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
         // fails to contain any slot we leased is abandoned for the next one.
         // The leased-slot test is the same one that now guards the mask path, so
         // "which buffer holds our ids" is answered by measurement.
+        // DROP A CANDIDATE WE NEVER SEE BARRIERED.
+        //
+        // Candidate selection is gated on `!idTarget_`, so a stale idTarget_ pins
+        // the probe forever. AbandonOwnedRefs clears it when a resource CHANGES
+        // IDENTITY -- a new resource appearing at the same address -- but a
+        // resource that simply dies and whose address is never reused trips
+        // nothing at all. The pointer stays, the gate stays shut, and the probe
+        // is finished for the session.
+        //
+        // Observed: a candidate elected at t=39s in the MENU, whose resource the
+        // world transition destroyed. The run then went 639 seconds with
+        // `inject: attempts=0` -- not one barrier ever matched, because the
+        // target no longer existed -- while the probe sat on it and 74 live slots
+        // went unread. Zero attempts is the signal: injection fires from the
+        // game's own barriers, so a target that draws none in ten seconds of
+        // gameplay is one we cannot copy from, whatever it used to be.
+        //
+        // Dropped, NOT blacklisted: the resource may be legitimately idle rather
+        // than wrong, and idRejected_ is permanent.
+        if (idTarget_ && frameIndex_ > idTargetSetFrame_ + 600 &&
+            injAttempts_ == injAttemptsAtSet_) {
+            LogWarn("idbuf: candidate %p drew ZERO barriers in %llu frames -- it is gone or "
+                    "unused; dropping it and picking another",
+                    static_cast<void*>(idTarget_), frameIndex_ - idTargetSetFrame_);
+            idTarget_ = nullptr;
+            idDumped_ = 0;
+        }
         if (!idTarget_) {
             // Rebuilt every time we need a candidate, NOT once. The Nanite
             // CombinedCustomStencil does not exist during the menu -- it is
@@ -302,6 +330,13 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
                 // buffers are integer targets too, and are 32x32 to 224x128.
                 if (backbufferWidth_ && t.width < backbufferWidth_ / 4) continue;
                 if (idRejected_.count(t.resource)) continue;
+                // Once a format has been PROVEN to carry our ids, only consider
+                // that format. Re-walking R32_UINT and R8_UINT decoys after a
+                // world transition is how a converged session loses its buffer
+                // and never gets it back -- and the R8_UINT decoy in particular
+                // matches trivially, because a flag buffer of {0,1,2} overlaps
+                // leased slots 1, 2 and 3.
+                if (provenFormat_ != DXGI_FORMAT_UNKNOWN && t.format != provenFormat_) continue;
                 idCandidates_.push_back(t.resource);
             }
             // Deterministic order so a re-run probes the same sequence, and so
@@ -310,17 +345,40 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
             idCandidateIndex_ = 0;
             if (idCandidateIndex_ < idCandidates_.size()) {
                 idTarget_ = idCandidates_[idCandidateIndex_];
+                // Stamped so the zero-barrier watchdog above can time it out.
+                idTargetSetFrame_ = frameIndex_;
+                injAttemptsAtSet_ = injAttempts_;
                 D3D12_RESOURCE_DESC d = idTarget_->GetDesc();
                 LogInfo("idbuf: probing candidate %zu of %zu: %p %llux%u %s",
                         idCandidateIndex_ + 1, idCandidates_.size(),
                         static_cast<void*>(idTarget_), d.Width, d.Height,
                         FormatName(d.Format));
             } else if (!idRejected_.empty()) {
-                loggedIdExhausted_ = true;
-                LogWarn("idbuf: every scene-scale integer target present has been tested "
-                        "(%zu rejected); none contained a stencil slot we leased. The "
-                        "per-object ids are not in an integer render target on this title.",
-                        idRejected_.size());
+                // EXHAUSTED IS NOT FINAL. This set loggedIdExhausted_ and closed
+                // the probe for the rest of the process -- a permanent verdict
+                // drawn from whichever targets happened to exist at one instant.
+                //
+                // The comment forty lines up says why that cannot hold: the
+                // Nanite CombinedCustomStencil DOES NOT EXIST until something
+                // first requests the CustomDepth pass. Testing every target
+                // present at t=49s and concluding "the ids are not in an integer
+                // target on this title" is concluding it before the buffer has
+                // been allocated. Observed exactly that: two candidates rejected
+                // at t=49.8s, then silence for 190 seconds while capture sat
+                // armed and 255 slots went unread.
+                //
+                // Forget the rejections and look again. A target that genuinely
+                // holds nothing costs one cheap re-test per sweep; the target we
+                // need appears only after the pass runs, and it is the only
+                // reason this probe exists.
+                if (frameIndex_ > idSweepFrame_ + 1800) {
+                    idSweepFrame_ = frameIndex_;
+                    LogWarn("idbuf: all %zu present integer targets rejected -- clearing and "
+                            "re-sweeping. The Nanite CombinedCustomStencil is allocated only "
+                            "once the CustomDepth pass runs, so 'not here yet' is not 'not here'.",
+                            idRejected_.size());
+                    idRejected_.clear();
+                }
             }
         }
         // NEVER copy from a resource whose state we have not observed. This is
@@ -421,6 +479,52 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
         if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) {
             armed_ = true;
             LogWarn("CAPTURE ARMED at frame %llu -- readback begins now", frameIndex_);
+        }
+    }
+
+    // LIVE RE-PROBE. Touch "segcap.reprobe" next to the DLL and discovery starts
+    // over, in the running game, without a relaunch.
+    //
+    // Getting inZOI to a loaded save costs six minutes of menu and streaming, and
+    // every probe experiment was paying that toll to test a decision the DLL makes
+    // in the first two seconds after arriving. Worse, a failed probe was terminal
+    // for the session: idRejected_ is permanent and idChannelFound_ never resets,
+    // so the ONLY way to try again was to destroy the world and rebuild it.
+    //
+    // This resets exactly the state discovery accumulates -- rejections, the
+    // current candidate, the proven channel and the pinned mask source -- and
+    // leaves the world, the hooks and the marked slots untouched. The marker is
+    // deleted as it is consumed so it fires once per touch. Code changes still
+    // need a relaunch (the DLL is mapped and MinHook's detours point into it),
+    // but the decisions we actually iterate on no longer do.
+    if ((frameIndex_ % 30) == 0) {
+        wchar_t self[MAX_PATH] = {};
+        GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), self, MAX_PATH);
+        std::wstring p(self);
+        const size_t dot = p.find_last_of(L'.');
+        if (dot != std::wstring::npos) p = p.substr(0, dot);
+        p += L".reprobe";
+        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            DeleteFileW(p.c_str());
+            LogWarn("RE-PROBE requested -- discarding %zu rejection(s), candidate %p, "
+                    "proven channel %d and mask source %p; discovery restarts now",
+                    idRejected_.size(), static_cast<void*>(idTarget_), maskChannel_,
+                    static_cast<void*>(maskSource_));
+            if (maskSource_) {
+                maskSource_->Release();
+                maskSource_ = nullptr;
+            }
+            maskChannel_ = -1;
+            idChannelFound_ = false;
+            idRejected_.clear();
+            idCandidates_.clear();
+            idCandidateIndex_ = 0;
+            idTarget_ = nullptr;
+            idDumped_ = 0;
+            loggedIdExhausted_ = false;
+            warnedProbeTooEarly_ = false;
+            loggedInjectArmed_ = false;
+            injectTarget_.store(nullptr, std::memory_order_relaxed);
         }
     }
 
@@ -597,6 +701,30 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
         } else {
             injectTarget_.store(nullptr, std::memory_order_relaxed);
         }
+        // Say WHY injection is off, once per transition.
+        //
+        // A run reported 0 masks with `inject: attempts` frozen at 58 for its
+        // last 300 seconds and no other line to explain it. Injection turning
+        // itself off is the single most consequential state change in this file
+        // and it was completely silent, so every diagnosis of it was a guess
+        // about which of five conditions had gone false. Log the actual one.
+        {
+            const bool onNow = injectTarget_.load(std::memory_order_relaxed) != nullptr;
+            if (onNow != injectWasOn_) {
+                injectWasOn_ = onNow;
+                if (onNow) {
+                    LogWarn("inject: ON (target %p, plane %u)",
+                            static_cast<void*>(injectWant), injectPlane);
+                } else {
+                    LogWarn("inject: OFF -- want=%p maskSource=%p idTarget=%p | "
+                            "census=%d noReadback=%d armOk=%d device=%d prepare=%s",
+                            static_cast<void*>(injectWant), static_cast<void*>(maskSource_),
+                            static_cast<void*>(idTarget_), censusOnly_ ? 1 : 0,
+                            noReadback_ ? 1 : 0, injectArmOk ? 1 : 0, device_ ? 1 : 0,
+                            injectWant ? "failed-or-not-reached" : "n/a (no target)");
+                }
+            }
+        }
         if (auto sc = GetMarker().publishedSidecar()) {
             sidecarHistory_.emplace_back(frameIndex_, std::move(sc));
             while (sidecarHistory_.size() > 16) sidecarHistory_.pop_front();
@@ -712,9 +840,26 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
 
     // The full score table is logged, not just the winner. A wrong election is
     // only debuggable if the runner-up and the reason it lost are visible.
+    //
+    // With ONE exception, collapsed to a count: "no stencil plane". That line
+    // was 63,000 of the 88,000 lines a 109-second session wrote -- roughly 12x
+    // the previous rate -- all of it emitted synchronously on the Present thread,
+    // which is a real cost paid every frame to restate a fact about a FORMAT that
+    // cannot change between frames. Nothing is lost: a target rejected on its
+    // format never had dimensions or bind counts printed here anyway, and every
+    // integer target worth knowing about is already enumerated above with its
+    // size. The runners-up that actually competed still print in full.
     LogInfo("  election:");
+    size_t noStencil = 0;
     for (const ElectionScore& e : ranked) {
+        if (std::strncmp(e.reason, "rejected: no stencil plane", 26) == 0) {
+            ++noStencil;
+            continue;
+        }
         LogInfo("    %+5d %p  %s", e.score, static_cast<void*>(e.resource), e.reason);
+    }
+    if (noStencil) {
+        LogInfo("    (%zu more rejected: no stencil plane)", noStencil);
     }
     if (!ranked.empty() && ranked.front().score > 0) {
         LogInfo("  ELECTED %p (score %d)", static_cast<void*>(ranked.front().resource),

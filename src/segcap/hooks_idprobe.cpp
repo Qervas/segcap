@@ -65,6 +65,45 @@ void Hooks::OnIdBufferReady(const MaskFrame& frame) {
                 leased[b.slot] = true;
             }
         }
+        // DO NOT JUDGE A BUFFER WHILE THE WORLD IS STILL BEING MARKED.
+        //
+        // The acceptance test below demands >=6 distinct leased values present and
+        // no single value carrying more than 60% of the match. Both are right, and
+        // both are UNPASSABLE when only a handful of objects have been marked --
+        // eight marked objects genuinely produce few distinct values and one big
+        // dominant region, so the guard reports "one big region, not a set of
+        // object ids" about the correct buffer.
+        //
+        // That is exactly what happened on inZOI. At t=46.6s the probe reached the
+        // R16G16_UINT Nanite CombinedCustomStencil -- the right target -- with 8
+        // slots leased, measured 100% of non-zero texels carrying leased slots in
+        // channel G16, and refused it because 86% of them were one value. Marking
+        // then grew to 40, 72, 88 and finally 106 live slots over the next two
+        // minutes, by which time the buffer would have passed easily. The probe
+        // had already spent its attempts on evidence gathered during the emptiest
+        // moment of the session.
+        //
+        // Wait for a population that can actually distinguish the two hypotheses.
+        // 16, not 32. The first version used 32 because that is what the MENU
+        // world happened to reach, and the probe then converged there perfectly
+        // -- and never again. Gameplay runs 23-31 live slots, because the world
+        // transition destroys every marked component (106 dropped-destroyed) and
+        // marking restarts against a much larger, mostly-occluded object set. A
+        // threshold read off the easy case silently became "never" in the case
+        // that matters. 16 is twice kMinDistinctLeasedSeen below, which is the
+        // real question being asked: are there enough slots that the acceptance
+        // test COULD distinguish an id buffer from one big region.
+        constexpr size_t kMinLeasedToJudge = 16;
+        if (leasedCount > 0 && leasedCount < kMinLeasedToJudge) {
+            if (!warnedProbeTooEarly_) {
+                warnedProbeTooEarly_ = true;
+                LogInfo("idbuf: holding off -- only %zu slots leased, need %zu before a "
+                        "verdict means anything (too few objects makes a correct buffer "
+                        "look like one big region)",
+                        leasedCount, kMinLeasedToJudge);
+            }
+            return;
+        }
         if (leasedCount > 0) {
             uint64_t nonZero[3] = {0, 0, 0};
             uint64_t hit[3] = {0, 0, 0};
@@ -174,6 +213,18 @@ void Hooks::OnIdBufferReady(const MaskFrame& frame) {
                         static_cast<void*>(idTarget_), names[bestChan], 100.0 * bestFrac,
                         leasedCount);
                 idChannelFound_ = true;
+                // Remember the SIGNATURE, not just this resource.
+                //
+                // UE destroys and reallocates this target across a world
+                // transition, and the probe then had to rediscover it from
+                // nothing -- re-walking every integer candidate while capture sat
+                // armed and idle. Observed: converged at t=44s, lost the buffer at
+                // t=89s, and never got it back for the remaining 190 seconds while
+                // 7,537 copies went to the probe instead of the mask writer.
+                // Once the format and channel are proven, a fresh resource with
+                // the same signature is the same buffer under a new address, so
+                // candidate selection can go straight to it.
+                provenFormat_ = idTarget_->GetDesc().Format;
                 // Switch the MASK pipeline onto this buffer. On a Nanite title
                 // the depth-stencil route cannot work at all: Nanite exports
                 // depth to CombinedCustomDepth (whose stencil plane is never
@@ -191,6 +242,22 @@ void Hooks::OnIdBufferReady(const MaskFrame& frame) {
                         "The CustomDepth stencil-plane route does not carry ids on this "
                         "title.",
                         static_cast<void*>(maskSource_), names[bestChan]);
+            } else if (bestFrac >= kIdChannelThreshold &&
+                       idDumped_ < kIdProbeAttemptsPerCandidate * 8) {
+                // Matched on fraction but failed a sample-quality guard: "not
+                // enough evidence YET" rather than "wrong buffer", so give it
+                // extra attempts instead of blacklisting the correct target
+                // while the scene is still filling in.
+                //
+                // BOUNDED, and the bound is the whole point. The first version
+                // exempted this verdict from the attempt budget entirely, which
+                // is unbounded for any buffer that ALWAYS matches and ALWAYS
+                // fails distinctness -- exactly what an R8_UINT flag buffer of
+                // {0,1,2} does, since our leased slots include 1, 2 and 3. The
+                // probe then sat on it for a whole 255-slot session, 6,573
+                // copies delivered, and never reached the R16G16_UINT target two
+                // candidates later. "Wait for better evidence" has to expire, or
+                // it is just a slower way of never deciding.
             } else if (idDumped_ >= kIdProbeAttemptsPerCandidate) {
                 // Abandon this candidate permanently and pick another next
                 // frame. Recorded in idRejected_ rather than by index, because

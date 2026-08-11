@@ -27,3 +27,7 @@ Thumbs.db
 
 # Mask dumps
 *.pgm
+
+# Python bytecode
+__pycache__/
+*.pyc

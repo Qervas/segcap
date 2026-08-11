@@ -47,6 +47,10 @@ param(
     # Turn on the D3D12 validation layer. Slow, and for diagnosis only -- never
     # for a capture run. Needs the "Graphics Tools" optional Windows feature.
     [switch]$D3DDebug,
+    # Drive the character during the capture hold. OFF by default: motion makes
+    # UE stream, streaming churns the object graph, and that churn destroys the
+    # marked slots the mask is built from. Static capture must work first.
+    [switch]$Walk,
     # Probe scene-scale INTEGER render targets for per-object ids, testing each
     # against the stencil slots we actually leased.
     #
@@ -187,9 +191,15 @@ Remove-Item (Join-Path $bin "segcap.arm") -ErrorAction SilentlyContinue
 Set-Content -Path (Join-Path $bin "segcap.requirearm") -Value "1" -NoNewline
 Write-Host "[play] readback DISARMED until gameplay (budget reserved for the world)"
 
+# -ErrorAction on the kill as well as the enumeration. A process can exit between
+# Get-Process and Stop-Process -- most easily when the previous run's game is
+# already on its way down -- and with $ErrorActionPreference = "Stop" the script
+# then dies during CLEANUP, before it has launched anything. Losing a run to
+# "cannot find a process with the process identifier" is absurd when the state we
+# wanted (that process not running) is exactly what we got.
 Get-Process -Name "inZOI*","vpad" -ErrorAction SilentlyContinue | ForEach-Object {
     Write-Host "[play] closing stale $($_.ProcessName) $($_.Id)"
-    Stop-Process -Id $_.Id -Force
+    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
 }
 Start-Sleep -Seconds 3
 # ARCHIVE FIRST, THEN DELETE. These two lines were the other way round, which
@@ -224,25 +234,217 @@ Write-Host "[play] game pid $($game.Id)"
 
 Start-Process -FilePath $vpad -ArgumentList @("--serve", "build\bin\vpad_cmd.txt") -WindowStyle Hidden | Out-Null
 
-Write-Host "[play] waiting ${MenuWait}s for the main menu"
-Start-Sleep -Seconds $MenuWait
-
 # --- the route, as fractions of the window ------------------------------------
 # Measured on 2560x1600. act.ps1 is DPI-aware and takes physical pixels, so the
 # fractions are resolved against the real window rect at click time.
-function Click([double]$fx, [double]$fy, [double]$wait, [string]$what) {
-    if (-not (Get-Process -Name "inZOI-Win64-Shipping" -ErrorAction SilentlyContinue)) {
-        throw "game exited before: $what"
+# "The process exists" is NOT "the game is running".
+#
+# A -D3DDebug session hung inZOI during world streaming: the render thread stopped
+# advancing while the process stayed alive at 12.9 GB resident. Every check here
+# passed, so the script clicked transport-play on a frozen window and then drove a
+# corpse with gamepad input for two more minutes before reporting 0 masks -- which
+# reads exactly like a capture bug rather than the hang it was. Responding is the
+# Win32 answer to "is this window's message loop still pumping".
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class SegcapThread {
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenThread(uint a, bool i, uint id);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern uint ResumeThread(IntPtr h);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr h);
+}
+'@ -ErrorAction SilentlyContinue
+
+# Recover a WHOLE-PROCESS SUSPEND, which is not a hang and not a crash.
+#
+# Observed twice: the game stops dead mid-session, the log's last line is
+# ordinary, and sampling shows every one of its ~147 threads in Wait/Suspended
+# with a suspend count of exactly 1 while the process burns ZERO CPU. That is the
+# signature of one NtSuspendProcess-style suspend, never resumed -- not a
+# deadlock (which would hold locks, not suspend counts) and not a fatal error
+# (no crash report, no CrashReportClient, no WER event).
+#
+# Ruled OUT as the suspender: MinHook (every MH_* call in segcap runs once at
+# startup, none at the time of the freeze), the D3D12 debug layer (it reproduces
+# with the layer off), Windows Error Reporting, and UE's own crash handler. WHAT
+# suspends it is still unknown.
+#
+# Resuming by hand brought a suspended session back and it ran on for another 400
+# seconds, so this is recoverable -- and a capture run that dies on it wastes
+# twenty minutes of game time for a condition that costs milliseconds to undo.
+# Recover, but say so LOUDLY: this is a workaround over an unexplained fault, and
+# a silent one would let the fault disappear from the record.
+function TryResumeSuspended($p) {
+    $resumed = 0
+    foreach ($t in $p.Threads) {
+        $h = [SegcapThread]::OpenThread(0x0002, $false, [uint32]$t.Id)   # THREAD_SUSPEND_RESUME
+        if ($h -eq [IntPtr]::Zero) { continue }
+        $prev = [SegcapThread]::ResumeThread($h)
+        if ($prev -ne [uint32]"0xFFFFFFFF" -and $prev -gt 0) { $resumed++ }
+        [void][SegcapThread]::CloseHandle($h)
     }
+    return $resumed
+}
+
+function GameLive([string]$what) {
+    $p = Get-Process -Name "inZOI-Win64-Shipping" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $p) { throw "game exited before: $what" }
+    if ($p.Responding) { return $p }
+
+    # Not responding. Distinguish a load hitch from a suspend by watching CPU:
+    # a streaming stall burns cycles, a suspended process burns none.
+    $cpu0 = $p.CPU
+    Start-Sleep -Seconds 3
+    $p.Refresh()
+    if ($p.Responding) { return $p }
+    $moved = ($p.CPU - $cpu0) -gt 0.5
+
+    # BUSY IS NOT DEAD. A game streaming a 35 GB save stops pumping its message
+    # loop for long stretches while burning CPU the whole time -- Responding is
+    # false and nothing is wrong. This function exists to catch the case where the
+    # process is NOT working, and the CPU delta is exactly that discriminator, so
+    # a thread that is advancing gets left alone. The first version threw here
+    # anyway and killed a run during world load, which is the one phase where a
+    # multi-second stall is the expected behaviour rather than a fault.
+    if ($moved) { return $p }
+
+    $susp = @($p.Threads | Where-Object { $_.ThreadState -eq 'Wait' -and $_.WaitReason -eq 'Suspended' }).Count
+    if ($susp -gt ($p.Threads.Count / 2)) {
+        Write-Host "[play] !! GAME SUSPENDED before: $what -- $susp of $($p.Threads.Count) threads suspended, 0 CPU. UNEXPLAINED FAULT; resuming them."
+        $n = TryResumeSuspended $p
+        Start-Sleep -Seconds 5
+        $p.Refresh()
+        Write-Host "[play] !! resumed $n thread(s); Responding=$($p.Responding)"
+        if ($p.Responding) { return $p }
+        throw "game stayed frozen after resuming $n thread(s) before: $what"
+    }
+
+    # Flat CPU for one 3-second sample is not proof either: a game streaming from
+    # disk blocks on I/O, which consumes no CPU and pumps no messages. Watch for
+    # considerably longer before calling it dead, and let any sign of life win.
+    for ($i = 0; $i -lt 6; $i++) {
+        $cpuN = $p.CPU
+        Start-Sleep -Seconds 5
+        $p.Refresh()
+        if ($p.Responding) { return $p }
+        if (($p.CPU - $cpuN) -gt 0.5) {
+            Write-Host "[play] (not responding but working -- CPU advancing during: $what)"
+            return $p
+        }
+    }
+    throw "game is FROZEN (not responding) before: $what -- pid $($p.Id) is alive but its message loop has stopped and it consumed no CPU for 30s, with $susp/$($p.Threads.Count) threads suspended. Check the log's LAST timestamp against the wall clock."
+}
+
+function Click([double]$fx, [double]$fy, [double]$wait, [string]$what) {
+    GameLive $what | Out-Null
     Write-Host "[play] $what"
     & $act -ClickFx $fx -ClickFy $fy -Wait $wait | ForEach-Object { Write-Host "       $_" }
 }
 
-Click 0.0883 0.2169 4  "Continue"
-Click 0.6926 0.3631 8  "first save slot (play)"
+# WAIT FOR THE SIGNAL, NOT FOR THE CLOCK.
+#
+# MenuWait and LoadWait were fixed Start-Sleeps of 150s and 180s -- 5.5 minutes of
+# blind waiting before a run could fail, on every iteration, chosen once to be
+# safely longer than the worst case. The DLL already logs exactly when the engine
+# is up and when the world settles, so the schedule can be driven by the game
+# instead of guessed at. These keep the old fixed values as CEILINGS, so the worst
+# case is unchanged and only the common case gets faster.
+function Get-LogTail([int]$n = 400) {
+    if (-not (Test-Path $log)) { return @() }
+    try { return @(Get-Content $log -Tail $n -ErrorAction Stop) } catch { return @() }
+}
 
-Write-Host "[play] waiting ${LoadWait}s for the world to stream in"
-Start-Sleep -Seconds $LoadWait
+# Wait until every one of $Patterns has appeared in the log, or $TimeoutSec.
+# Returns $true if the signal arrived, $false if it timed out (caller decides
+# whether that is fatal -- here it never is, we just fall through to the ceiling).
+function Wait-ForLog([string[]]$Patterns, [int]$TimeoutSec, [string]$What, [int]$FloorSec = 0) {
+    $t0 = Get-Date
+    Write-Host "[play] waiting for $What (ceiling ${TimeoutSec}s)"
+    while (((Get-Date) - $t0).TotalSeconds -lt $TimeoutSec) {
+        GameLive $What | Out-Null
+        $tail = Get-LogTail 1200
+        $all = $true
+        foreach ($p in $Patterns) {
+            if (-not ($tail | Where-Object { $_ -match $p })) { $all = $false; break }
+        }
+        if ($all) {
+            $waited = [math]::Round(((Get-Date) - $t0).TotalSeconds)
+            if ($waited -lt $FloorSec) {
+                Start-Sleep -Seconds ($FloorSec - $waited)
+                $waited = $FloorSec
+            }
+            Write-Host "[play] $What after ${waited}s (ceiling was ${TimeoutSec}s)"
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+    Write-Host "[play] $What NOT observed within ${TimeoutSec}s -- proceeding on the ceiling"
+    return $false
+}
+
+# The world is "settled" when the DLL stops reporting object-count churn. UE
+# streams a save in over many seconds and segcap logs `world is changing (A -> B
+# objects)` each time the count jumps; when that goes quiet, streaming is done.
+# This is the signal the fixed 180s was standing in for.
+function Wait-ForWorldSettled([int]$TimeoutSec, [int]$QuietSec = 8) {
+    $t0 = Get-Date
+    Write-Host "[play] waiting for the world to settle (quiet ${QuietSec}s, ceiling ${TimeoutSec}s)"
+    $lastChange = Get-Date
+    $sawAny = $false
+    $seen = ""
+    while (((Get-Date) - $t0).TotalSeconds -lt $TimeoutSec) {
+        GameLive "world settle" | Out-Null
+        $tail = Get-LogTail 600
+        $chg = @($tail | Where-Object { $_ -match 'world is changing' }) | Select-Object -Last 1
+        if ($chg -and $chg -ne $seen) { $seen = $chg; $lastChange = Get-Date; $sawAny = $true }
+        if ($sawAny -and ((Get-Date) - $lastChange).TotalSeconds -ge $QuietSec) {
+            Write-Host "[play] world settled after $([math]::Round(((Get-Date)-$t0).TotalSeconds))s"
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+    Write-Host "[play] world-settled signal not seen within ${TimeoutSec}s -- proceeding"
+    return $false
+}
+
+# "The engine is up" is observable, not a duration. ProcessEvent CONFIRMED means
+# the UObject world is reachable and validated; the first `customdepth: marked`
+# means components are being enumerated and rendered. Both together mean the menu
+# is live. On every run logged so far these land at t=40 and t=46 -- against a
+# fixed wait of 150s. The floor keeps a margin for the menu's own fade-in.
+#
+# Placed HERE, below the function definitions, not up beside the process launch:
+# PowerShell executes a script top-to-bottom, so a call above the `function`
+# keyword that defines it fails with "not recognized as a name of a cmdlet" --
+# which is exactly how the first version of this died, 20 seconds into a run.
+# CLICK AS SOON AS THE GAME IS DRAWING, AND RETRY UNTIL IT TAKES.
+#
+# This used to wait for `ProcessEvent CONFIRMED` and the first `customdepth:
+# marked`. Both are ENGINE-INTROSPECTION milestones -- they say our UObject
+# plumbing is ready, which has nothing whatever to do with whether the main menu
+# is on screen and clickable. Gating navigation on them meant every run paid for
+# work it did not need yet, and each time that work got faster the gate was
+# re-tuned instead of removed.
+#
+# The only precondition for clicking is that the game is rendering. The Present
+# hook's own census line proves that and lands within a few seconds.
+Wait-ForLog @('distinct targets observed') $MenuWait "the game to start rendering" -FloorSec 6 | Out-Null
+
+# Then probe rather than assume. A click on a still-loading screen does nothing,
+# so the cost of being early is one wasted click -- while the cost of being late
+# is the minutes this script has been burning. Repeat the pair until the log
+# shows the save actually loading. The loop is self-correcting: if a click lands
+# on the wrong screen the next iteration starts from the main menu again.
+$entered = $false
+for ($try = 1; $try -le 6 -and -not $entered; $try++) {
+    Click 0.0883 0.2169 2  "Continue (attempt $try)"
+    Click 0.6926 0.3631 3  "first save slot (attempt $try)"
+    $entered = Wait-ForLog @('world is changing') 25 "the save to begin loading"
+}
+if (-not $entered) {
+    Write-Host "[play] no load signal after $($try - 1) attempts -- continuing anyway"
+}
+
+Wait-ForWorldSettled $LoadWait 8 | Out-Null
 
 # The sim loads PAUSED. Clicking play is what starts time; the clock in the
 # bottom-left advancing is how you know it worked.
@@ -252,9 +454,10 @@ Click 0.0660 0.9606 5  "transport play (unpause)"
 # world to be stable and the field layout calibrated, and neither is true in the
 # first seconds after a save load -- marking reported "stale 300 of 300" for a
 # long stretch while the previous world's components were still being released.
-$armSettle = 25
-Write-Host "[play] settling ${armSettle}s, then ARMING the readback"
-Start-Sleep -Seconds $armSettle
+# Arm on evidence that marking has caught up, not on a stopwatch. A run that
+# arms early spends its capture budget on a world still being released.
+Wait-ForWorldSettled 60 6 | Out-Null
+Start-Sleep -Seconds 5
 Set-Content -Path (Join-Path $bin "segcap.arm") -Value "1" -NoNewline
 Write-Host "[play] ARMED -- every captured frame from here is gameplay"
 
@@ -262,13 +465,40 @@ Write-Host "[play] in gameplay; holding for ${Seconds}s while segcap marks"
 $deadline = (Get-Date).AddSeconds($Seconds)
 $step = 0
 while ((Get-Date) -lt $deadline) {
-    if (-not (Get-Process -Name "inZOI-Win64-Shipping" -ErrorAction SilentlyContinue)) {
+    $p = Get-Process -Name "inZOI-Win64-Shipping" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $p) {
         Write-Host "[play] GAME EXITED at step $step -- see the log tail below"
         break
     }
-    # Walk, so the scene changes and the capture is not 60 copies of one frame.
-    $ly = if ($step % 2 -eq 0) { 30000 } else { -30000 }
-    & $act -Ly $ly -Ms 2500 -Wait 0.5 | Out-Null
+    # Frozen counts as over. Continuing would spend the rest of the hold walking
+    # a window that cannot move, and bank the result as a capture failure.
+    if (-not $p.Responding) {
+        Write-Host "[play] GAME FROZEN at step $step (pid $($p.Id) alive, not responding) -- stopping the hold"
+        break
+    }
+    # STAND STILL unless -Walk is asked for.
+    #
+    # This used to drive the left stick full forward for 2.5s then full back for
+    # 2.5s, forever, to "keep the scene changing". Three things wrong with that,
+    # and the third is why it is now off by default:
+    #
+    #   1. Net displacement is about zero -- it shuffles between two viewpoints
+    #      rather than touring anything, so it barely served its own purpose.
+    #   2. It hardcodes what the left stick does in a life sim we never probed.
+    #   3. It FIGHTS THE CAPTURE. Moving makes UE stream, streaming makes the
+    #      object count churn, churn makes the marker pause and drop slots, and
+    #      slot churn is what repeatedly pulled the id buffer out from under the
+    #      probe. We were destabilising the exact state we were trying to read.
+    #
+    # Static capture has to work before dynamic capture means anything: if a
+    # standing-still frame cannot be captured, a moving one certainly cannot.
+    # Hold the world still, get masks, and only then reintroduce motion.
+    if ($Walk) {
+        $ly = if ($step % 2 -eq 0) { 30000 } else { -30000 }
+        & $act -Ly $ly -Ms 2500 -Wait 0.5 | Out-Null
+    } else {
+        Start-Sleep -Seconds 3
+    }
     $step++
 }
 

@@ -105,6 +105,10 @@ public:
 
     // Must be set before Install(), i.e. before the game creates its device.
     void SetD3DDebug(bool on) { d3dDebug_ = on; }
+    // Pre-load the format the id buffer is known to use, so discovery does not
+    // start from zero every session. Verification is unchanged: the leased-slot
+    // test still has to pass before anything is accepted.
+    void SeedIdFormat(DXGI_FORMAT f) { provenFormat_ = f; }
 
     void SetRequireArm(bool on) { requireArm_ = on; }
 
@@ -472,6 +476,11 @@ private:
     bool d3dDebug_ = false;
     ID3D12InfoQueue* infoQueue_ = nullptr;
     uint64_t d3dMessagesLogged_ = 0;
+    // The drain used to happen only on the Present thread. It is now also called
+    // from whichever of UE's parallel translate threads recorded our copy, so it
+    // needs a lock: two threads interleaving GetMessage/ClearStoredMessages would
+    // drop exactly the messages we are draining early in order to read.
+    std::mutex infoQueueMutex_;
     void AttachInfoQueue();
     void DrainInfoQueue();
     bool abTest_ = false;
@@ -486,6 +495,25 @@ private:
     // was never read once in 1,397 sightings.
     std::vector<ID3D12Resource*> idCandidates_;
     size_t idCandidateIndex_ = 0;
+    // Logged once: the probe is waiting for enough of the world to be marked
+    // before its acceptance test can distinguish an id buffer from one big region.
+    bool warnedProbeTooEarly_ = false;
+    // The format proven to carry our ids (R16G16_UINT on a Nanite title). Once
+    // known, candidate selection ignores every other format, so a buffer lost to
+    // a world transition is re-acquired immediately instead of rediscovered.
+    // NOT cleared by re-probe on purpose: a re-probe wants a fresh RESOURCE, not
+    // amnesia about which format works. `segcap.reprobe` clears it explicitly.
+    DXGI_FORMAT provenFormat_ = DXGI_FORMAT_UNKNOWN;
+    // Edge-trigger for the "inject ON/OFF" line, so the transition is logged
+    // rather than the state being restated every frame.
+    bool injectWasOn_ = false;
+    // Watchdog state for a probe candidate that never gets barriered, which is
+    // what a destroyed-but-still-pointed-at resource looks like from here.
+    // Last frame the probe cleared its rejections and re-swept, so "every target
+    // present has been tested" expires instead of ending the session.
+    uint64_t idSweepFrame_ = 0;
+    uint64_t idTargetSetFrame_ = 0;
+    uint64_t injAttemptsAtSet_ = 0;
     // Candidates already tested and found not to contain our slots. Keyed by
     // resource rather than by index because the candidate list is rebuilt every
     // time -- new integer targets appear once the CustomDepth pass first runs.
@@ -557,6 +585,9 @@ private:
     uint64_t injRefusedNotWriteToRead_ = 0;
     uint64_t injRefusedNoSlot_ = 0;
     uint64_t injRecorded_ = 0;
+    // Barriers that arrived on a non-DIRECT command list, where the game's own
+    // StateBefore is not a state D3D12 permits.
+    uint64_t injRefusedListType_ = 0;
     uint64_t injSubmitted_ = 0;
     bool loggedInjectArmed_ = false;
     void TryInjectCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* target,

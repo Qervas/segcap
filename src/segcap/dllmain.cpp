@@ -212,6 +212,39 @@ DWORD WINAPI InitThread(LPVOID) {
         const size_t dot5 = idb.find_last_of(L'.');
         if (dot5 != std::wstring::npos) idb = idb.substr(0, dot5);
         idb += L".idbuf";
+        // Seed the probe with a format we have already proven carries our ids.
+        //
+        // NOT a hardcode, and the distinction matters. The leased-slot test still
+        // has to pass, so a wrong seed cannot cause a wrong buffer to be
+        // accepted -- it only stops the probe spending the session rediscovering
+        // something we learned on the previous run. Without it, discovery walks
+        // decoys every time: an R8_UINT flag buffer of {0,1,2} matches trivially
+        // because leased slots include 1, 2 and 3, and inZOI lost a whole
+        // 255-slot session to exactly that.
+        //
+        // 36 = DXGI_FORMAT_R16G16_UINT, the Nanite CombinedCustomStencil.
+        {
+            std::wstring fp(marker);
+            const size_t dotf = fp.find_last_of(L'.');
+            if (dotf != std::wstring::npos) fp = fp.substr(0, dotf);
+            fp += L".idformat";
+            HANDLE fh = CreateFileW(fp.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (fh != INVALID_HANDLE_VALUE) {
+                char buf[16] = {};
+                DWORD got = 0;
+                if (ReadFile(fh, buf, sizeof(buf) - 1, &got, nullptr) && got) {
+                    const int fmt = atoi(buf);
+                    if (fmt > 0) {
+                        segcap::Hooks::Get().SeedIdFormat(static_cast<DXGI_FORMAT>(fmt));
+                        segcap::LogWarn("idbuf: SEEDED with format %d -- only this format will "
+                                        "be considered, and the leased-slot test still decides",
+                                        fmt);
+                    }
+                }
+                CloseHandle(fh);
+            }
+        }
         if (GetFileAttributesW(idb.c_str()) != INVALID_FILE_ATTRIBUTES) {
             segcap::Hooks::Get().SetProbeIdBuffer(true);
             segcap::LogInfo("ID-BUFFER PROBE enabled (read-only)");
@@ -562,7 +595,49 @@ DWORD WINAPI DiscoverThread(LPVOID) {
     }
 
     if (g_engine.namesResolved()) {
-        Sleep(25000);
+        // WAS: Sleep(25000), flat.
+        //
+        // That single line set the floor for the whole run. ProcessEvent could not
+        // be confirmed before t=40s no matter how fast the machine booted, the
+        // first mark could not land before t=46s, and the harness -- which waits
+        // for both before it dares click "Continue" -- inherited all of it. Three
+        // minutes of every iteration traced back to one hardcoded constant that
+        // was standing in for "give the engine time to come up".
+        //
+        // "The engine is up" is measurable: UE's object array grows hard during
+        // boot and plateaus once the menu is live. Wait for the plateau, keep 25s
+        // as the ceiling so the worst case is exactly what it was, and require a
+        // floor count so an array that is merely EMPTY early does not read as
+        // stable. Typical cost now is a few seconds.
+        {
+            const DWORD deadline = GetTickCount() + 25000;
+            int32_t prev = -1;
+            int stable = 0;
+            while (GetTickCount() < deadline) {
+                const int32_t n = g_engine.NumObjects();
+                // Growth under 1% between samples counts as settled; two in a row
+                // to avoid firing on a momentary lull in a streaming burst.
+                // 200k, not 50k. 50,000 was a guess at "not empty" and it fired at
+                // t=17.9s with 52,687 slots -- long before the menu's real
+                // population of ~240,000. ProcessEvent triage then had almost no
+                // live call traffic to validate against, found no candidate, and
+                // Install() failed silently: no marking, so no slots, so no probe,
+                // so no masks. The old Sleep(25000) had been buying ACTIVITY, not
+                // just elapsed time, and replacing it with a plateau test measured
+                // only the second half of what it was doing. Observed menu and
+                // gameplay counts run 240k-468k, so 200k is comfortably inside the
+                // real steady state and still far quicker than the flat sleep.
+                if (n >= 200000 && prev > 0 && n < prev + prev / 100) {
+                    if (++stable >= 2) break;
+                } else {
+                    stable = 0;
+                }
+                prev = n;
+                Sleep(500);
+            }
+            segcap::LogInfo("ue4: object graph settled at %d slots -- installing ProcessEvent",
+                            g_engine.NumObjects());
+        }
         auto& pe = segcap::ue4::GetProcessEventHook();
         if (pe.Install(g_engine)) {
             segcap::LogInfo("ue4: game-thread execution point ready (vtable %d)",

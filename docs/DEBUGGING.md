@@ -1120,6 +1120,227 @@ first version of `mask_sanity.py` flagged "coverage ~100%" as proof of noise and
 every pixel legitimately carries a stencil value. Running a new criterion against
 a title known to work is what caught it, and is now the rule.
 
+### 8.7 A crash with none of our code on the stack
+
+The next inZOI run died 98 seconds in, and the game wrote the report itself:
+
+```
+LowLevelFatalError [D3D12Util.cpp:1136]
+  hr failed at D3D12CommandList.cpp:277 with error E_INVALIDARG
+CrashType = Assert
+```
+
+`segcap.dll` appears nowhere on the callstack. The instinct that follows -- "not
+us, then" -- is wrong, and understanding why took the whole investigation.
+
+`D3D12CommandList.cpp:277` had to be identified without engine source. Parsing
+the shipping exe's `.pdata` exception directory gives function bounds; the
+RIP-relative cross-reference to the `D3D12CommandList.cpp` string literal picks
+the function; disassembling it finds `call qword ptr [rax+0x48]` at RVA
+`0x3A495E3`. Offset 0x48 is vtable slot 9 of `ID3D12GraphicsCommandList`, which
+is **`Close()`**. Four `.pdata` frames corroborate.
+
+That single fact inverts the reading. D3D12's recording methods --
+`CopyTextureRegion`, `ResourceBarrier` -- return `void`. An argument the runtime
+rejects is not reported where it is made: it is **latched into the command list**
+and surfaces later, from `Close()`, as `E_INVALIDARG`, on whichever thread the
+game happens to call `Close()` on. So a crash site with none of our frames on it
+is exactly what an invalid command recorded by us would look like. Deferred
+error reporting means the stack names the messenger.
+
+The minidump then puts it on our list specifically. Across 1.5 MB of captured
+memory there are exactly three `0x80070057` dwords: two on the crashing thread's
+stack, and one at `0x25C8CC9FC70` -- the D3D12Core command-list object at
+`0x25C8CC9FBE0`, plus 0x90. The last line our log wrote before dying names that
+list: `inject: FIRST copy recorded into the game's own command list
+0000025C8CC9FBE0`.
+
+Three theories were generated for what made the copy invalid. Two were refuted
+under adversarial review, including the leading one -- a stale cached footprint
+in `readback.cpp:186`, killed by the observation that the code revalidates every
+frame. `StateBefore=0x40` was ruled out on principle rather than evidence:
+resource-state correctness is checked by the debug layer, not by the core runtime
+at record time, so a wrong `StateBefore` never reaches `Close()` at all.
+
+**Nothing survived as a cause.** After three refuted guesses the correct move is
+to stop guessing and measure -- and the measurement was blocked by our own code.
+The debug layer was off that run, and `DrainInfoQueue()` was called only from the
+Present path. The game died *between* our copy and the next Present, so every
+validation message describing that copy went into the crash with the process.
+There is no next Present after the call that kills you. The drain now also runs
+inline at the end of `TryInjectCopy`, on the recording thread.
+
+### 8.8 The instrument was drowning -- but it did not cause the freeze
+
+Turning the debug layer on produced a new failure: the game hung. Not crashed --
+hung. The log stopped mid-stream at t=177s, the pid stayed alive at 12.9 GB
+resident, and it was still not responding twenty minutes later. No crash report
+was written, because nothing crashed.
+
+**I attributed this to the debug layer, and that was wrong.** The attribution is
+kept here rather than edited out, because the way it failed is the point: the
+message volume below is real, it was worth fixing on its own merits, and it was
+sitting in plain view at the moment the freeze appeared. A cause that is true,
+large, and *adjacent* is the easiest kind to accept without testing. The control
+run -- same build, debug layer OFF -- froze the same way at t=156s. See §8.9.
+
+The volume problem, then, on its own terms. 1.42 **million** validation messages in 177 seconds, of
+which 1.4M were warnings the game generates about itself:
+
+| id | count | message |
+|----|-------|---------|
+| 1008 | 739,726 | ResourceBarrier called on the same subresource in separate Barrier Descs |
+| 1424 | 620,704 | waiting for a fence value of zero |
+| 926 | 40,610 | |
+| 527 | 7,137 | ERROR: before state does not match preceding ResourceBarrier |
+
+`DrainInfoQueue` already declined to *log* warnings -- but declining to log is not
+declining to **store**. The runtime formatted and queued all 1.4M, and the queue
+was then walked from the Present thread and, once copies began, from UE's parallel
+translate threads as well. Fixed with `PushStorageFilter`, keeping only ERROR and
+CORRUPTION. An invalid `CopyTextureRegion` cannot be a warning -- it is precisely
+what gets latched and reported from `Close()` -- so nothing diagnostic is lost.
+
+Two things that run gave away for free, both worth more than the hang cost:
+
+**The `ERROR [id 527]` barrier-state mismatches are the game's own.** 7,137 of
+them were already logged at t=23.6s, at a moment when the counters read
+`inject: attempts=0 recorded=0` -- segcap had issued no GPU work whatsoever.
+inZOI ships with resource-state violations the runtime tolerates. That means the
+debug layer is not a clean reference on this title: any error must be attributed
+by resource and command-list address, never by "this looks new".
+
+**82 copies recorded, no crash.** The 11:46 run died on its *first* copy. So the
+crash is not deterministic on recording a copy, which quietly kills the whole
+family of "our copy is malformed" explanations that assume a fixed defect in what
+we record.
+
+Two harness defects fell out of it as well. The script checked
+`Get-Process` before each step, so a frozen game passed every check -- it clicked
+transport-play on a dead window and then drove it with gamepad input for two more
+minutes before reporting `0 masks`, which reads exactly like a capture bug rather
+than the hang it was. `Responding` is the actual question and is now asked. And
+`archive_capture.ps1` returned early when a run produced no images, *before* it
+copied the log -- so this 410 MB of validation evidence, the entire product of a
+diagnosis run, would have been deleted by the next run's cleanup.
+
+### 8.9 Not a hang: the process was suspended
+
+The control run -- debug layer off -- froze at t=156s, which killed the §8.8
+explanation. The new `Responding` check caught it, and this time the frozen
+process was still there to interrogate rather than already killed.
+
+Sampling it turned "hung" into something much more specific:
+
+  * 146 of 147 threads in `Wait` with `WaitReason = Suspended`
+  * suspend count exactly **1** on every one of them
+  * CPU flat at 330.2 seconds across a 12-second window -- **zero** cycles
+
+Zero CPU rules out a spin. A suspend count rules out a lock: a deadlocked thread
+is blocked, not suspended. Exactly-1-on-all-threads is the signature of a single
+whole-process suspend that was never matched by a resume.
+
+The decisive test was to undo it. Calling `ResumeThread` once per thread brought
+the game back -- `Responding = True`, and the log jumped from t=156 to t=556 and
+kept streaming. So: recoverable, and genuinely a suspension rather than damage.
+
+What that rules out, in order of how much I wanted each to be the answer:
+
+  * **MinHook.** It suspends every thread in the process to patch code, which
+    matches the signature exactly, and I said so before checking. Every `MH_*`
+    call in segcap is reachable only from `Install()` at startup -- `CreateHook`
+    has thirteen call sites and all thirteen are inside `AcquireVTables()` or
+    `AcquireSwapChainVTable()`. Nothing calls into MinHook at t=156. A mechanism
+    that fits the evidence perfectly is not thereby the mechanism that ran.
+  * **The D3D12 debug layer** -- reproduced with it off.
+  * **Windows Error Reporting** -- no WerFault process, no Application event.
+  * **UE's own crash handler** -- no `CrashReportClient`, no new `UECC-*` dir.
+
+**What suspends it is still unknown.** The harness now detects the state (zero CPU
+advance plus a majority of threads suspended, which distinguishes it from a
+streaming stall, which burns cycles) and resumes it, loudly. That is a workaround
+over an unexplained fault and is labelled as one in the code: a run that dies here
+wastes twenty minutes of game time for a condition that costs milliseconds to
+undo, but a *silent* recovery would erase the fault from the record.
+
+### 8.10 The cause: a lock that was taken on one side only
+
+`Readback::RecordInto` reads `footprint_`, `planeSlice_` and `slots_[].buffer`
+under `foreignMutex_`. `Readback::Prepare` **rewrites all three, and calls
+`ReleaseResources()` five times, holding nothing.**
+
+For the injection ring those two run on different threads by design: `Prepare`
+from `OnPresent`, `RecordInto` from whichever of UE's parallel translate threads
+is recording the game's command list. So the Present thread can free a slot's
+destination buffer and install a new footprint while a translate thread is
+partway through recording a copy that uses them. The result is a
+`CopyTextureRegion` whose placed footprint does not describe its destination.
+D3D12 records that silently, latches the rejection into the command list, and the
+GAME's `Close()` returns `E_INVALIDARG` -- §8.7's crash, with none of our code on
+the stack, exactly as deferred error reporting predicts.
+
+The timing lines up with both observed crashes. `Prepare` only rebuilds when the
+layout key changes, and the layout key changes when the id-buffer probe switches
+candidates. The 11:46 crash landed on the *first* copy, at arming, when the ring
+was first built; the 13:40 crash landed seconds after the probe moved from
+`R32_UINT` to `R16G16_UINT`. The runs that survived 83 and 128 copies were the
+ones that sat on a single candidate and never rebuilt.
+
+Why four earlier diagnoses missed it, which is the useful part:
+
+  * **The evidence pointed at the copy's arguments, and it was right.** Every
+    theory tried to find a wrong *value* -- a stale footprint, a bad
+    `StateBefore`, the wrong subresource. The values were all computed correctly.
+    They were correct at the moment they were computed and stale by the time they
+    were used. "Is this argument right?" and "is this argument still right?" read
+    identically in a code review.
+  * **A refutation was accepted slightly too broadly.** The stale-footprint theory
+    was killed with "the code revalidates every frame", which is true of the
+    Present-path `readback_` and says nothing about `maskInjectRing_`. Two
+    instances of one class, and the refutation checked the wrong one.
+  * **The debug layer could not see it.** With validation on, the crash stopped
+    reproducing -- the layer's overhead changes thread timing, and the race needs
+    the two threads to land inside a window of a few instructions. I read "zero
+    errors attributable to segcap across 128 copies" as evidence the copies were
+    fine. It was evidence the race had not fired.
+
+The fix is one `lock_guard` in `Prepare`, plus moving `RecordInto`'s
+`readyForLayout_` check inside the lock -- it was read unlocked, so a thread could
+pass it and then walk into buffers `Prepare` had already freed. The lock is
+deliberately NOT taken inside `ReleaseResources()`: `Prepare` calls it five times
+and the mutex is non-recursive, so locking in both would self-deadlock on the
+first rebuild.
+
+### 8.11 A threshold measured on the easy case
+
+With the crash fixed the probe still had to find the id buffer, and it was failing
+for a reason that had nothing to do with D3D12.
+
+Its acceptance test requires >=6 distinct leased values present and no single
+value carrying more than 60% of the match -- guards added after an earlier false
+positive where values 1, 2 and 3 covered 58.7% of the screen. Sound guards. But
+the probe was running them at t=46.6s with **8 slots leased**, and at 8 marked
+objects those conditions cannot be satisfied by any buffer, correct or not: eight
+objects genuinely are few distinct values with one dominant region. It measured
+100% of non-zero texels carrying our slots in channel G16 of the R16G16_UINT
+Nanite `CombinedCustomStencil` -- the right target, the right channel -- and
+reported "one big region, not a set of object ids".
+
+The guard was not wrong. It was being asked a question the sample could not
+answer, and it answered "no" instead of "not yet".
+
+Holding off until 32 slots made it converge immediately... in the main menu, and
+never again. The world transition destroys every marked component (`106
+dropped-destroyed`) and gameplay runs 23-31 live slots -- **below the threshold I
+had read off the menu**. A number taken from the case that was easy to observe
+became "never" in the case that mattered. It is now 16, derived from the guard it
+protects (twice `kMinDistinctLeasedSeen`) rather than from one observation.
+
+Related: a "matched, but the sample is too small" verdict no longer burns one of
+the candidate's attempts. It had been counting toward permanent rejection, so the
+correct buffer could be blacklisted for the rest of the session on the strength of
+looking at it too early.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have

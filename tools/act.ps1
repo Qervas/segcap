@@ -200,6 +200,21 @@ $g2 = [System.Drawing.Graphics]::FromImage($small)
 $g2.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
 $g2.DrawImage($bmp, 0, 0, $sw, $sh)
 $g2.Dispose(); $bmp.Dispose()
+# Anchor $Out to the REPO, not to the working directory.
+#
+# Bitmap.Save is a .NET call, and .NET resolves a relative path against
+# [Environment]::CurrentDirectory -- which PowerShell's Set-Location does NOT
+# update. So `cd` into the repo, run this, and New-Item happily creates
+# build\bin relative to $PWD while Save looks for it somewhere else entirely and
+# reports "the directory build\bin does not exist" about a directory that plainly
+# does. It worked for weeks because the shell happened to START in the repo root;
+# it failed 150 seconds into an inZOI diagnosis run when that stopped being true,
+# and took the run with it. Resolving against the script's own location makes the
+# output path independent of who called us and from where.
+if (-not [System.IO.Path]::IsPathRooted($Out)) {
+    $repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+    $Out  = Join-Path $repo $Out
+}
 New-Item -ItemType Directory -Force -Path (Split-Path $Out) | Out-Null
 $small.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
 $small.Dispose()

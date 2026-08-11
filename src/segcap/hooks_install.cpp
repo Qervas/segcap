@@ -284,14 +284,54 @@ void Hooks::AttachInfoQueue() {
     // exact failure mode being diagnosed. Messages are pulled and logged
     // instead, so the game keeps running long enough to produce them.
     iq->SetMuteDebugOutput(FALSE);
+
+    // STORE errors only. This is not tidiness, it is what makes the debug layer
+    // usable on this title at all.
+    //
+    // Measured on inZOI: 1.42 MILLION messages in 177 seconds, of which 1.4M
+    // were the game's own warnings -- id 1008 (740k, "ResourceBarrier called on
+    // the same subresource in separate Barrier Descs"), id 1424 (621k, "waiting
+    // for a fence value of zero"), id 926 (41k). The drain already declined to
+    // LOG those, but declining to log is not declining to store: the runtime
+    // still formatted and queued every one, and the queue was walked from the
+    // Present thread and, once copies start, from UE's parallel translate
+    // threads too. The game froze during world streaming, its log rate falling
+    // from 12,600 lines/s to nothing while the process stayed alive.
+    //
+    // A storage filter drops them before they are ever queued. What survives is
+    // ERROR and CORRUPTION -- and an invalid CopyTextureRegion, the thing this
+    // whole apparatus exists to catch, cannot be a mere warning: it is what the
+    // runtime latches into the command list and reports from Close().
+    D3D12_MESSAGE_SEVERITY keep[] = {
+        D3D12_MESSAGE_SEVERITY_CORRUPTION,
+        D3D12_MESSAGE_SEVERITY_ERROR,
+    };
+    D3D12_INFO_QUEUE_FILTER filter = {};
+    filter.AllowList.NumSeverities = _countof(keep);
+    filter.AllowList.pSeverityList = keep;
+    if (FAILED(iq->PushStorageFilter(&filter))) {
+        // Not fatal, but say so: without the filter this run will drown, and a
+        // frozen game looks nothing like a validation failure.
+        LogWarn("info queue storage filter REJECTED -- expect the game to stall "
+                "under the volume of its own warnings");
+    }
     infoQueue_ = iq;
-    LogInfo("D3D12 info queue attached");
+    LogInfo("D3D12 info queue attached (storing ERROR and CORRUPTION only)");
 }
-// Called once per present. Drains whatever validation has accumulated into our
-// own log, so the errors sit in the same timeline as the readback that caused
-// them rather than in a debugger we are not attached to.
+// Drains whatever validation has accumulated into our own log, so the errors sit
+// in the same timeline as the readback that caused them rather than in a debugger
+// we are not attached to.
+//
+// Called from TWO places, and the second one is the whole point. Draining only on
+// Present was a silent hole: inZOI died inside its own Close() between our
+// injected copy and the next Present, so every validation message the debug layer
+// had just produced about that copy went into the crash with the process. The
+// error we most need to read is the one emitted by the call that kills us, and by
+// definition that call has no next Present. So TryInjectCopy drains inline,
+// on the recording thread, before returning.
 void Hooks::DrainInfoQueue() {
     if (!infoQueue_) return;
+    std::lock_guard<std::mutex> lock(infoQueueMutex_);
     const UINT64 n = infoQueue_->GetNumStoredMessages();
     for (UINT64 i = 0; i < n; ++i) {
         SIZE_T len = 0;

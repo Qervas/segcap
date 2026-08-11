@@ -24,6 +24,30 @@ void SafeRelease(T*& p) {
 bool Readback::Prepare(ID3D12Device* device, ID3D12Resource* target, uint32_t planeSlice) {
     if (!device || !target) return false;
 
+    // SAME LOCK AS RecordInto. Prepare had none, and that was the bug.
+    //
+    // For the injection ring these two run on different threads by design:
+    // Prepare from OnPresent, RecordInto from whichever of UE's parallel
+    // translate threads is recording the game's command list. RecordInto reads
+    // footprint_, planeSlice_ and slots_[].buffer under foreignMutex_; Prepare
+    // rewrote all three and called ReleaseResources() -- freeing those very
+    // buffers -- while holding nothing.
+    //
+    // The window is small and it is not theoretical. A copy recorded with a
+    // footprint from one layout and a destination buffer from another is an
+    // invalid CopyTextureRegion; D3D12 records it silently, latches the
+    // rejection into the command list, and the GAME's Close() fails with
+    // E_INVALIDARG -- a crash with none of our code on the stack (see
+    // docs/DEBUGGING.md 8.7). Prepare only rebuilds when the layout key changes,
+    // which is exactly when the id-buffer probe switches candidates, and that is
+    // when both observed crashes happened.
+    //
+    // Deadlock note: the lock is taken HERE and never inside ReleaseResources(),
+    // which Prepare calls five times and which other callers reach directly. The
+    // mutex is non-recursive, so locking in both would self-deadlock on the
+    // first rebuild.
+    std::lock_guard<std::mutex> lock(foreignMutex_);
+
     const D3D12_RESOURCE_DESC desc = target->GetDesc();
 
     // Compare the LAYOUT, not the resource pointer.
@@ -219,9 +243,13 @@ Readback::InjectToken Readback::RecordInto(ID3D12GraphicsCommandList* list,
                                            D3D12_RESOURCE_STATES stateAfter, UINT subresource,
                                            uint64_t frameIndex, RecordBarrierFn origBarrier) {
     InjectToken token;
-    if (!list || !target || !readyForLayout_ || !origBarrier) return token;
+    if (!list || !target || !origBarrier) return token;
 
     std::lock_guard<std::mutex> lock(foreignMutex_);
+    // Re-read INSIDE the lock. Checking it outside was part of the same race:
+    // Prepare clears readyForLayout_ before it tears the ring down, so a thread
+    // that passed the check unlocked could still walk into freed slots.
+    if (!readyForLayout_) return token;
 
     // Find a slot that is neither awaiting the GPU nor already recorded into
     // some list we have not seen submitted yet.
