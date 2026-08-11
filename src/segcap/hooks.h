@@ -479,6 +479,10 @@ private:
     enum class Intervention { Off, Waiting, Requested, Settling, Done };
     Intervention interveneState_ = Intervention::Off;
     uint8_t interveneSlot_ = 0;
+    // The component that held the slot when we unmarked it. The marker's own
+    // churn can release and reissue a slot mid-measurement, and a different
+    // object wearing the same number makes the pixel count meaningless.
+    void* interveneComponent_ = nullptr;
     uint64_t intervenePixelsBefore_ = 0;
     uint64_t interveneOthersBefore_ = 0;
     uint64_t interveneFiredFrame_ = 0;

@@ -257,6 +257,17 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
                 // The unmark must happen on the game thread; it calls the
                 // engine's own setter so the render proxy is rebuilt.
                 const uint8_t slot = best;
+                // Remember WHICH COMPONENT held the slot. Without this the
+                // verdict is uninterpretable: the marker's own RefreshVisibility
+                // churn releases slots for primitives that go stale or invisible,
+                // and the pool can hand slot N to a different object while we are
+                // measuring. The first run of this test reported FAIL with the
+                // target slot GROWING 47% -- which is not a flag that failed to
+                // clear, it is a different object wearing the same number.
+                interveneComponent_ = nullptr;
+                for (const auto& mp : GetMarker().marked()) {
+                    if (mp.stencilValue == slot) { interveneComponent_ = mp.component; break; }
+                }
                 ue4::GetProcessEventHook().RunOnGameThread([slot](ue4::Engine& e) {
                     GetMarker().UnmarkSlotForGroundTruth(e, slot);
                 });
@@ -269,6 +280,25 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
                 // Give the renderer time to rebuild the scene proxy. Judging on
                 // the very next frame would fail even when the claim is true.
                 if (++interveneStableFrames_ < kInterveneSettleFrames) break;
+
+                // Is the slot still worn by the component we unmarked? If the
+                // pool reissued it, any pixel count under that id belongs to
+                // somebody else and proves nothing either way. Reporting FAIL
+                // here would be blaming the labels for the test's own confound.
+                void* holder = nullptr;
+                for (const auto& mp : GetMarker().marked()) {
+                    if (mp.stencilValue == interveneSlot_) { holder = mp.component; break; }
+                }
+                if (holder != interveneComponent_) {
+                    LogWarn("groundtruth: INCONCLUSIVE -- slot %u changed hands during the "
+                            "measurement (was %p, now %p). The marker released and reissued "
+                            "it, so its pixel count is no longer about the object we "
+                            "unmarked.",
+                            static_cast<unsigned>(interveneSlot_), interveneComponent_, holder);
+                    interveneState_ = Intervention::Done;
+                    break;
+                }
+
                 const uint64_t after = perSlot[interveneSlot_];
                 const uint64_t othersAfter = labelled - after;
                 const double gone =
@@ -276,28 +306,41 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
                         ? 1.0 - static_cast<double>(after) /
                                     static_cast<double>(intervenePixelsBefore_)
                         : 0.0;
-                // Others are allowed to move: the camera and the world keep
-                // running. A wide band, because this asks "did everything else
-                // stay roughly put", not "is the scene identical".
-                const double othersDelta =
+                // ONE-SIDED on purpose. The first version required other slots to
+                // stay within +/-50% and returned INCONCLUSIVE on a run where the
+                // target went 684,024 -> 0 px, a perfect result, because the
+                // others grew 59.7%.
+                //
+                // That growth is not noise, it is the mechanism: the slot chosen
+                // is the largest in the frame, so unmarking it stops a big
+                // foreground surface from writing, and the geometry BEHIND it
+                // becomes visible to other marked objects. Other slots MUST grow.
+                // The symmetric band punished exactly the case that proves the
+                // claim.
+                //
+                // What would actually indicate a problem is other slots LOSING
+                // pixels -- that would mean the intervention disturbed more than
+                // the one primitive it touched.
+                const double othersLost =
                     interveneOthersBefore_
-                        ? std::abs(static_cast<double>(othersAfter) -
-                                   static_cast<double>(interveneOthersBefore_)) /
-                              static_cast<double>(interveneOthersBefore_)
+                        ? 1.0 - static_cast<double>(othersAfter) /
+                                    static_cast<double>(interveneOthersBefore_)
                         : 0.0;
                 const bool targetGone = gone >= 0.95;
-                const bool othersHeld = othersDelta <= 0.50;
+                const bool othersHeld = othersLost <= 0.20;   // growth is fine, loss is not
                 LogWarn("groundtruth RESULT: slot %u went %llu -> %llu px (%.1f%% removed); "
-                        "all other slots %llu -> %llu px (%.1f%% change). VERDICT: %s",
+                        "all other slots %llu -> %llu px (%.1f%% lost; growth is expected, "
+                        "the unmarked surface stops occluding them). VERDICT: %s",
                         static_cast<unsigned>(interveneSlot_), intervenePixelsBefore_, after,
-                        100.0 * gone, interveneOthersBefore_, othersAfter, 100.0 * othersDelta,
+                        100.0 * gone, interveneOthersBefore_, othersAfter, 100.0 * othersLost,
                         (targetGone && othersHeld)
                             ? "PASS -- exactly the unmarked object's pixels disappeared"
                             : (!targetGone ? "FAIL -- the unmarked object's pixels are STILL "
                                              "THERE, so the slot does not mean what the sidecar "
                                              "says"
-                                           : "INCONCLUSIVE -- the rest of the scene moved too "
-                                             "much to attribute the change"));
+                                           : "INCONCLUSIVE -- other slots LOST pixels too, so "
+                                             "the intervention disturbed more than the one "
+                                             "primitive it touched"));
                 interveneState_ = Intervention::Done;
                 break;
             }
