@@ -119,6 +119,25 @@ public:
 
     const std::vector<MarkedPrimitive>& marked() const { return marked_; }
 
+    // ---- ground truth by intervention --------------------------------------
+    //
+    // Turn ONE slot off, deliberately, and see whether exactly its pixels vanish.
+    //
+    // Every validator in tools/ is necessary and not sufficient, and they say so
+    // in their own output: a label that is wrong in a spatially and temporally
+    // coherent way passes all of them. That is not hypothetical here -- a full
+    // session of masks once passed verify_labels while containing another render
+    // target's bytes entirely.
+    //
+    // This is the one test that cannot be satisfied by coherent-but-wrong data.
+    // If our claim "slot S means that object" is true, clearing S's flag removes
+    // that object's pixels and nothing else. If the mask is really some other
+    // buffer, or the slot table is a fiction, the pixels do not move.
+    //
+    // Returns the component that was unmarked, or nullptr if the slot was not
+    // held. Must run on the game thread: it calls the engine's own setter.
+    void* UnmarkSlotForGroundTruth(ue4::Engine& engine, uint8_t slot);
+
     // Slot -> object identity, for the per-frame sidecar table. The 8-bit
     // stencil value is a lease, not an identity: it only means something joined
     // against this map.

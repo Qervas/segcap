@@ -262,6 +262,40 @@ bool CustomDepthMarker::WasRecentlyRendered(void* component, float toleranceSeco
     return visible;
 }
 
+void* CustomDepthMarker::UnmarkSlotForGroundTruth(ue4::Engine& engine, uint8_t slot) {
+    // Deliberately does NOT release the slot back to the pool, and does NOT
+    // remove the entry from marked_. Both would confound the measurement: a
+    // reissued slot would put a DIFFERENT object's pixels under the same id, and
+    // "the pixels went away" would no longer mean what we want it to mean.
+    //
+    // The point is to change exactly one thing -- this primitive's opt-in -- and
+    // watch the mask. Leaving the lease held means any pixels that survive under
+    // this id are unambiguously a failure of the claim, not a re-lease.
+    for (auto& mp : marked_) {
+        if (mp.stencilValue != slot) continue;
+        if (!engine.StillLive(mp.component, mp.objectIndex, mp.serialNumber)) {
+            LogWarn("groundtruth: slot %u's component was destroyed before the "
+                    "intervention could run; nothing to prove",
+                    static_cast<unsigned>(slot));
+            return nullptr;
+        }
+        if (!fnSetRenderCustomDepth_) {
+            LogError("groundtruth: no SetRenderCustomDepth UFunction, so the flag cannot "
+                     "be cleared the way the engine would clear it");
+            return nullptr;
+        }
+        struct { uint32_t bValue; } off = {0};
+        ue4::GetProcessEventHook().CallFunction(mp.component, fnSetRenderCustomDepth_, &off);
+        LogWarn("groundtruth: UNMARKED slot %u (%s) -- from here its pixels must vanish "
+                "and no others may move",
+                static_cast<unsigned>(slot), mp.className.c_str());
+        return mp.component;
+    }
+    LogWarn("groundtruth: slot %u is not held by any marked primitive",
+            static_cast<unsigned>(slot));
+    return nullptr;
+}
+
 bool CustomDepthMarker::UnmarkPrimitive(const MarkedPrimitive& mp) {
     if (!mp.component) return false;
 

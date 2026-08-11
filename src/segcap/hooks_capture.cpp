@@ -13,6 +13,10 @@
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 namespace segcap {
+
+void Hooks::SetIntervene(bool on) {
+    interveneState_ = on ? Intervention::Waiting : Intervention::Off;
+}
 namespace {
 
 // Capture budget, expressed as coverage in TIME rather than in frames.
@@ -210,6 +214,97 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     const bool idsAreOurs = !leaseCheckPossible || unleasedFrac <= kMaxUnleasedFraction;
 
     const bool hasContent = distinctIds >= kMinIdsToStart && ourMarks > 0 && idsAreOurs;
+
+    // ---- ground truth by intervention --------------------------------------
+    //
+    // Change exactly one thing and require exactly one consequence. Everything
+    // else this file does can be satisfied by a mask that is coherently wrong;
+    // this cannot. If "slot S means that object" is true, clearing S's flag
+    // removes S's pixels and moves nothing else. If the mask is a different
+    // buffer, or the slot table is a fiction, the pixels sit there unchanged.
+    if (interveneState_ != Intervention::Off && hasContent) {
+        // Per-slot pixel counts for this frame -- the measurement itself.
+        uint64_t perSlot[256] = {};
+        for (uint32_t y = 0; y < mf.height; ++y) {
+            const uint8_t* r = mf.data + static_cast<size_t>(y) * mf.rowPitch;
+            for (uint32_t x = 0; x < mf.width; ++x) ++perSlot[r[x]];
+        }
+        uint64_t labelled = 0;
+        for (int i = 1; i < 256; ++i) labelled += perSlot[i];
+
+        switch (interveneState_) {
+            case Intervention::Waiting: {
+                if (++interveneStableFrames_ < kInterveneWarmupFrames) break;
+                // Pick the largest non-trivial slot: the bigger its footprint,
+                // the less ambiguous "its pixels vanished" is. A slot with 40
+                // pixels could disappear through ordinary occlusion.
+                uint8_t best = 0;
+                uint64_t bestPx = 0;
+                for (int i = 1; i < 256; ++i) {
+                    if (perSlot[i] > bestPx) { bestPx = perSlot[i]; best = static_cast<uint8_t>(i); }
+                }
+                if (!best || bestPx < 500) break;   // wait for something worth measuring
+                interveneSlot_ = best;
+                intervenePixelsBefore_ = bestPx;
+                interveneOthersBefore_ = labelled - bestPx;
+                interveneState_ = Intervention::Requested;
+                LogWarn("groundtruth: selected slot %u with %llu px (%.2f%% of frame); "
+                        "everything else holds %llu px. Requesting unmark.",
+                        static_cast<unsigned>(best), bestPx,
+                        100.0 * static_cast<double>(bestPx) /
+                            static_cast<double>(static_cast<uint64_t>(mf.width) * mf.height),
+                        interveneOthersBefore_);
+                // The unmark must happen on the game thread; it calls the
+                // engine's own setter so the render proxy is rebuilt.
+                const uint8_t slot = best;
+                ue4::GetProcessEventHook().RunOnGameThread([slot](ue4::Engine& e) {
+                    GetMarker().UnmarkSlotForGroundTruth(e, slot);
+                });
+                interveneFiredFrame_ = mf.frameIndex;
+                interveneState_ = Intervention::Settling;
+                interveneStableFrames_ = 0;
+                break;
+            }
+            case Intervention::Settling: {
+                // Give the renderer time to rebuild the scene proxy. Judging on
+                // the very next frame would fail even when the claim is true.
+                if (++interveneStableFrames_ < kInterveneSettleFrames) break;
+                const uint64_t after = perSlot[interveneSlot_];
+                const uint64_t othersAfter = labelled - after;
+                const double gone =
+                    intervenePixelsBefore_
+                        ? 1.0 - static_cast<double>(after) /
+                                    static_cast<double>(intervenePixelsBefore_)
+                        : 0.0;
+                // Others are allowed to move: the camera and the world keep
+                // running. A wide band, because this asks "did everything else
+                // stay roughly put", not "is the scene identical".
+                const double othersDelta =
+                    interveneOthersBefore_
+                        ? std::abs(static_cast<double>(othersAfter) -
+                                   static_cast<double>(interveneOthersBefore_)) /
+                              static_cast<double>(interveneOthersBefore_)
+                        : 0.0;
+                const bool targetGone = gone >= 0.95;
+                const bool othersHeld = othersDelta <= 0.50;
+                LogWarn("groundtruth RESULT: slot %u went %llu -> %llu px (%.1f%% removed); "
+                        "all other slots %llu -> %llu px (%.1f%% change). VERDICT: %s",
+                        static_cast<unsigned>(interveneSlot_), intervenePixelsBefore_, after,
+                        100.0 * gone, interveneOthersBefore_, othersAfter, 100.0 * othersDelta,
+                        (targetGone && othersHeld)
+                            ? "PASS -- exactly the unmarked object's pixels disappeared"
+                            : (!targetGone ? "FAIL -- the unmarked object's pixels are STILL "
+                                             "THERE, so the slot does not mean what the sidecar "
+                                             "says"
+                                           : "INCONCLUSIVE -- the rest of the scene moved too "
+                                             "much to attribute the change"));
+                interveneState_ = Intervention::Done;
+                break;
+            }
+            default:
+                break;
+        }
+    }
 
     if (leaseCheckPossible && !idsAreOurs && !warnedUnleasedIds_) {
         warnedUnleasedIds_ = true;

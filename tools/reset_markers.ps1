@@ -48,6 +48,7 @@ $markers = @(
     "segcap.requirearm",  # hold the readback until segcap.arm appears
     "segcap.arm",         # the arm trigger itself
     "segcap.idbuf",       # id-buffer probe (copies from integer targets)
+    "segcap.groundtruth", # unmark one slot mid-run and check its pixels vanish
     "segcap.introspect"   # reflection dump
 )
 

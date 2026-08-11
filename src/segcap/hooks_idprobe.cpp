@@ -247,11 +247,24 @@ void Hooks::OnIdBufferReady(const MaskFrame& frame) {
     if (_wfopen_s(&f, path, L"wb") != 0 || !f) return;
     std::fprintf(f, "P5\n%u %u\n255\n", frame.width, frame.height);
     std::vector<uint8_t> row(frame.width);
+    // Decode by bytesPerPixel. This read used to go through a uint32_t*
+    // unconditionally, which is 4*width bytes per row -- correct for the 4-byte
+    // candidates it was written for, and an OUT-OF-BOUNDS READ for the 1- and
+    // 2-byte candidates it was later widened to accept. With an R8_UINT the row
+    // pitch is about `width`, so each row overran into the next and the last row
+    // read past the end of the mapped readback buffer entirely.
+    //
+    // The histogram loop above was fixed when the probe was widened; this one
+    // was missed, because nothing crashed -- an over-read inside a 4 MB mapped
+    // buffer usually just returns neighbouring rows.
     for (uint32_t y = 0; y < frame.height; ++y) {
-        const auto* src =
-            reinterpret_cast<const uint32_t*>(frame.data + static_cast<size_t>(y) * frame.rowPitch);
+        const uint8_t* src = frame.data + static_cast<size_t>(y) * frame.rowPitch;
         for (uint32_t x = 0; x < frame.width; ++x) {
-            const uint32_t v = src[x];
+            const uint8_t* p = src + static_cast<size_t>(x) * frame.bytesPerPixel;
+            uint32_t v = 0;
+            for (uint32_t b = 0; b < frame.bytesPerPixel; ++b) {
+                v |= static_cast<uint32_t>(p[b]) << (8 * b);
+            }
             // Cheap avalanche so neighbouring ids get far-apart greys.
             uint32_t h = v * 2654435761u;
             h ^= h >> 16;

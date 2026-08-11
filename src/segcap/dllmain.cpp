@@ -217,6 +217,20 @@ DWORD WINAPI InitThread(LPVOID) {
             segcap::LogInfo("ID-BUFFER PROBE enabled (read-only)");
         }
 
+        // Ground truth by intervention: unmark one slot mid-run and require
+        // exactly its pixels to vanish. This MUTATES the game (it clears one
+        // primitive's CustomDepth flag), so it is opt-in like segcap.mark, and
+        // it is the only check here that a coherently-wrong mask cannot pass.
+        std::wstring gt(marker);
+        const size_t dot6 = gt.find_last_of(L'.');
+        if (dot6 != std::wstring::npos) gt = gt.substr(0, dot6);
+        gt += L".groundtruth";
+        if (GetFileAttributesW(gt.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            segcap::Hooks::Get().SetIntervene(true);
+            segcap::LogInfo("GROUND-TRUTH INTERVENTION enabled -- one slot will be unmarked "
+                            "mid-run and its pixels checked");
+        }
+
         // Optional capture profile. Each file holds a single integer.
         auto readInt = [&](const wchar_t* ext) -> unsigned long {
             std::wstring q(marker);

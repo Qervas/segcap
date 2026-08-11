@@ -129,6 +129,12 @@ public:
     void SetProbeIdBuffer(bool on) { probeIdBuffer_ = on; }
     bool probeIdBuffer() const { return probeIdBuffer_; }
 
+    // Ground truth by intervention. Unmarks one slot mid-run and checks that
+    // exactly its pixels disappear -- the only check here that a mask which is
+    // wrong in a spatially and temporally coherent way cannot pass. Mutates the
+    // game, so it is opt-in.
+    void SetIntervene(bool on);
+
     // Capture profile, read from marker files at startup.
     //
     // These are a genuine trade-off rather than a tuning knob, which is why
@@ -459,6 +465,28 @@ private:
     // resource nobody writes to any more.
     uint32_t maskSourceMissing_ = 0;
     static constexpr uint32_t kMaskSourceMissingLimit = 120;
+
+    // ---- ground truth by intervention --------------------------------------
+    //
+    // Every other check we have is necessary and not sufficient, and one of them
+    // once passed a whole session of masks that contained another render target
+    // entirely. This is the only test that a coherent-but-wrong mask cannot pass:
+    // turn ONE slot's flag off and require exactly its pixels to disappear.
+    //
+    // Runs as a state machine across frames because the unmark has to happen on
+    // the game thread and the renderer takes a frame or two to rebuild the scene
+    // proxy, so "before" and "after" cannot be adjacent frames.
+    enum class Intervention { Off, Waiting, Requested, Settling, Done };
+    Intervention interveneState_ = Intervention::Off;
+    uint8_t interveneSlot_ = 0;
+    uint64_t intervenePixelsBefore_ = 0;
+    uint64_t interveneOthersBefore_ = 0;
+    uint64_t interveneFiredFrame_ = 0;
+    uint32_t interveneStableFrames_ = 0;
+    // Frames of settled recording before intervening, and frames to let the
+    // scene proxy rebuild afterwards.
+    static constexpr uint32_t kInterveneWarmupFrames = 90;
+    static constexpr uint32_t kInterveneSettleFrames = 30;
     bool idChannelFound_ = false;
     bool loggedIdExhausted_ = false;
     // Dumps to spend before giving up on a candidate and advancing. Small,

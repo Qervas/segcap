@@ -75,7 +75,16 @@ param(
     # coverage, so objects actually leave and re-enter the working set). One
     # run cannot serve both well.
     [int]$Captures = 0,
-    [int]$Stride = 0
+    [int]$Stride = 0,
+    # Ground truth by intervention: once recording has settled, unmark ONE slot
+    # and require exactly its pixels to disappear.
+    #
+    # This is the only check in the project that a coherently-wrong mask cannot
+    # pass. Everything else -- identity consistency, spatial coherence, temporal
+    # coherence, the leased-slot gate -- is necessary and not sufficient, and a
+    # full session of masks once passed verify_labels while containing a
+    # completely different render target's bytes.
+    [switch]$GroundTruth
 )
 
 $ErrorActionPreference = "Stop"
@@ -112,6 +121,10 @@ foreach ($f in @($dll, $injector, $vpad, $gameExe)) {
 # and kill the game -- reported as "no masks were written", cause in neither the
 # code under test nor the game.
 & (Join-Path $root "tools\reset_markers.ps1") -Bin (Join-Path $root "build\bin")
+if ($GroundTruth) {
+    Set-Content -Path (Join-Path $root "build\bin\segcap.groundtruth") -Value "1" -NoNewline
+    Write-Host "[auto] GROUND TRUTH: one slot will be unmarked mid-run and its pixels checked"
+}
 foreach ($stale in @()) {
     $p = Join-Path $root "build\bin\$stale"
     if (Test-Path $p) {
@@ -536,10 +549,33 @@ if (-not $NoMark) {
         Write-Host "           A stale segcap.census marker was present at launch."
     } elseif (-not $peFound) {
         Write-Host "  VERDICT: FAILED -- ProcessEvent was never confirmed, so nothing could be marked."
+    } elseif ($peak -le 250000) {
+        # The run never entered the level, so nothing downstream of it means
+        # anything. This branch exists because a run that stayed at the menu --
+        # 58 stuck recoveries at one coordinate, 197,085 peak slots -- still
+        # printed "VERDICT: ok" on the strength of a single mask. A verdict that
+        # cannot fail when the game never started is not a verdict.
+        Write-Host "  VERDICT: FAILED -- never reached the level (peak $peak slots)."
+        Write-Host "           The patrol was stuck or the save never loaded; nothing"
+        Write-Host "           downstream of this is evidence about the code."
     } elseif ($masks.Count -eq 0) {
         Write-Host "  VERDICT: FAILED -- ProcessEvent found but no masks were written."
+    } elseif ($masks.Count -lt 20) {
+        # A handful of masks means the gate was mostly refusing. That is a real
+        # signal and it was previously indistinguishable from a healthy run.
+        Write-Host "  VERDICT: WEAK -- only $($masks.Count) masks; the capture gate was"
+        Write-Host "           refusing most frames. Check 'recording=' and 'REFUSING' lines."
     } else {
         Write-Host "  VERDICT: ok"
+    }
+
+    if ($GroundTruth) {
+        $gt = Select-String -Path $snapshot -Pattern "groundtruth RESULT" -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($gt) {
+            Write-Host "  $($gt.Line.Trim())"
+        } else {
+            Write-Host "  GROUND TRUTH: never ran (needs a settled recording with a slot >= 500 px)."
+        }
     }
 }
 Write-Host "======================================"
