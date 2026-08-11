@@ -166,7 +166,13 @@ bool Hooks::AcquireVTables() {
         //
         // Gated so a title that never asks for injection (Stray) gains no extra
         // vtable patches and no new code on any hot path at all.
-        if (foreignInject_) {
+        // Not in dry-run: the guard exists to stop a COPY landing inside a render
+        // pass, and a dry run records no copy. Installing two extra detours on
+        // one of the engine's hottest paths to protect against something that
+        // cannot happen is exactly the kind of cost that should not exist -- and
+        // it doubles as the bisection that says whether these hooks are what
+        // destabilised the game.
+        if (foreignInject_ && !injectDryRun_) {
             ID3D12GraphicsCommandList4* gcl4 = nullptr;
             if (SUCCEEDED(dummyList->QueryInterface(IID_PPV_ARGS(&gcl4))) && gcl4) {
                 auto** vt4 = *reinterpret_cast<void***>(gcl4);

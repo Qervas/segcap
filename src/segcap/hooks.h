@@ -521,6 +521,10 @@ private:
     // serialise every recording thread in the game on us.
     std::mutex listMutex_;
     std::unordered_map<ID3D12GraphicsCommandList*, ListState> listState_;
+    // Number of recorded-but-unsubmitted tokens. Read without the lock in
+    // ExecuteCommandLists so the common case -- nothing outstanding -- costs one
+    // relaxed load instead of a global mutex on every submit from every thread.
+    std::atomic<uint32_t> outstandingTokens_{0};
 
     using BeginRenderPassFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList4*, UINT,
                                                        const void*, const void*, UINT);

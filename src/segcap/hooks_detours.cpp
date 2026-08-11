@@ -67,12 +67,25 @@ void STDMETHODCALLTYPE Hooks::ExecuteCommandLists_(ID3D12CommandQueue* self, UIN
     // buffer the GPU has not written yet.
     Readback::InjectToken claimed[8];
     UINT claimedCount = 0;
-    if (h.foreignInject_ && lists && count) {
+    // The atomic is checked BEFORE the lock, and it is not an optimisation.
+    //
+    // ExecuteCommandLists is called many times per frame from several threads,
+    // and world streaming is the heaviest submission period in the process.
+    // Taking a global mutex there unconditionally serialised every submitting
+    // thread on us -- including in DRY-RUN mode, where no token can ever exist,
+    // so the lock was pure cost protecting an always-empty map. inZOI died
+    // during world load in that mode, with no GPU work recorded at all.
+    //
+    // When nothing is outstanding -- always in dry run, and most frames
+    // otherwise -- the cost is now one relaxed load.
+    if (h.foreignInject_ && lists && count &&
+        h.outstandingTokens_.load(std::memory_order_relaxed) != 0) {
         std::lock_guard<std::mutex> lock(h.listMutex_);
         for (UINT i = 0; i < count && claimedCount < 8; ++i) {
             auto it = h.listState_.find(reinterpret_cast<ID3D12GraphicsCommandList*>(lists[i]));
             if (it == h.listState_.end() || !it->second.pendingToken.valid) continue;
             claimed[claimedCount++] = it->second.pendingToken;
+            h.outstandingTokens_.fetch_sub(1, std::memory_order_relaxed);
             // Cleared so a list submitted twice does not signal the same slot
             // twice -- the second signal would retire a slot whose buffer is
             // about to be overwritten by the re-execution.
@@ -282,6 +295,7 @@ void Hooks::TryInjectCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* targe
         std::lock_guard<std::mutex> lock(listMutex_);
         listState_[list].pendingToken = token;
     }
+    outstandingTokens_.fetch_add(1, std::memory_order_relaxed);
     ++injRecorded_;
     if (injRecorded_ == 1) {
         LogWarn("inject: FIRST copy recorded into the game's own command list %p "
