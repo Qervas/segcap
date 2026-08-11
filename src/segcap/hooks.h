@@ -112,6 +112,10 @@ public:
 
     void SetRequireArm(bool on) { requireArm_ = on; }
 
+    // Isolation switch for the backbuffer copy; see the colour block in
+    // OnPresent. Set from a "segcap.nocolour" marker.
+    void SetNoColour(bool on) { noColour_ = on; }
+
     // A/B mode: capture colour frames on a fixed stride regardless of whether a
     // mask was kept, so the "marking off" condition produces frames at all.
     void SetAbTest(bool on) { abTest_ = on; }
@@ -471,6 +475,7 @@ private:
 
     // Hold the readback until a segcap.arm file appears next to the DLL.
     bool requireArm_ = false;
+    bool noColour_ = false;
     bool armed_ = false;
 
     bool d3dDebug_ = false;
@@ -625,8 +630,8 @@ private:
     // marks at all -- extra frames only cost time.
     static constexpr uint32_t kIdProbeAttemptsPerCandidate = 3;
     static constexpr uint32_t kIdProbeDumpBudget = 6;
-    uint32_t maxCaptures_ = 150;
-    uint64_t captureStride_ = 60;
+    uint32_t maxCaptures_ = 600;   // 60 gave a 7-second demo at stride 4; a real video needs more
+    uint64_t captureStride_ = 6;    // ~5/sec at 30fps: motion is visible without 600 near-identical frames
 };
 
 }  // namespace segcap

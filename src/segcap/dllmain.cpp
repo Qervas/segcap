@@ -245,6 +245,17 @@ DWORD WINAPI InitThread(LPVOID) {
                 CloseHandle(fh);
             }
         }
+        {
+            std::wstring nc(marker);
+            const size_t dotc = nc.find_last_of(L'.');
+            if (dotc != std::wstring::npos) nc = nc.substr(0, dotc);
+            nc += L".nocolour";
+            if (GetFileAttributesW(nc.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                segcap::Hooks::Get().SetNoColour(true);
+                segcap::LogWarn("colour backbuffer capture DISABLED (segcap.nocolour) "
+                                "-- isolating whether it causes the arm-time crash");
+            }
+        }
         if (GetFileAttributesW(idb.c_str()) != INVALID_FILE_ATTRIBUTES) {
             segcap::Hooks::Get().SetProbeIdBuffer(true);
             segcap::LogInfo("ID-BUFFER PROBE enabled (read-only)");

@@ -262,12 +262,18 @@ def log_is_advancing(path: Path, seconds: float = 12.0) -> bool:
     The DLL logs from the Present path, so its log growing is direct evidence
     that frames are still being presented -- which is the only liveness that
     matters once we are trying to capture. Cheap: one stat() call.
+
+    SIZE, not mtime. Windows does not reliably flush a file's modification time
+    while a handle is open and being appended to -- the directory entry can sit
+    stale for a long time while the file grows. Checking mtime therefore reported
+    a perfectly healthy, actively-logging game as dead, and killed two capture
+    runs before they ever armed. Size comes from the same stat() and does update.
     """
     if not path.exists():
         return False
-    first = path.stat().st_mtime
+    first = path.stat().st_size
     time.sleep(min(seconds, 3.0))
-    return path.stat().st_mtime > first
+    return path.stat().st_size > first
 
 
 def tail(path: Path, lines: int = 1200) -> list[str]:

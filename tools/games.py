@@ -70,6 +70,10 @@ class GameProfile:
     # Some titles load paused and need an explicit unpause; some do not.
     settle_after_unpause: float = 60.0
 
+    # Key that resumes the simulation, sent instead of clicking a transport
+    # button. Empty means the title has no separate sim clock.
+    resume_key: str = ""
+
 
 INZOI = GameProfile(
     name="inzoi",
@@ -84,7 +88,10 @@ INZOI = GameProfile(
     ),
     # The sim loads PAUSED. Clicking play is what starts time; the clock in the
     # bottom-left advancing is how you know it worked.
-    after_load=(Step(0.0660, 0.9606, 5, "transport play (unpause)"),),
+    # No transport CLICK: '1' resumes at normal speed, and a key cannot land on
+    # the pause button next door, which is what the click was doing.
+    after_load=(),
+    resume_key="1",
 )
 
 

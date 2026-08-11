@@ -419,7 +419,17 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
         // almost no motion, which makes a useless demo. Striding spreads the
         // same budget across ~20 seconds so objects actually move, enter, and
         // leave -- which is also what makes the identity/slot behaviour visible.
-        if ((recordedFrames_ % captureStride_) != 1) return;
+        // Stride on the FRAME INDEX, not on a private counter.
+        //
+        // recordedFrames_ counts frames that reached this path; the colour
+        // capture on the Present path has no access to it and strides on
+        // frameIndex_. Two clocks, so the two sides picked different frames and
+        // the exact-index pairing in OnColourReady almost never matched: one run
+        // kept 61 masks out of 23,219 frames and wrote ZERO colour frames.
+        // Keying both on frameIndex_ makes the pairing exact by construction
+        // rather than by coincidence, which is the property that guarantees a
+        // mask and its frame came from the same Present.
+        if ((frame.frameIndex % captureStride_) != 1) return;
         ++masksDumped_;
         maskKept_.insert(frame.frameIndex);
     }
@@ -491,9 +501,19 @@ void Hooks::OnColourReady(const MaskFrame& frame) {
         ++colourDumped_;
     } else {
         if (!recording_) return;
-        // Only keep colour frames whose mask was also kept. An unpaired frame is
-        // dead weight -- make_demo can only use indices that have both.
-        if (!maskKept_.count(frame.frameIndex)) return;
+        // The STRIDE is the pairing guarantee now, not this lookup.
+        //
+        // Both sides select frames by `frameIndex % captureStride == 1`, so a
+        // colour frame and its mask are chosen by the same rule from the same
+        // clock and their indices coincide by construction. Requiring the mask to
+        // be kept ALREADY was a race on top of that: the mask is copied at the
+        // barrier and delivered several frames after its Present, so a colour
+        // frame that arrived first was discarded permanently even though its mask
+        // was moments away. That race is why runs wrote 61 masks and zero frames.
+        //
+        // make_demo pairs on exact index and reports anything unmatched, so a
+        // stray unpaired frame is visible rather than silently mispaired.
+        if ((frame.frameIndex % captureStride_) != 1) return;
         ++colourDumped_;
     }
 

@@ -30,6 +30,12 @@ param(
     [string]$Out = "build\bin\act.png",
     [double]$Scale = 0.62,
     # Click at this point in the window, physical pixels from its top-left.
+    # Send a keystroke to the game. inZOI's transport responds to the number
+    # keys -- "1" resumes at normal speed -- which is far more reliable than
+    # clicking a transport button, because a key needs no coordinate and cannot
+    # land on the neighbouring control. Our click route was hitting pause instead
+    # of play, so every "unpaused" capture was actually of a frozen sim.
+    [string]$Key = "",
     [int]$ClickX = -1,
     # Same click, as a fraction of the window. Prefer these: pixel coordinates
     # measured on one window size click empty space on any other.
@@ -102,6 +108,26 @@ public class Act {
 
 [Act]::SetProcessDPIAware() | Out-Null
 
+# Keystrokes go through keybd_event with KEYEVENTF_SCANCODE, not SendKeys.
+# Games commonly read raw scan codes and ignore the synthesised virtual-key
+# messages SendKeys produces, so SendKeys looks like it worked and does nothing.
+if (-not ("Keys1" -as [type])) {
+    Add-Type @"
+using System; using System.Runtime.InteropServices;
+public class Keys1 {
+  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);
+  [DllImport("user32.dll")] public static extern uint MapVirtualKeyW(uint code, uint mapType);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  public static void Tap(byte vk){
+    byte sc = (byte)MapVirtualKeyW(vk, 0);
+    keybd_event(vk, sc, 0x0008, IntPtr.Zero);              // KEYEVENTF_SCANCODE down
+    System.Threading.Thread.Sleep(45);
+    keybd_event(vk, sc, 0x0008 | 0x0002, IntPtr.Zero);     // + KEYUP
+  }
+}
+"@
+}
+
 $g = Get-Process -Name $Process -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $g) { throw "$Process is not running" }
 
@@ -125,6 +151,19 @@ if (-not $focused) {
 # script cheerfully printed a click for each step. Coordinates measured on one
 # window size are not portable, but neither is a rect fetched by a subshell
 # that can fail silently.
+# Keys go after the focus loop above, so the game is foreground when they land.
+if ($Key) {
+    $vk = if ($Key -match '^[0-9]$') { [byte][char]$Key }
+          elseif ($Key -match '^[a-zA-Z]$') { [byte][char]([string]$Key).ToUpper() }
+          else { 0 }
+    if ($vk -eq 0) {
+        Write-Host "key: '$Key' not supported (use a single digit or letter)"
+    } else {
+        [Keys1]::Tap($vk)
+        Write-Host "key: sent '$Key' (vk 0x$('{0:X2}' -f $vk)) to pid $($g.Id)"
+    }
+}
+
 if ($ClickFx -ge 0 -and $ClickFy -ge 0) {
     $wr = New-Object Act+RECT
     if (-not [Act]::GetWindowRect($g.MainWindowHandle, [ref]$wr)) {

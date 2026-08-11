@@ -752,20 +752,63 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
             while (frameStamps_.size() > 64) frameStamps_.pop_front();
         }
 
-        // Colour backbuffer, same frame, same index. Capturing both here is the
-        // whole reason the streams cannot drift: there is no separate video
-        // recorder with its own clock to reconcile afterwards.
-        if (swapChain) {
-            ID3D12Resource* back = nullptr;
-            const UINT idx = swapChain->GetCurrentBackBufferIndex();
-            if (SUCCEEDED(swapChain->GetBuffer(idx, IID_PPV_ARGS(&back))) && back) {
-                if (colourRing_.Prepare(device_, back, 0 /*colour, not a plane*/)) {
-                    // At Present time the game has transitioned the backbuffer to
-                    // PRESENT (0). Use the shadowed state rather than assuming.
-                    colourRing_.Enqueue(queue_, back, StateOf(back), frameIndex_);
-                }
-                back->Release();
+    }
+
+    // Colour backbuffer, same frame, same index. Capturing both here is the
+    // whole reason the streams cannot drift: there is no separate video recorder
+    // with its own clock to reconcile afterwards.
+    //
+    // MOVED OUT of the Present-readback branch above, which is an `else` to the
+    // injection path. So the moment injection became the mask route -- which is
+    // exactly what made inZOI work at all -- this block stopped running, and the
+    // run that finally produced 61 correct masks wrote `frames: 0` alongside
+    // them. A mask with no frame cannot be overlaid, which is the deliverable.
+    // The design intent in the comment above was always that both come from the
+    // same Present; the inject path had silently opted out of half of it.
+    //
+    // Gated on armReady only, not on canCopy: canCopy is about whether our
+    // SHADOW knows the MASK source's state, which says nothing about the
+    // backbuffer. The backbuffer's state at Present is known independently --
+    // the game has just transitioned it to PRESENT -- and StateOf() reads the
+    // shadow rather than assuming it.
+    // SAME STRIDE AS THE MASK. Enqueuing every Present pushed ~23,000 frames
+    // through a 3-slot ring, so a colour frame was overwritten long before its
+    // mask was kept, and the survivors landed on indices no mask shared. Only
+    // capture the frames we will actually pair.
+    // ISOLATION SWITCH: "segcap.nocolour" disables the backbuffer copy.
+    //
+    // The E_INVALIDARG at the game's Close() started landing immediately after
+    // CAPTURE ARMED once this block began running on the inject path -- and
+    // arming is exactly when it starts, because it is gated on armReady. Runs
+    // before that change armed and captured 61 masks without dying. That is a
+    // correlation, not a cause, and the way to tell them apart is to remove one
+    // variable rather than argue about it: same build, same route, colour off.
+    if (!censusOnly_ && !noReadback_ && armReady && swapChain && device_ && queue_ &&
+        !noColour_ && (frameIndex_ % captureStride_) == 1) {
+        ID3D12Resource* back = nullptr;
+        const UINT idx = swapChain->GetCurrentBackBufferIndex();
+        if (SUCCEEDED(swapChain->GetBuffer(idx, IID_PPV_ARGS(&back))) && back) {
+            if (colourRing_.Prepare(device_, back, 0 /*colour, not a plane*/)) {
+                // PRESENT, not our shadow.
+                //
+                // DXGI REQUIRES the back buffer to be in D3D12_RESOURCE_STATE_
+                // PRESENT when Present() is called -- we are inside that call, so
+                // this is a guarantee from the API contract, not an assumption.
+                // Our shadow is the weaker source: it only knows states it has
+                // observed a barrier for, and the swapchain rotates buffers, so
+                // for a back buffer it can easily be stale or empty. Declaring a
+                // wrong StateBefore is an invalid barrier, which D3D12 latches and
+                // reports from the GAME's Close() as E_INVALIDARG.
+                //
+                // Measured: colour ON crashed at CAPTURE ARMED with exactly that
+                // error and wrote 0 masks; colour OFF, same build and route,
+                // survived and wrote 61. The injected mask copy has always taken
+                // its StateBefore from the game's own barrier -- "an equality
+                // copied out of the caller's struct cannot be wrong" -- and this
+                // path was the one place given a weaker guarantee.
+                colourRing_.Enqueue(queue_, back, D3D12_RESOURCE_STATE_PRESENT, frameIndex_);
             }
+            back->Release();
         }
         colourRing_.Drain([this](const MaskFrame& f) { OnColourReady(f); });
     }

@@ -152,6 +152,21 @@ class Run:
             self.say("no load signal -- continuing anyway")
 
         H.wait_for_world_settled(LOG, p.load_ceiling, self.pid, self.say)
+
+        # RESUME THE SIM WITH A KEY, NOT A CLICK, AND DO IT FIRST.
+        #
+        # The transport bar's play button sits between pause and the
+        # fast-forward speeds, and our click coordinate was landing left of it --
+        # so every "unpaused" capture was of a frozen simulation, and the motion
+        # in those masks was camera movement alone. A key needs no coordinate and
+        # cannot hit the neighbouring control. inZOI maps the number keys to
+        # speeds, with 1 being normal.
+        if p.resume_key:
+            self.say(f"resuming the sim with '{p.resume_key}'")
+            if not self.preflight:
+                subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                                "-File", str(ACT), "-Key", p.resume_key, "-Wait", "1"],
+                               cwd=str(ROOT))
         for step in p.after_load:
             self.click(step)
         if p.after_load:
