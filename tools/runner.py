@@ -294,6 +294,12 @@ class Run:
                 if self.preflight:
                     running = True
                     break
+                # Bail the moment the game is gone rather than sweeping a corpse.
+                # Observed: seven consecutive clicks each throwing
+                # "inZOI-Win64-Shipping is not running", seven "screen static:
+                # still paused" verdicts about a process that had already
+                # exited, and then a 220-second hold against it.
+                H.ensure_live(self.pid, "transport sweep", self.say)
                 self.say(f"resume: clicking transport at ({x:.3f}, {y:.4f})")
                 subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                                 "-File", str(ACT), "-ClickFx", str(x), "-ClickFy", str(y),
@@ -336,6 +342,17 @@ class Run:
         # menu's -- an unreadable level falls through, because "I could not tell"
         # is not "it is wrong", and the fallback path for titles with no level
         # line has to keep working.
+        # IS THE GAME EVEN ALIVE? Ask before arming, not 220 seconds later.
+        #
+        # Three attempts in one run armed on a dead process. The transport sweep
+        # had already thrown "inZOI-Win64-Shipping is not running" seven times in
+        # a row, the pause probe had correctly reported `screen static`, and the
+        # harness announced ARMED anyway and settled in to hold for 220s against
+        # a pid that no longer existed. ensure_live raises GameGone, which go()
+        # already catches and turns into a failed attempt -- so the retry starts
+        # immediately instead of after the full hold.
+        H.ensure_live(self.pid, "arming", self.say)
+
         level = H.current_level(LOG)
         if level and self.menu_level and level == self.menu_level:
             self.say(f"REFUSING to arm: still in '{level}', the world we started in. "
