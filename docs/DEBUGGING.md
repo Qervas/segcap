@@ -1803,6 +1803,55 @@ cannot produce a crash from our own copy. The two populations are not comparable
 so the ratio is not evidence. Worth re-measuring on a fresh machine with equal
 numbers of gameplay-reaching runs; not worth acting on now.
 
+### 8.21 The engine stopped populating, and it was not us
+
+Late in a long session every inZOI run began failing at the engine layer:
+
+```
+ue4: object graph did NOT settle within 90s -- only 53375 slots, floor is 200000
+ue4: ProcessEvent not found in slots 60..80
+state: MENU level=? objects=0
+```
+
+No ProcessEvent means no execution point: no marking, no world state, no
+masks. Dated across the day's archives, the break is sharp:
+
+```
+16:21-16:46   plateau = 245,465-245,466   normal
+19:28 onward  plateau = 53,375            every run
+```
+
+I had been editing the DLL in that window, so the obvious suspect was me. The
+cheap way to find out is not to reason about which edit could plausibly do it
+-- it is to rebuild the last commit known to have produced 401 masks and a
+ground-truth PASS, and look:
+
+```
+ue4: object graph settled at 53375 slots -- installing ProcessEvent
+```
+
+Same 53,375, byte-identical DLL. The changes are exonerated, and the game's
+own menu now populates to a fifth of what it did that morning, on the same
+binary and the same save, after roughly sixty launch-crash cycles.
+
+Two things worth keeping from it.
+
+**The old log line said "settled".** The known-good build prints `object graph
+settled at 53375 slots` for what is a 25-second timeout against a 200,000
+floor -- a threshold that cannot be met reporting success. §8.16's ceiling fix
+did not create this condition, it made an existing one legible; without that
+change the failure is a silent absence of every downstream capability, with a
+reassuring line above it.
+
+**A bisect answers "is it me" faster than any amount of reading.** Four fixes
+went in during that window on the assumption that the harness was at fault.
+Two of them were real bugs worth having. None of them were this, and one
+restore of one file settled it in ninety seconds.
+
+The practical consequence: a run of attempts on a machine this deep into a
+launch-crash cycle cannot discriminate between hypotheses about our code, and
+should not be used to try. Reboot first.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have
