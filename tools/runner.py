@@ -309,10 +309,40 @@ class Run:
             H.wait_for_world_settled(LOG, p.settle_after_unpause, self.pid, self.say, quiet=6)
         time.sleep(5)
 
-    def capture(self) -> None:
+    def capture(self) -> bool:
+        # DO NOT ARM IF WE KNOW WE ARE NOT IN THE WORLD.
+        #
+        # Every wait in into_gameplay is a CEILING that proceeds on expiry, which
+        # is right -- a missed signal should not deadlock a run. But nothing then
+        # consulted the answer, so a run whose every check had FAILED still armed
+        # and captured happily:
+        #
+        #   no stable level change within 120s -- proceeding
+        #   world-settled signal not seen within 240s -- proceeding
+        #   no stable level change within 240s -- proceeding
+        #   ARMED -- every captured frame from here is gameplay
+        #
+        # That run spent 200s photographing OpeningLevel2. Once the detectors
+        # were fixed to report honestly (see 8.18), the remaining bug was that
+        # the honest answer was ignored one line later.
+        #
+        # Failing the attempt here is strictly better than capturing the menu:
+        # capture.py relaunches, and a fast retry beats 200s of wrong data that
+        # reports success. Only refuses when the level is KNOWN and still the
+        # menu's -- an unreadable level falls through, because "I could not tell"
+        # is not "it is wrong", and the fallback path for titles with no level
+        # line has to keep working.
+        level = H.current_level(LOG)
+        if level and self.menu_level and level == self.menu_level:
+            self.say(f"REFUSING to arm: still in '{level}', the world we started in. "
+                     f"Capturing here would fill the budget with menu frames and "
+                     f"report success. Failing this attempt so the run can retry.")
+            return False
+
         (BIN / "segcap.arm").write_text("1")
-        self.say("ARMED -- every captured frame from here is gameplay")
-        self.say(f"in gameplay; holding for {self.o.seconds}s")
+        self.say(f"ARMED in '{level or 'unknown world'}' -- every captured frame "
+                 f"from here is gameplay")
+        self.say(f"holding for {self.o.seconds}s")
         deadline = time.monotonic() + self.o.seconds
         step = 0
         stalled = 0
@@ -343,6 +373,7 @@ class Run:
             else:
                 time.sleep(3)
             step += 1
+        return True
 
     def report(self) -> None:
         masks = len(list(BIN.glob("segcap_mask_*.pgm")))
