@@ -1472,6 +1472,37 @@ produced nothing."** §8.6 had a mask passing a structural test while being nois
 §2 has counters reporting effort as result; this reports a null experiment as a
 failed one. The correct output was never FAIL or PASS. It was "this did not run."
 
+### 8.15 What it said once it could run
+
+```
+groundtruth: selected slot 102 with 161787 px (15.80% of frame);
+             everything else holds 44351 px. Requesting unmark.
+groundtruth: UNMARKED slot 102 (InstancedStaticMeshComponent)
+groundtruth RESULT: slot 102 went 161787 -> 0 px (100.0% removed);
+             all other slots 44351 -> 46370 px (grew 4.6%).
+             VERDICT: PASS -- exactly the unmarked object's pixels disappeared
+```
+
+One primitive's flag cleared through the engine's own setter; 15.8% of the frame
+went to **exactly zero**, and nothing else lost anything. The other slots *grew*
+4.6%, which is not noise tolerated by the threshold but the mechanism itself:
+the unmarked surface stopped occluding the geometry behind it, so objects that
+were already marked became visible. An earlier version of this test required
+other slots to stay within ±50% and returned INCONCLUSIVE on a perfect result
+for exactly that reason -- the symmetric band punished the case that proves the
+claim. It is one-sided now: growth is expected, loss is not.
+
+Two honest limits. The settle window is about half a second, which is short --
+but the failure direction is the safe one: too little time shows the pixels
+*still there*, a false FAIL, never a false PASS. And this is one slot at one
+moment, not a survey. It does not prove every label is right; it proves the
+mechanism is real, which is what nothing else here could establish.
+
+This is what separates the inZOI result from §8.6, where a mask passed a
+structural check while containing another buffer's bytes entirely. Every other
+test in this project reads the buffer and asks whether it looks like ids.
+This one changes the world and requires the buffer to follow.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have

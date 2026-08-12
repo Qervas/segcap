@@ -1,0 +1,22 @@
+inZOI ground-truth intervention -- PASS
+
+Unmark exactly one primitive's bRenderCustomDepth via the engine's own
+setter, and require exactly that id's pixels to disappear from the mask.
+This is the only check in the project that cannot be satisfied by
+coherent-but-wrong data: every other one reads the buffer; this one
+changes something and requires the mask to follow.
+
+Note the second line: it confirms the unmark ACTUALLY RAN. An earlier
+version of this test reported FAIL on a run where the selected slot was
+held by no live marked primitive, so nothing was changed and there was
+nothing to judge. See DEBUGGING.md 8.13-8.14.
+
+Extracted from build/bin/segcap.log, run of 2026-08-12.
+==============================================================
+[segcap    100.766 warn ] CAPTURE ARMED at frame 3600 -- readback begins now
+[segcap    100.781 warn ] colour: FIRST backbuffer copy recorded into the game's own command list 000002964CA68180 (StateBefore=0x0 from the game's barrier). This is the path the mask copy has always used; the Present-time version of this crashed the game.
+[segcap    125.516 warn ] idbuf: FOUND OUR IDS in 0000029E2D3C2710 channel G16(high) (100.0% of non-zero texels are leased slots; 15 distinct leased values of 114 slots leased, needed 14; largest single id holds 71% of the match). This is the per-object id buffer.
+[segcap    125.516 warn ] capture: mask source switched to the id buffer 0000029E2D3C2710 (channel G16(high)). The CustomDepth stencil-plane route does not carry ids on this title.
+[segcap    130.312 warn ] groundtruth: selected slot 102 with 161787 px (15.80% of frame); everything else holds 44351 px. Requesting unmark.
+[segcap    130.312 warn ] groundtruth: UNMARKED slot 102 (InstancedStaticMeshComponent) -- from here its pixels must vanish and no others may move
+[segcap    130.859 warn ] groundtruth RESULT: slot 102 went 161787 -> 0 px (100.0% removed); all other slots 44351 -> 46370 px (-4.6% lost; growth is expected, the unmarked surface stops occluding them). VERDICT: PASS -- exactly the unmarked object's pixels disappeared
