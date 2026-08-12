@@ -222,10 +222,24 @@ void STDMETHODCALLTYPE Hooks::ResourceBarrier_(ID3D12GraphicsCommandList* self, 
                         b.Transition.Subresource, static_cast<unsigned>(b.Flags));
             }
 
+            // ANY write state -> PRESENT, not specifically RENDER_TARGET.
+            //
+            // I matched RENDER_TARGET and nothing ever fired. The barriers this
+            // game actually issues are StateBefore=0x400 -> StateAfter=0x0, and
+            // 0x400 is COPY_DEST -- RENDER_TARGET is 0x4. inZOI writes its final
+            // image to the backbuffer with a COPY (the DLSS upscale blit), never
+            // by rendering into it, so the transition I was waiting for does not
+            // exist on this title. Reusing the same write-state set the mask path
+            // uses makes this title-agnostic instead of a second guess.
+            //
+            // PRESENT is 0, so StateAfter must be tested for equality; masking
+            // against it is vacuously true and hides exactly this kind of error.
             if (wantColour && !colourInject && b.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE &&
-                (b.Transition.StateAfter & D3D12_RESOURCE_STATE_PRESENT) ==
-                    D3D12_RESOURCE_STATE_PRESENT &&
-                b.Transition.StateBefore == D3D12_RESOURCE_STATE_RENDER_TARGET &&
+                b.Transition.StateAfter == D3D12_RESOURCE_STATE_PRESENT &&
+                (b.Transition.StateBefore & (D3D12_RESOURCE_STATE_RENDER_TARGET |
+                                             D3D12_RESOURCE_STATE_COPY_DEST |
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
+                                             D3D12_RESOURCE_STATE_RESOLVE_DEST)) != 0 &&
                 h.IsBackBuffer(b.Transition.pResource)) {
                 colourInject = true;
                 colourBack = b.Transition.pResource;
@@ -392,14 +406,37 @@ void Hooks::TryInjectCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* targe
 }
 void Hooks::TryInjectColour(ID3D12GraphicsCommandList* list, ID3D12Resource* back,
                             D3D12_RESOURCE_STATES stateAfter, UINT subresource) {
+    // SAY WHY IT REFUSED. The barrier diagnostic proved the gate matches -- the
+    // backbuffer really does go 0x400 -> 0x0 with flags NONE on a registered
+    // resource -- so every remaining failure is in here, and a silent `return`
+    // makes the difference between "wrong render-pass state", "wrong list type"
+    // and "the ring had no slot" unknowable. The mask path had exactly this hole
+    // and closing it is what made it debuggable.
+    ++colInjAttempts_;
+    const bool sayIt = colInjAttempts_ <= 3;
+
     // Same rules as the mask copy, for the same reasons.
-    if (g_renderPassDepth > 0) return;
-    if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+    if (g_renderPassDepth > 0) {
+        if (sayIt) LogWarn("colour: refused -- inside a render pass (depth %u)",
+                           g_renderPassDepth);
+        return;
+    }
+    if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        if (sayIt) LogWarn("colour: refused -- list %p is type %d, not DIRECT",
+                           static_cast<void*>(list), static_cast<int>(list->GetType()));
+        return;
+    }
 
     const Readback::InjectToken token = colourInjectRing_.RecordInto(
         list, back, stateAfter, subresource,
         injectFrame_.load(std::memory_order_relaxed), origBarrier_);
-    if (!token.valid) return;
+    if (!token.valid) {
+        if (sayIt) LogWarn("colour: refused -- RecordInto gave no token "
+                           "(ring dropped=%llu). StateBefore=0x%X sub=%u",
+                           colourInjectRing_.dropped(),
+                           static_cast<unsigned>(stateAfter), subresource);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(listMutex_);
         listState_[list].pendingColourToken = token;

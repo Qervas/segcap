@@ -597,6 +597,7 @@ private:
     uint32_t backBufferCount_ = 0;
     std::atomic<bool> colourInjectArmed_{false};
     uint64_t colInjRecorded_ = 0;
+    uint64_t colInjAttempts_ = 0;
     uint32_t colBarriersSeen_ = 0;
     // The one resource injection is permitted to touch, published by OnPresent
     // and read by ResourceBarrier_ on every recording thread. An atomic rather
