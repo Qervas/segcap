@@ -1727,6 +1727,82 @@ ambiguous between "the menu's world is called ?" and "I could not read the
 world". A log line that renders two different states identically cannot be
 evidence for either.
 
+### 8.19 An honest instrument nobody consults
+
+Fixing the detectors in §8.18 changed nothing on its own, twice, and the shape of
+that is worth more than either fix.
+
+**First.** With `current_level` returning the truth, a run reported:
+
+```
+no stable level change within 120s -- proceeding
+world-settled signal not seen within 240s -- proceeding
+no stable level change within 240s -- proceeding
+ARMED -- every captured frame from here is gameplay
+```
+
+Every check failed, said so correctly, and the harness armed and spent 200
+seconds photographing the main menu. Each of those waits is a *ceiling* that
+proceeds on expiry, which is the right design -- a missed signal should not
+deadlock a run -- but nothing downstream read the answer.
+
+**Second, immediately after fixing that.** The pause probe stopped reporting a
+false `sim IS running` (§8.18) and started correctly reporting `screen static`.
+The next run:
+
+```
+inZOI-Win64-Shipping is not running        (x7)
+screen static: still paused                (x7)
+!! could not resume -- capturing a PAUSED world
+ARMED in 'RedCity_Map' -- every captured frame from here is gameplay
+holding for 220s
+```
+
+The process had already exited. Seven transport clicks into nothing, seven
+correct "static" verdicts about a corpse, then a 220-second hold against a dead
+pid -- three times in one four-attempt run.
+
+Both fixes were right. Both were useless alone, because **the value of a
+measurement is zero until something branches on it.** Every failure in §8.11
+through §8.18 is a detector that answered wrongly; these two are detectors that
+answered correctly into a void. The second kind is harder to see, because the
+log now contains the truth and reads as though someone acted on it.
+
+The rule that falls out: when you fix an instrument, grep for its callers before
+claiming the fix. If the answer is only ever logged, it is documentation, not
+control flow.
+
+### 8.20 What the crash data says now, and what it does not
+
+Four consecutive attempts failed after the harness work, which looks like a
+regression and is not one. The claim is checkable rather than assertable: the DLL
+has not been rebuilt since `9014787`, and the next run after that commit captured
+401 masks and produced the second ground-truth PASS. Everything since is Python
+in the harness. The code that touches the game is byte-identical to a known-good
+run.
+
+What the four deaths were:
+
+```
+t+27s  AccessViolation
+t+77s  E_ABORT/ResizeBuffers
+t+52s  Close()/E_INVALIDARG
+t+86s  E_ABORT/ResizeBuffers
+```
+
+Three different families, all early, on the 51st-54th launch of the day. The
+honest reading is that machine state degrades across a long session of
+launch-crash cycles, and that a run of attempts under those conditions cannot
+discriminate between hypotheses about our code.
+
+One tempting inference to record as *not* supported. The `Close()` family went
+from 1-in-16 before the probe fix to 4-in-12 after, which looks like the more
+permissive probe causing more bad copies. But the probe fix is also what lets a
+run reach gameplay and issue any copies at all -- a run that dies in the menu
+cannot produce a crash from our own copy. The two populations are not comparable,
+so the ratio is not evidence. Worth re-measuring on a fresh machine with equal
+numbers of gameplay-reaching runs; not worth acting on now.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have
