@@ -121,6 +121,149 @@ void SignalReady() {
     CloseHandle(ev);
 }
 
+// Ask the ENGINE what it is doing, instead of inferring it.
+//
+// State was being deduced from proxies -- how many UObjects exist, whether that
+// number is moving, whether anything renders at scene scale. Those correlate
+// with menu / loading / world, and correlation is exactly as reliable as it
+// sounds: it could not tell a loaded world from a loaded world with time
+// stopped, which is how a paused simulation was reported as live gameplay.
+//
+// UE knows both answers exactly and we have reflection, so ask it:
+//
+//   the current UWorld's NAME is the level. A main menu and a played save are
+//   different worlds with different names -- no threshold, no heuristic.
+//
+//   AWorldSettings::PauserPlayerState is UE's own pause flag. Non-null means
+//   paused; it is precisely what UGameplayStatics::IsGamePaused reads. The
+//   offset is found by reflection rather than hardcoded, so it survives an
+//   engine version change.
+void ProbeWorldState(segcap::ue4::Engine& engine) {
+    // Resolved once by reflection, then read every tick. Offsets are looked up
+    // by NAME so an engine-version change cannot silently shift them.
+    static int32_t pauserOffset = -2;   // -2 = not looked up yet, -1 = absent
+    static int32_t dilationOffset = -2;
+
+    std::string level;
+    void* worldSettings = nullptr;
+    void* world = nullptr;
+    static void* gsCDO = nullptr;      // Default__GameplayStatics, to call statics on
+    const int32_t total = engine.NumObjects();
+    for (int32_t i = 0; i < total; ++i) {
+        segcap::ue4::ObjectRef ref;
+        if (!engine.GetObject(i, ref)) continue;
+        // SKIP CLASS DEFAULT OBJECTS. Every UClass owns one, named
+        // "Default__<Class>", and it is a template that never participates in a
+        // level -- taking the first match reported level=Default__World, which
+        // is a real object and completely the wrong one.
+        if (ref.name.rfind("Default__", 0) == 0) {
+            // Keep exactly one CDO: static UFunctions are invoked on it.
+            if (!gsCDO && ref.className == "GameplayStatics") gsCDO = ref.object;
+            continue;
+        }
+        if (level.empty() && ref.className == "World") { level = ref.name; world = ref.object; }
+        if (!worldSettings && ref.className == "WorldSettings") worldSettings = ref.object;
+        if (!level.empty() && worldSettings) break;
+    }
+
+    if (pauserOffset == -2 && worldSettings) {
+        pauserOffset = -1;
+        if (void* cls = engine.FindClass("WorldSettings")) {
+            dilationOffset = -1;
+            for (const auto& prop : engine.ListProperties(cls, true)) {
+                if (prop.name == "PauserPlayerState") pauserOffset = prop.offset;
+                // TimeDilation IS the transport. inZOI's speed buttons set it:
+                // 0 while paused, 1 at normal, higher when fast-forwarding. It
+                // answers "is time flowing and how fast" as a number, which no
+                // amount of counting objects or render targets can.
+                else if (prop.name == "TimeDilation") dilationOffset = prop.offset;
+            }
+            // Say how many properties came back. Zero means the property-chain
+            // offsets are wrong for this engine build -- a known failure mode in
+            // this codebase, with DumpStructLayout written for exactly it -- and
+            // that is a completely different problem from "the field is absent".
+            const auto props = engine.ListProperties(cls, true);
+            segcap::LogInfo("ue4: WorldSettings has %zu reflected properties; "
+                            "PauserPlayerState +0x%X, TimeDilation +0x%X",
+                            props.size(), pauserOffset, dilationOffset);
+            if (props.empty()) {
+                segcap::LogWarn("ue4: WorldSettings reflected ZERO properties -- the "
+                                "property chain is not where we look on this build, so "
+                                "sim/dilation stay UNKNOWN and the object-delta proxy "
+                                "remains the only pause signal");
+            } else if (pauserOffset < 0) {
+                for (size_t i = 0; i < props.size() && i < 40; ++i) {
+                    segcap::LogInfo("ue4:   WorldSettings +0x%04X %-18s %s",
+                                    props[i].offset, props[i].type.c_str(),
+                                    props[i].name.c_str());
+                }
+            }
+            if (pauserOffset < 0) {
+                segcap::LogWarn("ue4: PauserPlayerState not reflected -- pause state "
+                                "will read UNKNOWN");
+            }
+        }
+    }
+
+    int paused = -1;   // unknown
+    float dilation = -1.0f;
+    if (worldSettings && pauserOffset >= 0) {
+        void** slot = reinterpret_cast<void**>(
+            reinterpret_cast<uint8_t*>(worldSettings) + pauserOffset);
+        if (segcap::ue4::IsReadable(slot, sizeof(void*))) paused = (*slot != nullptr) ? 1 : 0;
+    }
+    if (worldSettings && dilationOffset >= 0) {
+        float* slot = reinterpret_cast<float*>(
+            reinterpret_cast<uint8_t*>(worldSettings) + dilationOffset);
+        if (segcap::ue4::IsReadable(slot, sizeof(float))) dilation = *slot;
+    }
+    // ASK THE ENGINE BY CALLING IT, since reading its properties does not work.
+    //
+    // WorldSettings reflected ZERO properties on this build, so PauserPlayerState
+    // and TimeDilation are unreachable by offset. But CALLING functions works --
+    // it is how marking sets bRenderCustomDepth -- and both facts have a
+    // BlueprintCallable static behind them. UGameplayStatics::IsGamePaused is
+    // literally the engine's own answer to the question.
+    //
+    // This matters because the proxy lied: object-delta accepted +3 out of
+    // 564,553 objects as "the simulation is running" when it was paused the
+    // entire time. A count that twitches by three is garbage collection, not
+    // time passing.
+    static void* fnPaused = nullptr;
+    static void* fnDilation = nullptr;
+    static bool looked = false;
+    if (!looked && gsCDO) {
+        looked = true;
+        if (void* cls = engine.FindClass("GameplayStatics")) {
+            fnPaused = engine.FindFunction(cls, "IsGamePaused");
+            fnDilation = engine.FindFunction(cls, "GetGlobalTimeDilation");
+        }
+        segcap::LogInfo("ue4: GameplayStatics CDO=%p IsGamePaused=%p GetGlobalTimeDilation=%p",
+                        gsCDO, fnPaused, fnDilation);
+    }
+    if (world && gsCDO && (fnPaused || fnDilation)) {
+        auto& pe = segcap::ue4::GetProcessEventHook();
+        void* cdo = gsCDO;
+        void* fp = fnPaused;
+        void* fd = fnDilation;
+        pe.RunOnGameThread([cdo, fp, fd, world](segcap::ue4::Engine&) {
+            // Params are laid out as UE lays them out: context pointer first,
+            // return value after it, both naturally aligned.
+            if (fp) {
+                struct { void* ctx; bool ret; unsigned char pad[7]; } prm = {world, false, {}};
+                segcap::ue4::GetProcessEventHook().CallFunction(cdo, fp, &prm);
+                segcap::Hooks::Get().SetPausedDirect(prm.ret ? 1 : 0);
+            }
+            if (fd) {
+                struct { void* ctx; float ret; unsigned char pad[4]; } prm = {world, -1.0f, {}};
+                segcap::ue4::GetProcessEventHook().CallFunction(cdo, fd, &prm);
+                segcap::Hooks::Get().SetDilationDirect(prm.ret);
+            }
+        });
+    }
+    segcap::Hooks::Get().SetWorldState(level.c_str(), paused, dilation);
+}
+
 DWORD WINAPI InitThread(LPVOID) {
     segcap::Log::Get().Init(g_self);
     segcap::LogInfo("segcap attached to pid %lu", GetCurrentProcessId());
@@ -812,6 +955,8 @@ DWORD WINAPI MarkLoopThread(LPVOID) {
             const int32_t count = g_engine.NumObjects();
             const int32_t delta = count > lastObjectCount ? count - lastObjectCount
                                                           : lastObjectCount - count;
+            segcap::Hooks::Get().SetObjectCount(count);
+            ProbeWorldState(g_engine);
             if (lastObjectCount > 0 && delta * 200 < lastObjectCount) {
                 ++stableTicks;
             } else {

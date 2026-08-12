@@ -344,3 +344,143 @@ def wait_for_world_settled(path: Path, timeout: float, pid: int,
         time.sleep(2)
     log(f"world-settled signal not seen within {timeout:.0f}s -- proceeding")
     return False
+
+
+def sim_is_running(path: Path, log: Callable[[str], None], samples: int = 4) -> bool:
+    """Is game TIME flowing, as opposed to merely being in the world?
+
+    The DLL publishes `state: WORLD objects=N delta=+D ...` each census. In a
+    running world objects are constantly created and destroyed, so delta moves.
+    In a paused one it is +0 forever -- measured at exactly +0 for 176 seconds
+    straight while the harness cheerfully reported "live gameplay".
+
+    This is the check that was missing. Every "the sim is running" claim until
+    now came from having SENT an input, never from observing an effect.
+    """
+    seen = 0
+    for _ in range(samples):
+        lines = [ln for ln in tail(path, 400) if "state: " in ln and "delta=" in ln]
+        for ln in lines[-3:]:
+            try:
+                d = int(ln.split("delta=")[1].split()[0])
+            except (IndexError, ValueError):
+                continue
+            # A THRESHOLD, not "not zero". This accepted +3 out of 564,553
+            # objects and reported a fully paused game as live gameplay -- three
+            # objects is garbage collection, not time passing. And prefer the
+            # engine's own answer when it is present: `sim=RUNNING` comes from
+            # UGameplayStatics::IsGamePaused and settles the question outright.
+            if "sim=RUNNING" in ln:
+                log("sim IS running (engine says so: IsGamePaused = false)")
+                return True
+            if "sim=PAUSED" in ln:
+                continue
+            if abs(d) >= 25:
+                log(f"sim IS running (object delta {d:+d})")
+                return True
+        seen += 1
+        time.sleep(3)
+    log("sim appears PAUSED (object delta +0 across every sample)")
+    return False
+
+
+def frame_changes(root: Path, act: Path, wait: float = 4.0) -> bool:
+    """Does the SCREEN change while we hold still? The only honest pause oracle.
+
+    inZOI does not use UE's pause flag -- IsGamePaused reads false even sitting
+    in the opening menu -- so the engine's answer describes UE, not the Zoi's
+    world clock. Object-count delta was noise. What is left is the thing a human
+    uses: look at it, wait, look again.
+
+    Two screenshots with no input between them. If world time is flowing, Zois
+    walk, the clock ticks and the pixels differ. If it is paused with a static
+    camera, the frames are effectively identical. Compared as bytes rather than
+    images so this needs no PIL -- PNG encoding of identical pixels is identical.
+    """
+    a = root / "build" / "bin" / "pause_probe_a.png"
+    b = root / "build" / "bin" / "pause_probe_b.png"
+    for out in (a, b):
+        subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", str(act), "-Wait", "0.2", "-Out", str(out)],
+                       cwd=str(root), capture_output=True)
+        if out is a:
+            time.sleep(wait)
+    try:
+        return a.read_bytes() != b.read_bytes()
+    except OSError:
+        return False
+
+
+def current_level(path: Path) -> str:
+    """The loaded UWorld's name, straight from the engine's own state line."""
+    for ln in reversed(tail(path, 400)):
+        if "state: " in ln and "level=" in ln:
+            return ln.split("level=")[1].split()[0]
+    return ""
+
+
+def wait_for_level_change(path: Path, was: str, timeout: float, pid: int,
+                          log: Callable[[str], None], stable: float = 6.0) -> str:
+    """Wait until a DIFFERENT world is loaded and its name holds steady.
+
+    Marked-component count could not tell menu from gameplay -- the menu world
+    marks ~106 components too, so a >=100 threshold passed three seconds in and
+    the harness went on clicking a loading screen. The level NAME can: the menu
+    is OpeningLevel2, a loaded save is a different world entirely, and the name
+    comes from UWorld rather than from anything inferred.
+
+    Requiring it to hold steady rejects the intermediate worlds UE passes
+    through while streaming.
+    """
+    t0 = time.monotonic()
+    log(f"waiting to leave '{was or '?'}' for a loaded world (ceiling {timeout:.0f}s)")
+    seen = ""
+    since = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        ensure_live(pid, "level change", log)
+        now = current_level(path)
+        if now and now != was:
+            if now != seen:
+                seen = now
+                since = time.monotonic()
+                log(f"world is now '{now}' -- waiting {stable:.0f}s for it to settle")
+            elif time.monotonic() - since >= stable:
+                log(f"loaded world '{now}' after {time.monotonic() - t0:.0f}s")
+                return now
+        time.sleep(2)
+    log(f"no stable level change within {timeout:.0f}s -- proceeding")
+    return current_level(path)
+
+
+def wait_for_gameplay(path: Path, timeout: float, pid: int,
+                      log: Callable[[str], None], min_marked: int = 100) -> bool:
+    """Wait until we are REALLY in the world, not still on a loading screen.
+
+    "World settled" -- object-count churn going quiet -- fires while the loading
+    screen is still up, and a screenshot proved it: the harness was clicking the
+    transport bar over a loading tip and a spinner, so every click went nowhere
+    and the simulation was never resumed. The spinner also animates, which is why
+    a full-frame "did the screen change" oracle reported the sim as running.
+
+    The DLL already knows the difference and logs it: on a loading screen it can
+    mark 8-16 components, in gameplay it marks 255. A high marked count means
+    real renderable actors exist, which only happens once the world is up.
+    """
+    t0 = time.monotonic()
+    log(f"waiting for real gameplay (marked >= {min_marked}, ceiling {timeout:.0f}s)")
+    while time.monotonic() - t0 < timeout:
+        ensure_live(pid, "gameplay", log)
+        for ln in reversed(tail(path, 600)):
+            if "state: " not in ln or "marked=" not in ln:
+                continue
+            try:
+                marked = int(ln.split("marked=")[1].split()[0])
+            except (IndexError, ValueError):
+                continue
+            if marked >= min_marked:
+                log(f"in gameplay after {time.monotonic() - t0:.0f}s (marked={marked})")
+                return True
+            break
+        time.sleep(2)
+    log(f"gameplay signal not seen within {timeout:.0f}s -- proceeding anyway")
+    return False

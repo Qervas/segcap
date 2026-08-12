@@ -73,6 +73,10 @@ class GameProfile:
     # Key that resumes the simulation, sent instead of clicking a transport
     # button. Empty means the title has no separate sim clock.
     resume_key: str = ""
+    # Vertical position of the transport bar, as a window fraction. The play
+    # button's X is found by sweeping, because it moves between builds and a
+    # single guess already cost us every capture so far.
+    transport_y: float = 0.0
 
 
 INZOI = GameProfile(
@@ -91,7 +95,8 @@ INZOI = GameProfile(
     # No transport CLICK: '1' resumes at normal speed, and a key cannot land on
     # the pause button next door, which is what the click was doing.
     after_load=(),
-    resume_key="1",
+    resume_key="",
+    transport_y=0.9606,
 )
 
 

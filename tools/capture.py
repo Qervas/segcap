@@ -42,6 +42,10 @@ def main() -> int:
                     help="mask budget for the run (was pinned at 60 by a stale marker file)")
     ap.add_argument("--stride", type=int, default=8,
                     help="keep every Nth frame; 8 is ~4/sec at 30fps")
+    ap.add_argument("--retries", type=int, default=3,
+                    help="relaunch and try again if a run captures nothing. inZOI crashes "
+                         "during world streaming often enough that a single attempt is a "
+                         "coin flip; the capture itself is reliable once it arms")
     ap.add_argument("--preflight", action="store_true",
                     help="validate the control flow without launching anything")
     ap.add_argument("--menu-ceiling", type=float, default=None,
@@ -56,7 +60,29 @@ def main() -> int:
     if args.load_ceiling is not None:
         profile = replace_ceiling(profile, load=args.load_ceiling)
 
-    return Run(profile, args, preflight=args.preflight).go()
+    # RETRY, because the failure is the game, not the capture.
+    #
+    # inZOI dies during world streaming on most attempts -- E_ABORT out of
+    # ResizeBuffers, or E_INVALIDARG from its own Close() -- at 45s, 66s, 70s,
+    # 79s, 114s across today's runs, all before the readback ever arms. Once a
+    # run does reach gameplay it captures fine: the successful one produced 401
+    # masks over a full 300s hold. Retrying converts a coin flip into a capture,
+    # and a harness that gives up after one crash is not automation.
+    attempts = max(1, args.retries)
+    for attempt in range(1, attempts + 1):
+        rc = Run(profile, args, preflight=args.preflight).go()
+        if args.preflight:
+            return rc
+        masks = len(list((Path(__file__).resolve().parent.parent /
+                          "build" / "bin").glob("segcap_mask_*.pgm")))
+        if masks:
+            print(f"[{profile.name}] captured {masks} masks on attempt {attempt}")
+            return rc
+        if attempt < attempts:
+            print(f"[{profile.name}] attempt {attempt} captured nothing "
+                  f"(the game died before arming); retrying")
+    print(f"[{profile.name}] no capture after {attempts} attempts")
+    return 1
 
 
 def replace_ceiling(profile, menu: float | None = None, load: float | None = None):

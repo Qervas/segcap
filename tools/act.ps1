@@ -36,6 +36,8 @@ param(
     # land on the neighbouring control. Our click route was hitting pause instead
     # of play, so every "unpaused" capture was actually of a frozen sim.
     [string]$Key = "",
+    [int]$KeyHoldMs = 90,
+    [switch]$KeyLegacy,
     [int]$ClickX = -1,
     # Same click, as a fraction of the window. Prefer these: pixel coordinates
     # measured on one window size click empty space on any other.
@@ -114,15 +116,42 @@ public class Act {
 if (-not ("Keys1" -as [type])) {
     Add-Type @"
 using System; using System.Runtime.InteropServices;
+[StructLayout(LayoutKind.Sequential)]
+public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+[StructLayout(LayoutKind.Explicit, Size=40)]
+public struct INPUT { [FieldOffset(0)] public uint type; [FieldOffset(8)] public KEYBDINPUT ki; }
 public class Keys1 {
+  [DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint n, INPUT[] p, int cb);
   [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);
   [DllImport("user32.dll")] public static extern uint MapVirtualKeyW(uint code, uint mapType);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-  public static void Tap(byte vk){
+
+  // SendInput, not keybd_event.
+  //
+  // keybd_event stamps its events LLKHF_INJECTED, and games reading through Raw
+  // Input or DirectInput routinely discard those -- which is exactly what inZOI
+  // did: the log said "key: sent '1'", focus had succeeded, and the simulation
+  // stayed paused for 176 seconds (object delta +0 the whole time). SendInput
+  // with a hardware scan code is the closest thing to a real keypress that user
+  // mode can produce.
+  public static void Tap(ushort vk, int holdMs){
+    ushort sc = (ushort)MapVirtualKeyW(vk, 0);
+    INPUT[] down = new INPUT[1];
+    down[0].type = 1;
+    down[0].ki.wVk = 0; down[0].ki.wScan = sc; down[0].ki.dwFlags = 0x0008; // SCANCODE
+    INPUT[] up = new INPUT[1];
+    up[0].type = 1;
+    up[0].ki.wVk = 0; up[0].ki.wScan = sc; up[0].ki.dwFlags = 0x0008 | 0x0002; // +KEYUP
+    SendInput(1, down, Marshal.SizeOf(typeof(INPUT)));
+    System.Threading.Thread.Sleep(holdMs);
+    SendInput(1, up, Marshal.SizeOf(typeof(INPUT)));
+  }
+  // Legacy path kept as a fallback: if a title filters SendInput instead, the
+  // two APIs fail in opposite directions and trying both costs milliseconds.
+  public static void TapLegacy(byte vk, int holdMs){
     byte sc = (byte)MapVirtualKeyW(vk, 0);
-    keybd_event(vk, sc, 0x0008, IntPtr.Zero);              // KEYEVENTF_SCANCODE down
-    System.Threading.Thread.Sleep(45);
-    keybd_event(vk, sc, 0x0008 | 0x0002, IntPtr.Zero);     // + KEYUP
+    keybd_event(vk, sc, 0x0008, IntPtr.Zero);
+    System.Threading.Thread.Sleep(holdMs);
+    keybd_event(vk, sc, 0x0008 | 0x0002, IntPtr.Zero);
   }
 }
 "@
@@ -159,8 +188,9 @@ if ($Key) {
     if ($vk -eq 0) {
         Write-Host "key: '$Key' not supported (use a single digit or letter)"
     } else {
-        [Keys1]::Tap($vk)
-        Write-Host "key: sent '$Key' (vk 0x$('{0:X2}' -f $vk)) to pid $($g.Id)"
+        if ($KeyLegacy) { [Keys1]::TapLegacy([byte]$vk, $KeyHoldMs) }
+        else { [Keys1]::Tap([uint16]$vk, $KeyHoldMs) }
+        Write-Host "key: sent '$Key' (vk 0x$('{0:X2}' -f $vk)) hold=${KeyHoldMs}ms via $(if($KeyLegacy){'keybd_event'}else{'SendInput'}) to pid $($g.Id)"
     }
 }
 

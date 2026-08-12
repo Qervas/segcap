@@ -67,6 +67,8 @@ void STDMETHODCALLTYPE Hooks::ExecuteCommandLists_(ID3D12CommandQueue* self, UIN
     // buffer the GPU has not written yet.
     Readback::InjectToken claimed[8];
     UINT claimedCount = 0;
+    Readback::InjectToken claimedColour[8];
+    UINT claimedColourCount = 0;
     // The atomic is checked BEFORE the lock, and it is not an optimisation.
     //
     // ExecuteCommandLists is called many times per frame from several threads,
@@ -83,7 +85,13 @@ void STDMETHODCALLTYPE Hooks::ExecuteCommandLists_(ID3D12CommandQueue* self, UIN
         std::lock_guard<std::mutex> lock(h.listMutex_);
         for (UINT i = 0; i < count && claimedCount < 8; ++i) {
             auto it = h.listState_.find(reinterpret_cast<ID3D12GraphicsCommandList*>(lists[i]));
-            if (it == h.listState_.end() || !it->second.pendingToken.valid) continue;
+            if (it == h.listState_.end()) continue;
+            if (it->second.pendingColourToken.valid && claimedColourCount < 8) {
+                claimedColour[claimedColourCount++] = it->second.pendingColourToken;
+                h.outstandingTokens_.fetch_sub(1, std::memory_order_relaxed);
+                it->second.pendingColourToken = Readback::InjectToken{};
+            }
+            if (!it->second.pendingToken.valid) continue;
             claimed[claimedCount++] = it->second.pendingToken;
             h.outstandingTokens_.fetch_sub(1, std::memory_order_relaxed);
             // Cleared so a list submitted twice does not signal the same slot
@@ -97,6 +105,9 @@ void STDMETHODCALLTYPE Hooks::ExecuteCommandLists_(ID3D12CommandQueue* self, UIN
 
     for (UINT i = 0; i < claimedCount; ++i) {
         if (h.maskInjectRing_.NotifySubmitted(self, claimed[i])) ++h.injSubmitted_;
+    }
+    for (UINT i = 0; i < claimedColourCount; ++i) {
+        h.colourInjectRing_.NotifySubmitted(self, claimedColour[i]);
     }
 }
 void STDMETHODCALLTYPE Hooks::CreateRenderTargetView_(ID3D12Device* self, ID3D12Resource* res,
@@ -176,6 +187,15 @@ void STDMETHODCALLTYPE Hooks::ResourceBarrier_(ID3D12GraphicsCommandList* self, 
     D3D12_RESOURCE_STATES injectState = D3D12_RESOURCE_STATE_COMMON;
     UINT injectSub = 0;
 
+    // The backbuffer rides the SAME gate. Its transition to PRESENT is a
+    // write->read transition like any other, so no new rule is needed -- the
+    // colour path simply stops being the one place that schedules its own copy.
+    const bool wantColour = h.colourInjectArmed_.load(std::memory_order_relaxed);
+    bool colourInject = false;
+    ID3D12Resource* colourBack = nullptr;
+    D3D12_RESOURCE_STATES colourState = D3D12_RESOURCE_STATE_COMMON;
+    UINT colourSub = 0;
+
     if (barriers) {
         std::lock_guard<std::mutex> lock(h.mutex_);
         for (UINT i = 0; i < count; ++i) {
@@ -187,6 +207,31 @@ void STDMETHODCALLTYPE Hooks::ResourceBarrier_(ID3D12GraphicsCommandList* self, 
             // debug-layer error at best and a GPU hang at worst.
             h.resourceState_[b.Transition.pResource] = b.Transition.StateAfter;
             ++h.barriersSeen_[b.Transition.pResource];
+
+            // Log what the game ACTUALLY does to a backbuffer, before filtering
+            // on a state pattern I assumed. The colour gate matched nothing at
+            // all, and "nothing matched" cannot distinguish a wrong pattern from
+            // a wrong resource set -- these five lines say which.
+            if (wantColour && h.colBarriersSeen_ < 5 && h.IsBackBuffer(b.Transition.pResource)) {
+                ++h.colBarriersSeen_;
+                LogWarn("colour: backbuffer %p barrier StateBefore=0x%X StateAfter=0x%X "
+                        "sub=%u flags=0x%X",
+                        static_cast<void*>(b.Transition.pResource),
+                        static_cast<unsigned>(b.Transition.StateBefore),
+                        static_cast<unsigned>(b.Transition.StateAfter),
+                        b.Transition.Subresource, static_cast<unsigned>(b.Flags));
+            }
+
+            if (wantColour && !colourInject && b.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE &&
+                (b.Transition.StateAfter & D3D12_RESOURCE_STATE_PRESENT) ==
+                    D3D12_RESOURCE_STATE_PRESENT &&
+                b.Transition.StateBefore == D3D12_RESOURCE_STATE_RENDER_TARGET &&
+                h.IsBackBuffer(b.Transition.pResource)) {
+                colourInject = true;
+                colourBack = b.Transition.pResource;
+                colourState = b.Transition.StateAfter;
+                colourSub = b.Transition.Subresource;
+            }
 
             if (!want || b.Transition.pResource != want || inject) continue;
             ++h.injAttempts_;
@@ -232,6 +277,7 @@ void STDMETHODCALLTYPE Hooks::ResourceBarrier_(ID3D12GraphicsCommandList* self, 
     h.origBarrier_(self, count, barriers);
 
     if (inject) h.TryInjectCopy(self, want, injectState, injectSub);
+    if (colourInject) h.TryInjectColour(self, colourBack, colourState, colourSub);
 }
 
 // Render-pass nesting is tracked THREAD-LOCAL, not in a shared map.
@@ -342,6 +388,30 @@ void Hooks::TryInjectCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* targe
     // messages naming the invalid argument were still sitting in the info queue
     // when the process went down. There is no "next Present" after the call that
     // kills you. Costs nothing when the debug layer is off: infoQueue_ is null.
+    DrainInfoQueue();
+}
+void Hooks::TryInjectColour(ID3D12GraphicsCommandList* list, ID3D12Resource* back,
+                            D3D12_RESOURCE_STATES stateAfter, UINT subresource) {
+    // Same rules as the mask copy, for the same reasons.
+    if (g_renderPassDepth > 0) return;
+    if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+
+    const Readback::InjectToken token = colourInjectRing_.RecordInto(
+        list, back, stateAfter, subresource,
+        injectFrame_.load(std::memory_order_relaxed), origBarrier_);
+    if (!token.valid) return;
+    {
+        std::lock_guard<std::mutex> lock(listMutex_);
+        listState_[list].pendingColourToken = token;
+    }
+    outstandingTokens_.fetch_add(1, std::memory_order_relaxed);
+    ++colInjRecorded_;
+    if (colInjRecorded_ == 1) {
+        LogWarn("colour: FIRST backbuffer copy recorded into the game's own command list %p "
+                "(StateBefore=0x%X from the game's barrier). This is the path the mask copy "
+                "has always used; the Present-time version of this crashed the game.",
+                static_cast<void*>(list), static_cast<unsigned>(stateAfter));
+    }
     DrainInfoQueue();
 }
 // Resources carry an initial state that no ResourceBarrier ever announces. A

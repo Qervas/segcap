@@ -30,6 +30,7 @@ class Run:
         self.o = opts
         self.preflight = preflight
         self.pid = 0
+        self.menu_level = ""
 
     # --- plumbing ---------------------------------------------------------
     def say(self, msg: str) -> None:
@@ -147,6 +148,11 @@ class Run:
         # nothing, so being early costs one wasted click while being late costs
         # minutes. The loop is self-correcting: a click that lands on the wrong
         # screen leaves the next iteration starting from the menu again.
+        # Remember which world the MENU is, so the load can be detected as a
+        # change rather than guessed at from a timer.
+        self.menu_level = H.current_level(LOG)
+        self.say(f"menu world is '{self.menu_level or '?'}'")
+
         entered = False
         for attempt in range(1, 4):
             for step in p.to_load:
@@ -172,12 +178,77 @@ class Run:
         # in those masks was camera movement alone. A key needs no coordinate and
         # cannot hit the neighbouring control. inZOI maps the number keys to
         # speeds, with 1 being normal.
-        if p.resume_key:
-            self.say(f"resuming the sim with '{p.resume_key}'")
-            if not self.preflight:
+        # TRY, THEN CHECK. Not "send it and hope".
+        #
+        # The keystroke was dispatched correctly every time -- focus acquired,
+        # "key: sent '1' (vk 0x31)" in the log -- and the simulation stayed
+        # paused for 176 seconds. Dispatching an input and observing its effect
+        # are different claims, and only the second one is worth anything.
+        # Candidates are tried in order and each is judged by whether game time
+        # actually starts flowing.
+        # THE SPEED KEY IS A TOGGLE, so press it an ODD number of times.
+        #
+        # inZOI maps 1-4 to game speeds and pressing the number you are ALREADY
+        # on pauses -- so '1' flips between normal speed and paused. The previous
+        # version sent '1' via SendInput, checked, then sent '1' again through a
+        # different API as a "fallback". Two presses. It toggled the game back to
+        # paused every single time, and the fallback loop written to fix the
+        # problem was the problem.
+        #
+        # Press once, ask the engine, and only press again if it is still paused
+        # -- which converges precisely because it toggles. Never two presses
+        # without a check between them.
+        # RESUME, THEN LOOK AT THE SCREEN.
+        #
+        # Every indirect oracle failed here. UE's IsGamePaused reads false even
+        # in the opening menu, because inZOI runs its own world clock rather
+        # than using UE's pause flag. Object-count delta was garbage-collection
+        # noise. So the check is the one a person would make: take a screenshot,
+        # wait, take another, and see whether anything moved.
+        #
+        # The key is tried first because it needs no coordinate. If it does not
+        # take, sweep the transport bar -- inZOI's speed controls sit bottom-left
+        # and our original single guess landed on PAUSE, one button left of play.
+        # CLICK THE TRANSPORT. No keyboard.
+        #
+        # The number keys do not resume this game in practice, and the engine
+        # cannot tell us whether they did: UE's IsGamePaused describes the
+        # ENGINE pause a popup menu sets, and it reads false even sitting in the
+        # opening menu. inZOI runs its own world clock, independent of it, and a
+        # loaded save comes up with that clock stopped -- a behaviour its own
+        # forums document. There is no flag to read, only a button to press.
+        #
+        # So: sweep the transport bar and judge each press by whether the SCREEN
+        # starts changing on its own. The original single guess at x=0.066 landed
+        # on PAUSE, one button left of play, which is why every "resumed" capture
+        # was of a frozen world.
+        # BE IN THE WORLD BEFORE TOUCHING THE TRANSPORT.
+        #
+        # A screenshot caught the harness clicking the transport bar while a
+        # LOADING SCREEN was still up -- tip text, spinner, no HUD at all. Every
+        # resume click landed on nothing, which is why the sim was never running.
+        H.wait_for_level_change(LOG, self.menu_level, 240, self.pid, self.say)
+
+        if p.resume_key or p.transport_y:
+            running = False
+            y = p.transport_y or 0.9606
+            for x in (0.086, 0.100, 0.114, 0.128, 0.072, 0.142, 0.058):
+                if self.preflight:
+                    running = True
+                    break
+                self.say(f"resume: clicking transport at ({x:.3f}, {y:.4f})")
                 subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                                "-File", str(ACT), "-Key", p.resume_key, "-Wait", "1"],
-                               cwd=str(ROOT))
+                                "-File", str(ACT), "-ClickFx", str(x), "-ClickFy", str(y),
+                                "-Wait", "1"], cwd=str(ROOT))
+                if H.frame_changes(ROOT, ACT):
+                    self.say(f"sim IS running -- screen changed with no input, "
+                             f"play is at x={x:.3f}")
+                    running = True
+                    break
+                self.say("screen static: still paused")
+            if not running:
+                self.say("!! could not resume -- capturing a PAUSED world. Masks stay "
+                         "correct but nothing in the scene will move.")
         for step in p.after_load:
             self.click(step)
         if p.after_load:

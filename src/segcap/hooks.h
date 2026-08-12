@@ -112,6 +112,30 @@ public:
 
     void SetRequireArm(bool on) { requireArm_ = on; }
 
+    // The UObject count, published by the marking loop. Hooks cannot reach the
+    // engine, and this is the single most informative number for telling menu
+    // from loading from world -- so the one place that knows it hands it over.
+    void SetObjectCount(int32_t n) { objectCount_.store(n, std::memory_order_relaxed); }
+
+    // The engine's own answers: which level is loaded, and UE's actual pause
+    // flag (1 paused, 0 running, -1 unknown). Direct facts, not proxies.
+    // Answers obtained by CALLING the engine, which outrank anything inferred.
+    void SetPausedDirect(int p) {
+        std::lock_guard<std::mutex> lock(worldStateMutex_);
+        pausedDirect_ = p;
+    }
+    void SetDilationDirect(float d) {
+        std::lock_guard<std::mutex> lock(worldStateMutex_);
+        dilationDirect_ = d;
+    }
+
+    void SetWorldState(const char* level, int paused, float dilation) {
+        std::lock_guard<std::mutex> lock(worldStateMutex_);
+        if (level && *level) worldLevel_ = level;
+        worldPaused_ = paused;
+        worldDilation_ = dilation;
+    }
+
     // Isolation switch for the backbuffer copy; see the colour block in
     // OnPresent. Set from a "segcap.nocolour" marker.
     void SetNoColour(bool on) { noColour_ = on; }
@@ -475,6 +499,14 @@ private:
 
     // Hold the readback until a segcap.arm file appears next to the DLL.
     bool requireArm_ = false;
+    std::atomic<int32_t> objectCount_{0};
+    std::mutex worldStateMutex_;
+    std::string worldLevel_;
+    int worldPaused_ = -1;
+    float worldDilation_ = -1.0f;
+    int pausedDirect_ = -1;
+    float dilationDirect_ = -1.0f;
+    int32_t lastStateObjects_ = 0;
     bool noColour_ = false;
     bool armed_ = false;
 
@@ -548,6 +580,24 @@ private:
     bool foreignInject_ = false;
     bool injectDryRun_ = false;
     Readback maskInjectRing_;
+
+    // --- colour by INJECTION, not at Present ---------------------------------
+    //
+    // The backbuffer copy issued from our own queue inside Present crashed inZOI
+    // at CAPTURE ARMED, twice, against a clean control with it disabled. Outside
+    // an engine you cannot reliably know a transient resource's state; the mask
+    // copy has always taken StateBefore from the game's own barrier struct, and
+    // that path has never caused this. The backbuffer's transition to PRESENT is
+    // itself a write->read transition, so it fits the existing inject gate with
+    // no new rules -- the colour path just had to stop being the exception.
+    Readback colourInjectRing_;
+    // Every buffer the swapchain owns. Collected once, then read lock-free on the
+    // barrier hot path: written before injection is armed and never mutated after.
+    ID3D12Resource* backBuffers_[8] = {};
+    uint32_t backBufferCount_ = 0;
+    std::atomic<bool> colourInjectArmed_{false};
+    uint64_t colInjRecorded_ = 0;
+    uint32_t colBarriersSeen_ = 0;
     // The one resource injection is permitted to touch, published by OnPresent
     // and read by ResourceBarrier_ on every recording thread. An atomic rather
     // than a lock because ResourceBarrier is the hottest hook in the process and
@@ -563,6 +613,12 @@ private:
     // hottest path.
     struct ListState {
         Readback::InjectToken pendingToken{};
+        // A list can carry BOTH a mask copy and a colour copy in the same frame.
+        // One slot would let the second overwrite the first, and the overwritten
+        // ring slot then never retires -- the ring starves and capture stops with
+        // no error anywhere, which is the failure ReclaimStaleRecordings exists
+        // to paper over. Two copies, two slots.
+        Readback::InjectToken pendingColourToken{};
     };
     // Separate from mutex_ and NEVER nested with it: mutex_ is already held
     // across the barrier bookkeeping loop, and taking a second lock there would
@@ -595,6 +651,14 @@ private:
     uint64_t injRefusedListType_ = 0;
     uint64_t injSubmitted_ = 0;
     bool loggedInjectArmed_ = false;
+    void TryInjectColour(ID3D12GraphicsCommandList* list, ID3D12Resource* back,
+                         D3D12_RESOURCE_STATES stateAfter, UINT subresource);
+    bool IsBackBuffer(ID3D12Resource* r) const {
+        for (uint32_t i = 0; i < backBufferCount_; ++i) {
+            if (backBuffers_[i] == r) return true;
+        }
+        return false;
+    }
     void TryInjectCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* target,
                        D3D12_RESOURCE_STATES stateAfter, UINT subresource);
 

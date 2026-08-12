@@ -159,6 +159,8 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
         // being submitted; without reclaiming, the ring starves to nothing and
         // capture stops with no error anywhere.
         maskInjectRing_.ReclaimStaleRecordings(frameIndex_, 240);
+        colourInjectRing_.Drain([this](const MaskFrame& f) { OnColourReady(f); });
+        colourInjectRing_.ReclaimStaleRecordings(frameIndex_, 240);
     }
 
     // Election runs every frame too. It is cheap (a handful of targets) and the
@@ -783,34 +785,45 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     // before that change armed and captured 61 masks without dying. That is a
     // correlation, not a cause, and the way to tell them apart is to remove one
     // variable rather than argue about it: same build, same route, colour off.
-    if (!censusOnly_ && !noReadback_ && armReady && swapChain && device_ && queue_ &&
-        !noColour_ && (frameIndex_ % captureStride_) == 1) {
-        ID3D12Resource* back = nullptr;
-        const UINT idx = swapChain->GetCurrentBackBufferIndex();
-        if (SUCCEEDED(swapChain->GetBuffer(idx, IID_PPV_ARGS(&back))) && back) {
-            if (colourRing_.Prepare(device_, back, 0 /*colour, not a plane*/)) {
-                // PRESENT, not our shadow.
-                //
-                // DXGI REQUIRES the back buffer to be in D3D12_RESOURCE_STATE_
-                // PRESENT when Present() is called -- we are inside that call, so
-                // this is a guarantee from the API contract, not an assumption.
-                // Our shadow is the weaker source: it only knows states it has
-                // observed a barrier for, and the swapchain rotates buffers, so
-                // for a back buffer it can easily be stale or empty. Declaring a
-                // wrong StateBefore is an invalid barrier, which D3D12 latches and
-                // reports from the GAME's Close() as E_INVALIDARG.
-                //
-                // Measured: colour ON crashed at CAPTURE ARMED with exactly that
-                // error and wrote 0 masks; colour OFF, same build and route,
-                // survived and wrote 61. The injected mask copy has always taken
-                // its StateBefore from the game's own barrier -- "an equality
-                // copied out of the caller's struct cannot be wrong" -- and this
-                // path was the one place given a weaker guarantee.
-                colourRing_.Enqueue(queue_, back, D3D12_RESOURCE_STATE_PRESENT, frameIndex_);
+    // ARM the injected colour path. The copy itself happens on the barrier, not
+    // here -- see TryInjectColour.
+    //
+    // What used to be here was a copy issued from OUR queue inside Present, and
+    // it crashed inZOI at CAPTURE ARMED twice against a clean control with it
+    // disabled. Changing its StateBefore to PRESENT (which DXGI guarantees) did
+    // not help, which ruled out the state as the cause and left the mechanism:
+    // a copy we schedule ourselves, against a resource whose real state only the
+    // game knows. The mask path never had this problem because it records into
+    // the game's own list at a barrier and copies StateBefore out of the caller's
+    // struct. This is that same discipline, finally applied to colour.
+    if (!censusOnly_ && !noReadback_ && armReady && swapChain && device_ && !noColour_) {
+        if (backBufferCount_ == 0) {
+            // ASK the swapchain how many buffers it has; do not probe until
+            // GetBuffer fails. Probing returned FOUR on a swapchain the crash
+            // report describes as Num=3, and the crash in question was
+            // ResizeBuffers returning E_ABORT -- reaching past the real buffer
+            // count is not a harmless miss.
+            DXGI_SWAP_CHAIN_DESC scd = {};
+            UINT count = 3;
+            if (SUCCEEDED(swapChain->GetDesc(&scd)) && scd.BufferCount) {
+                count = scd.BufferCount;
+                if (count > 8) count = 8;
             }
-            back->Release();
+            for (UINT i = 0; i < count; ++i) {
+                ID3D12Resource* b = nullptr;
+                if (FAILED(swapChain->GetBuffer(i, IID_PPV_ARGS(&b))) || !b) break;
+                // Not retained: holding a reference to a back buffer blocks
+                // ResizeBuffers. The pointer is only ever compared, never used.
+                b->Release();
+                backBuffers_[backBufferCount_++] = b;
+            }
+            LogWarn("colour: %u backbuffers registered for injected capture", backBufferCount_);
         }
-        colourRing_.Drain([this](const MaskFrame& f) { OnColourReady(f); });
+        if (backBufferCount_ && colourInjectRing_.Prepare(device_, backBuffers_[0], 0)) {
+            colourInjectArmed_.store(true, std::memory_order_relaxed);
+        }
+    } else {
+        colourInjectArmed_.store(false, std::memory_order_relaxed);
     }
 
     // Log periodically, but always on an election change: a target switching
@@ -820,6 +833,54 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
         targets_.clear();
         bindOrdinal_ = 0;
         return;
+    }
+
+    // PUBLISH A VERDICT ON WHAT THE GAME IS DOING.
+    //
+    // The harness had no sensor. It inferred "we are in the world" from
+    // object-count churn going quiet, "the menu is up" from the first census
+    // line, and it never checked whether the simulation was running at all --
+    // which is how a paused sim was reported as live gameplay for hours, and why
+    // clicks were fired at coordinates and simply hoped for.
+    //
+    // The signals to answer this properly are all in here already, they were
+    // just never combined: how many UObjects exist, whether that count is
+    // moving, and whether anything is rendering at scene scale. A screenshot
+    // would be a worse sensor than this, and we are the only observer with it.
+    {
+        const int32_t objects = objectCount_.load(std::memory_order_relaxed);
+        const int32_t delta = objects - lastStateObjects_;
+        lastStateObjects_ = objects;
+        bool sceneScale = false;
+        for (const TargetFingerprint& t : snapshot) {
+            if (backbufferWidth_ && t.width >= backbufferWidth_ / 4) { sceneScale = true; break; }
+        }
+        // Ordered most-specific first. LOADING wins over WORLD because a world
+        // still streaming looks fully populated a moment before it is replaced.
+        const char* phase = "BOOT";
+        if (objects > 0 && (delta > objects / 100 || delta < -(objects / 100))) {
+            phase = "LOADING";
+        } else if (objects >= 200000 && sceneScale) {
+            phase = "WORLD";
+        } else if (sceneScale) {
+            phase = "MENU";
+        }
+        std::string level;
+        int paused = -1;
+        float dilation = -1.0f;
+        {
+            std::lock_guard<std::mutex> lock(worldStateMutex_);
+            level = worldLevel_;
+            // Direct answer wins; the property read is the fallback.
+            paused = (pausedDirect_ >= 0) ? pausedDirect_ : worldPaused_;
+            dilation = (dilationDirect_ >= 0.0f) ? dilationDirect_ : worldDilation_;
+        }
+        LogInfo("state: %s level=%s sim=%s dilation=%.2f objects=%d delta=%+d "
+                "scene-scale=%s marked=%zu targets=%zu frame=%llu",
+                phase, level.empty() ? "?" : level.c_str(),
+                paused == 1 ? "PAUSED" : (paused == 0 ? "RUNNING" : "?"),
+                dilation, objects, delta, sceneScale ? "yes" : "no",
+                GetMarker().markedCount(), snapshot.size(), frameIndex_);
     }
 
     LogInfo("--- frame %llu: %zu distinct targets observed, %llu descriptor misses ---",
