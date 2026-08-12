@@ -1492,11 +1492,29 @@ other slots to stay within ±50% and returned INCONCLUSIVE on a perfect result
 for exactly that reason -- the symmetric band punished the case that proves the
 claim. It is one-sided now: growth is expected, loss is not.
 
+**Replicated on a second run**, on a different object and at four times the
+scale:
+
+```
+groundtruth: selected slot 1 with 696837 px (68.05% of frame);
+             everything else holds 327163 px. Requesting unmark.
+groundtruth: UNMARKED slot 1 (StaticMeshComponent)
+groundtruth RESULT: slot 1 went 696837 -> 0 px (100.0% removed);
+             all other slots 327163 -> 326971 px (0.1%).  VERDICT: PASS
+```
+
+Slot 1 is the sky sphere, and it behaves exactly as the mechanism predicts in
+the *other* direction: the sky is behind everything, so removing it reveals
+nothing, and the other slots stay flat instead of growing. Two runs, two
+objects, 15.8% and 68.1% of the frame, both to exactly zero, with the
+side-effect on everything else going the way the geometry says it should each
+time. That is replication rather than one lucky measurement.
+
 Two honest limits. The settle window is about half a second, which is short --
 but the failure direction is the safe one: too little time shows the pixels
-*still there*, a false FAIL, never a false PASS. And this is one slot at one
-moment, not a survey. It does not prove every label is right; it proves the
-mechanism is real, which is what nothing else here could establish.
+*still there*, a false FAIL, never a false PASS. And this is one slot per run,
+not a survey. It does not prove every label is right; it proves the mechanism is
+real, which is what nothing else here could establish.
 
 This is what separates the inZOI result from §8.6, where a mask passed a
 structural check while containing another buffer's bytes entirely. Every other

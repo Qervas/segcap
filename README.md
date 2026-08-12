@@ -16,10 +16,11 @@ interesting one: on a Nanite title the per-object stencil is not in the
 depth-stencil at all, and finding where it *is* took most of the project.
 
 That the labels are real is not argued from the pictures. Clearing exactly one
-object's `bRenderCustomDepth` removed **exactly that id's 161,787 pixels and
-nothing else** — [`docs/evidence/inzoi-groundtruth-pass.log`](docs/evidence/inzoi-groundtruth-pass.log).
+object's `bRenderCustomDepth` removed **exactly that id's pixels and nothing
+else** — twice, on different objects, at 15.8% and 68.1% of the frame, both to
+zero: [`docs/evidence/inzoi-groundtruth-pass.log`](docs/evidence/inzoi-groundtruth-pass.log).
 It is the one check here that a coherent-but-wrong mask cannot pass, and getting
-it to run at all took two fixes of its own (`DEBUGGING.md` §8.13–8.14).
+it to run at all took two fixes of its own (`DEBUGGING.md` §8.13–8.15).
 
 ![overlay](docs/evidence/STRAY-GAMEPLAY-OVERLAY.png)
 
@@ -229,7 +230,7 @@ candidate explanations are now killed with evidence rather than left as guesses.
 |---|---|
 | Objects per mask | Stray 60–89 distinct ids; inZOI 31–110 (mean 56 outdoors, 97 indoors) |
 | Pixels labelled | Stray 94–99.9%; inZOI 79–91% outdoors, 100% indoors |
-| Ground truth by intervention (inZOI) | **PASS** — unmarked one object, its 161,787 px (15.8% of frame) went to **exactly 0**; no other id lost pixels |
+| Ground truth by intervention (inZOI) | **PASS, replicated** — two runs, two objects, 15.8% and 68.1% of the frame, both to **exactly 0**, with no other id disturbed |
 | Every mask id resolves via its sidecar | **0 unbound**, 0.000% of pixels |
 | Identity survives slot loss | 52 objects left and returned; 55 held >1 slot |
 | Slot ambiguity within a frame | **0** |

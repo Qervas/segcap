@@ -1,18 +1,28 @@
-inZOI ground-truth intervention -- PASS
+inZOI ground-truth intervention -- PASS, replicated on two runs
 
 Unmark exactly one primitive's bRenderCustomDepth via the engine's own
 setter, and require exactly that id's pixels to disappear from the mask.
 This is the only check in the project that cannot be satisfied by
-coherent-but-wrong data: every other one reads the buffer; this one
-changes something and requires the mask to follow.
+coherent-but-wrong data: every other one reads the buffer and asks whether
+it looks like object ids; this one changes the world and requires the
+buffer to follow.
 
-Note the second line: it confirms the unmark ACTUALLY RAN. An earlier
-version of this test reported FAIL on a run where the selected slot was
-held by no live marked primitive, so nothing was changed and there was
-nothing to judge. See DEBUGGING.md 8.13-8.14.
+  run 1  slot 102  InstancedStaticMeshComponent  161,787 px (15.8%) -> 0
+         others 44,351 -> 46,370 px  (GREW 4.6%: the unmarked surface
+         stopped occluding the geometry behind it)
 
-Extracted from build/bin/segcap.log, run of 2026-08-12.
-==============================================================
+  run 2  slot 1    StaticMeshComponent           696,837 px (68.1%) -> 0
+         others 327,163 -> 326,971 px (flat, 0.1%: slot 1 is the sky
+         sphere, which is behind everything, so removing it reveals
+         nothing new)
+
+Different objects, different magnitudes, both to exactly zero. Note the
+'UNMARKED' line in each: it confirms the intervention ACTUALLY RAN. An
+earlier version reported FAIL on a run where the selected slot was held by
+no live marked primitive, so nothing was changed and there was nothing to
+judge. See DEBUGGING.md 8.13-8.15.
+
+==================== RUN 1 ====================
 [segcap    100.766 warn ] CAPTURE ARMED at frame 3600 -- readback begins now
 [segcap    100.781 warn ] colour: FIRST backbuffer copy recorded into the game's own command list 000002964CA68180 (StateBefore=0x0 from the game's barrier). This is the path the mask copy has always used; the Present-time version of this crashed the game.
 [segcap    125.516 warn ] idbuf: FOUND OUR IDS in 0000029E2D3C2710 channel G16(high) (100.0% of non-zero texels are leased slots; 15 distinct leased values of 114 slots leased, needed 14; largest single id holds 71% of the match). This is the per-object id buffer.
@@ -20,3 +30,13 @@ Extracted from build/bin/segcap.log, run of 2026-08-12.
 [segcap    130.312 warn ] groundtruth: selected slot 102 with 161787 px (15.80% of frame); everything else holds 44351 px. Requesting unmark.
 [segcap    130.312 warn ] groundtruth: UNMARKED slot 102 (InstancedStaticMeshComponent) -- from here its pixels must vanish and no others may move
 [segcap    130.859 warn ] groundtruth RESULT: slot 102 went 161787 -> 0 px (100.0% removed); all other slots 44351 -> 46370 px (-4.6% lost; growth is expected, the unmarked surface stops occluding them). VERDICT: PASS -- exactly the unmarked object's pixels disappeared
+
+==================== RUN 2 ====================
+[segcap     90.204 warn ] idbuf: FOUND OUR IDS in 000001D88D7B6F80 channel G16(high) (100.0% of non-zero texels are leased slots; 14 distinct leased values of 114 slots leased, needed 14; largest single id holds 77% of the match). This is the per-object id buffer.
+[segcap     98.188 warn ] colour: FIRST backbuffer copy recorded into the game's own command list 000001D1D0B7F8B0 (StateBefore=0x0 from the game's barrier). This is the path the mask copy has always used; the Present-time version of this crashed the game.
+[segcap     99.750 warn ] groundtruth: selected slot 1 with 696837 px (68.05% of frame); everything else holds 327163 px. Requesting unmark.
+[segcap     99.766 warn ] groundtruth: UNMARKED slot 1 (StaticMeshComponent) -- from here its pixels must vanish and no others may move
+[segcap    100.282 warn ] groundtruth RESULT: slot 1 went 696837 -> 0 px (100.0% removed); all other slots 327163 -> 326971 px (0.1% lost; growth is expected, the unmarked surface stops occluding them). VERDICT: PASS -- exactly the unmarked object's pixels disappeared
+[segcap    122.641 warn ] idbuf: FOUND OUR IDS in 000001D9288C28E0 channel G16(high) (100.0% of non-zero texels are leased slots; 35 distinct leased values of 114 slots leased, needed 14; largest single id holds 81% of the match). This is the per-object id buffer.
+[segcap    248.532 warn ] idbuf: FOUND OUR IDS in 000001D8A6B9F670 channel G16(high) (100.0% of non-zero texels are leased slots; 55 distinct leased values of 222 slots leased, needed 27; largest single id holds 62% of the match). This is the per-object id buffer.
+[segcap    272.329 warn ] idbuf: FOUND OUR IDS in 000001D88D441410 channel G16(high) (100.0% of non-zero texels are leased slots; 72 distinct leased values of 226 slots leased, needed 28; largest single id holds 56% of the match). This is the per-object id buffer.
