@@ -1432,6 +1432,46 @@ destroyed or simply walks off camera. Their removing it from `marked_` is what
 makes the verdict's "is the slot still held by the component we unmarked?" check
 fire. Pin everything and every camera cut becomes proof.
 
+### 8.14 The verdict it reached instead
+
+With the pin in, the test ran on inZOI for the first time and returned **FAIL --
+the unmarked object's pixels are STILL THERE, so the slot does not mean what the
+sidecar says**. That would be the worst result this project could produce, if the
+line immediately above it were not this:
+
+```
+groundtruth: selected slot 64 with 23645 px (2.31% of frame). Requesting unmark.
+groundtruth: slot 64 is not held by any marked primitive
+groundtruth RESULT: slot 64 went 23645 -> 23533 px (0.5% removed) ... FAIL
+```
+
+Nothing was unmarked. The experiment had no independent variable, and the test
+graded it anyway and blamed the labels.
+
+Two defects compose to produce that:
+
+**It chose a slot it could not act on.** Selection scanned the mask for the
+largest id. Slot 64 was legitimately in the buffer with 23,645 px while no live
+marked primitive held it -- not a contradiction: when a component is destroyed,
+`RefreshVisibility` drops the entry *without* clearing the flag, because calling
+into a freed component is precisely the crash that path exists to avoid. Its
+pixels keep arriving from a render proxy we no longer track. Eligibility now
+requires that we actually hold the slot.
+
+**It could not tell "ran" from "requested".** The unmark is scheduled onto the
+game thread and returns the component it cleared, or `nullptr`. That return was
+discarded. The guard that should have caught it compares the slot's current
+holder against the component recorded at selection -- and both were `nullptr`, so
+two absences compared equal and the run was graded. A pin set only on the path
+that really clears the flag now separates them, and an aborted selection
+re-selects instead of producing a verdict.
+
+The shape is worth naming, because it is the third variant of one thing in this
+file: **a check that cannot distinguish "it did not happen" from "it happened and
+produced nothing."** §8.6 had a mask passing a structural test while being noise;
+§2 has counters reporting effort as result; this reports a null experiment as a
+failed one. The correct output was never FAIL or PASS. It was "this did not run."
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have

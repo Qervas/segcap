@@ -688,6 +688,14 @@ private:
     // scene proxy rebuild afterwards.
     static constexpr uint32_t kInterveneWarmupFrames = 90;
     static constexpr uint32_t kInterveneSettleFrames = 30;
+    // Selections that were requested but never took effect. A slot can be
+    // present in the mask while no live marked primitive holds it -- the
+    // stale-object path drops entries WITHOUT unmarking, by design -- and
+    // unmarking it is then a no-op. Judging anyway reports FAIL about a run in
+    // which nothing was changed, which is the worst possible output: it accuses
+    // the labels of being wrong using evidence that was never collected.
+    uint32_t interveneAborted_ = 0;
+    static constexpr uint32_t kInterveneMaxAborts = 5;
     bool idChannelFound_ = false;
     bool loggedIdExhausted_ = false;
     // Dumps to spend before giving up on a candidate and advancing. Small,

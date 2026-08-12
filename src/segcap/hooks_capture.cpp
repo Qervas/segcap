@@ -247,11 +247,36 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
                 // Pick the largest non-trivial slot: the bigger its footprint,
                 // the less ambiguous "its pixels vanished" is. A slot with 40
                 // pixels could disappear through ordinary occlusion.
+                //
+                // ONLY slots we can actually unmark are eligible. A value can be
+                // present in the mask while no live marked primitive holds it:
+                // RefreshVisibility drops stale objects WITHOUT clearing their
+                // flag (touching a freed component is the crash it exists to
+                // avoid), so their pixels keep arriving from a primitive we no
+                // longer track. Choosing one of those makes the unmark a no-op.
+                //
+                // This is not hypothetical. The first run to get this far picked
+                // slot 64 -- 23,645 px, the largest in the frame -- got "slot 64
+                // is not held by any marked primitive", changed nothing, and then
+                // reported FAIL because the pixels were still there. A verdict
+                // against the labels from a run with no independent variable.
+                // One pass over marked_, not one per slot. The naive version walks
+                // the list 255 times, and this read is not synchronised against
+                // the game thread that mutates it -- so the cheap version is also
+                // the one that spends least time exposed.
+                void* holderOf[256] = {};
+                for (const auto& mp : GetMarker().marked()) {
+                    if (mp.stencilValue) holderOf[mp.stencilValue] = mp.component;
+                }
                 uint8_t best = 0;
                 uint64_t bestPx = 0;
                 for (int i = 1; i < 256; ++i) {
-                    if (perSlot[i] > bestPx) { bestPx = perSlot[i]; best = static_cast<uint8_t>(i); }
+                    if (perSlot[i] > bestPx && holderOf[i]) {
+                        bestPx = perSlot[i];
+                        best = static_cast<uint8_t>(i);
+                    }
                 }
+                void* bestComponent = best ? holderOf[best] : nullptr;
                 if (!best || bestPx < 500) break;   // wait for something worth measuring
                 interveneSlot_ = best;
                 intervenePixelsBefore_ = bestPx;
@@ -273,10 +298,7 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
                 // measuring. The first run of this test reported FAIL with the
                 // target slot GROWING 47% -- which is not a flag that failed to
                 // clear, it is a different object wearing the same number.
-                interveneComponent_ = nullptr;
-                for (const auto& mp : GetMarker().marked()) {
-                    if (mp.stencilValue == slot) { interveneComponent_ = mp.component; break; }
-                }
+                interveneComponent_ = bestComponent;
                 ue4::GetProcessEventHook().RunOnGameThread([slot](ue4::Engine& e) {
                     GetMarker().UnmarkSlotForGroundTruth(e, slot);
                 });
@@ -289,6 +311,40 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
                 // Give the renderer time to rebuild the scene proxy. Judging on
                 // the very next frame would fail even when the claim is true.
                 if (++interveneStableFrames_ < kInterveneSettleFrames) break;
+
+                // DID THE EXPERIMENT ACTUALLY RUN? The unmark is scheduled onto
+                // the game thread and can decline -- the component may have been
+                // destroyed between selection and execution, or the slot may not
+                // be held at all. The pin is set only on the path that really
+                // clears the flag, so this distinguishes "we changed something"
+                // from "we asked". Without it the next branch compares two
+                // nullptrs, finds them equal, and grades an experiment that never
+                // happened.
+                if (GetMarker().GroundTruthPinnedSlot() != interveneSlot_) {
+                    ++interveneAborted_;
+                    LogWarn("groundtruth: the unmark for slot %u never took effect (attempt "
+                            "%u of %u) -- nothing was changed, so there is nothing to judge. "
+                            "Re-selecting.",
+                            static_cast<unsigned>(interveneSlot_), interveneAborted_,
+                            kInterveneMaxAborts);
+                    GetMarker().ClearGroundTruthPin();
+                    if (interveneAborted_ >= kInterveneMaxAborts) {
+                        LogWarn("groundtruth: giving up after %u selections that could not be "
+                                "unmarked. NO VERDICT -- this says nothing about whether the "
+                                "labels are correct, only that the test could not run.",
+                                interveneAborted_);
+                        interveneState_ = Intervention::Done;
+                    } else {
+                        // Do not re-serve the full warmup. It exists to let the
+                        // working set fill before the first measurement, and it
+                        // already has; five aborts at 90 masks each would spend
+                        // the entire capture budget deciding what to test.
+                        interveneState_ = Intervention::Waiting;
+                        interveneStableFrames_ =
+                            kInterveneWarmupFrames > 15 ? kInterveneWarmupFrames - 15 : 0;
+                    }
+                    break;
+                }
 
                 // Is the slot still worn by the component we unmarked? If the
                 // pool reissued it, any pixel count under that id belongs to

@@ -159,6 +159,12 @@ public:
     // verdict has been recorded. Held only for the duration of the measurement.
     void ClearGroundTruthPin() { groundTruthPin_ = 0; }
 
+    // The slot whose flag was ACTUALLY cleared, or 0 if the unmark has not run
+    // or found nothing to unmark. The intervention is scheduled onto the game
+    // thread, so this is the only way the render thread can tell "the experiment
+    // ran" from "the experiment was requested".
+    uint8_t GroundTruthPinnedSlot() const { return groundTruthPin_.load(); }
+
     // Slot -> object identity, for the per-frame sidecar table. The 8-bit
     // stencil value is a lease, not an identity: it only means something joined
     // against this map.
