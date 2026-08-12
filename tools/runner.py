@@ -95,6 +95,25 @@ class Run:
                      "no marking. If the game still dies the same way, the crash is not "
                      "something we are doing to it.")
         self.marker("segcap.census", census)
+        # PROCESSEVENT MUST BE ON, OR THE CONTROL PROVES NOTHING.
+        #
+        # Census skips ProcessEvent discovery by default -- "probing vtable slots
+        # is not a read-only act" -- and without it the DLL has no world state at
+        # all: `state: MENU level=? objects=0`. The level oracle goes blind, the
+        # object-churn fallback can never fire because the object count is always
+        # zero, and the run holds for 200s wherever it happens to be.
+        #
+        # A control that cannot confirm it reached gameplay is worthless here.
+        # "Survived 200 seconds" in the main menu is not comparable to a capture
+        # run in the open city; the menu is a fraction of the load. Caught by
+        # watching the first attempt rather than by reasoning about it.
+        #
+        # This still isolates what the experiment is about: no readback, no
+        # injected copies, no colour, no marking. ProcessEvent is a hook we
+        # install, not GPU work we submit, and the marking that uses it is off.
+        self.marker("segcap.petriage", census,
+                    "ProcessEvent discovery ON for the control, so it can tell "
+                    "gameplay from the menu")
         self.marker("segcap.mark", not o.no_mark and not census,
                     "mark marker SET -- this run writes bRenderCustomDepth")
         self.marker("segcap.d3ddebug", o.d3d_debug,
