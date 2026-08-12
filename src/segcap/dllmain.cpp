@@ -1038,8 +1038,23 @@ DWORD WINAPI MarkLoopThread(LPVOID) {
         // if the consumer batches; the flag makes the pass self-limiting.
         if (!g_markPassPending.exchange(true, std::memory_order_acq_rel)) {
             pe.RunOnGameThread([](segcap::ue4::Engine& e) {
-                g_marker.RefreshVisibility(e, 120);
-                g_marker.MarkBatch(e, 300);
+                // Scan wider per pass. 300 candidates every 250ms against
+                // ~33,000 markable primitives means a full sweep of the world
+                // takes ~28 seconds, and two thirds of each batch fails the
+                // visibility test -- so the working set fills slowly and decays
+                // to a fraction of the 255 available (26 live slots observed at
+                // the end of a run). More candidates inspected per pass is the
+                // direct lever on how many DISTINCT objects end up labelled.
+                //
+                // Not free, and not risk-free: every candidate costs a
+                // WasRecentlyRendered call through ProcessEvent ON THE GAME
+                // THREAD, and a control run established that marking is what
+                // destabilises this title during world streaming (passive hooks
+                // alone survive). 700 is a deliberate middle: more than double
+                // the candidate throughput, well short of the 3000-per-pass that
+                // an earlier note in this file records as having swept too much.
+                g_marker.RefreshVisibility(e, 240);
+                g_marker.MarkBatch(e, 700);
                 g_markPassPending.store(false, std::memory_order_release);
             });
         }

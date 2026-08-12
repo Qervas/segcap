@@ -252,6 +252,9 @@ private:
     uint64_t visibilityHits_ = 0;
     uint64_t slotsReleased_ = 0;
     size_t slotsFreedForCoverage_ = 0;
+    // Slots currently held by instanced (environmental) components, capped so
+    // the budget cannot be consumed by ground, foliage and building batches.
+    size_t instancedLeased_ = 0;
     // Consecutive masks in which a slot rendered below the area threshold.
     // A streak, not a single frame: an object can legitimately be occluded for
     // a moment, and evicting on one bad frame is thrash.

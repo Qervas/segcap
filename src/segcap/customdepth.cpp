@@ -389,6 +389,10 @@ int CustomDepthMarker::RefreshVisibility(ue4::Engine& engine, int limit) {
                 std::lock_guard<std::mutex> lock(identityMutex_);
                 identity_.ReleaseSlot(mp.stencilValue);
             }
+            if (mp.className.find("InstancedStaticMesh") != std::string::npos ||
+                mp.className.find("Foliage") != std::string::npos) {
+                if (instancedLeased_) --instancedLeased_;
+            }
             slotTable_.erase(mp.stencilValue);
             alreadyMarked_.erase(mp.component);
             marked_.erase(marked_.begin() + static_cast<ptrdiff_t>(refreshCursor_));
@@ -561,6 +565,7 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
     int assigned = 0;
     int refused = 0;
     int skippedInvisible = 0;
+    int skippedInstancedQuota = 0;
     int skippedAlready = 0;
 
     // Cap how many primitives are newly opted in per pass.
@@ -609,6 +614,33 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
             continue;
         }
 
+        // QUOTA THE INSTANCED MESHES.
+        //
+        // One InstancedStaticMeshComponent covers EVERY instance of a mesh --
+        // all the paving, all the trees of a type -- so it is a single slot
+        // buying an enormous screen area. Measured, they took 51% of all slots
+        // (38.2% ISM + 11.8% HISM + 1.0% foliage) while SkeletalMesh, i.e. the
+        // people, got 5.9%. The result labels ground, buildings and foliage and
+        // misses chairs, cars and characters.
+        //
+        // The area-based eviction added for coverage made this worse, not
+        // better: it rewards whatever fills pixels, which is exactly these. A
+        // chair is small BY NATURE, and optimising coverage evicts it in favour
+        // of a road. Coverage and object diversity are different goals and the
+        // budget has to be split deliberately rather than handed to whichever
+        // metric was measured last.
+        //
+        // A third of the budget is plenty to keep the environment legible; the
+        // rest goes to discrete objects, which is what a segmentation map is
+        // actually for.
+        const bool instanced =
+            c.className.find("InstancedStaticMesh") != std::string::npos ||
+            c.className.find("Foliage") != std::string::npos;
+        if (instanced && instancedLeased_ >= IdentityRegistry::kSlotCount / 3) {
+            ++skippedInstancedQuota;
+            continue;
+        }
+
         // Lease a slot through the registry rather than handing out a counter.
         //
         // The registry assigns a stable 64-bit id keyed on (pointer, serial) and
@@ -621,6 +653,7 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
             std::lock_guard<std::mutex> lock(identityMutex_);
             slot = identity_.LeaseSlot(c.component, c.serial, c.className, c.name, markPass_);
         }
+        if (slot != 0 && instanced) ++instancedLeased_;
         if (slot == 0) {
             // All 255 slots are held by objects seen this pass. Refusing is
             // correct: stealing one would thrash two labels and ruin both.
