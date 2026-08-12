@@ -34,12 +34,13 @@ def main() -> int:
     ap.add_argument("--idbuf", action="store_true", help="id-buffer probe (implied by --inject)")
     ap.add_argument("--d3d-debug", action="store_true", help="D3D12 validation layer; slow")
     ap.add_argument("--no-mark", action="store_true", help="read-only; no CustomDepth writes")
-    ap.add_argument("--census", action="store_true",
-                    help="CONTROL RUN. Hooks and logging only: no GPU work of any kind "
-                         "(no readback, no injected copies, no colour) and no marking. "
-                         "Navigates to gameplay and holds, to answer the one question the "
-                         "crash archive cannot: does inZOI die the same way when we touch "
-                         "nothing? Overrides --inject/--idbuf/--groundtruth/--mark")
+    ap.add_argument("--control", "--census", dest="census", action="store_true",
+                    help="CONTROL RUN. No GPU work of any kind (no readback, no injected "
+                         "copies, no colour) and no marking, but otherwise an ordinary "
+                         "run, so it still navigates and reports world state. Answers the "
+                         "one question the crash archive cannot: does inZOI die the same "
+                         "way in gameplay when we touch nothing? Overrides "
+                         "--inject/--idbuf/--groundtruth/--mark")
     ap.add_argument("--groundtruth", action="store_true",
                     help="mid-run, unmark exactly one slot and check that precisely its "
                          "pixels vanish. The only check here that cannot be satisfied by "

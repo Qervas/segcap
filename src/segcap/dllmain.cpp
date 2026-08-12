@@ -693,25 +693,43 @@ DWORD WINAPI DiscoverThread(LPVOID) {
         // Still do everything that IS read-only -- sampling and introspection
         // are the whole point of a census run.
         if (g_engine.namesResolved()) {
-            // PE-TRIAGE FIRST WHEN IT WAS ASKED FOR.
+            // ORDER RESTORED, DELIBERATELY.
             //
-            // This block used to sit after the sampling schedule below, which
-            // sleeps to t+180s before it finishes. So a census run that had
-            // explicitly requested ProcessEvent did not get it for three
-            // minutes, and until then the DLL has no world state at all:
-            // `state: MENU level=? objects=0`, because ProbeWorldState calls
-            // UFunctions through this very hook.
+            // I hoisted this block ahead of the sampling schedule below, to get
+            // ProcessEvent installed early enough for a control run to read
+            // world state. It worked, and it was wrong: at t+8s the object graph
+            // has not plateaued, the read-only triage has too few live objects to
+            // rank slots from, and discovery went from "too late to be useful" to
+            // "too early to work" --
             //
-            // That made the control run built on census (--census) unable to
-            // tell gameplay from the menu, which is the one thing it has to
-            // do -- its whole claim is "the game died / survived IN THE SAME
-            // STATE as a capture run". The harness waits 60s for a world name
-            // and got `?` every time.
+            //   pe-triage: attempting ProcessEvent discovery      t=8s
+            //   pe-triage: no candidate validated as ProcessEvent t=34s
             //
-            // The sampling schedule is a census diagnostic and can wait; the
-            // execution point the run depends on cannot.
-            const bool peFirst = g_peTriageInCensus;
-            if (peFirst) {
+            // The sampling delay was doing real work as an incidental settle.
+            //
+            // It was also solving nothing: census returns before line ~980, so
+            // ProbeWorldState is never called on this path and world state would
+            // have stayed `level=?` however early the hook landed. The control
+            // run now uses segcap.noreadback on the NORMAL path instead, which
+            // suppresses readback, injected copies and colour while leaving the
+            // engine layer intact.
+            const int kSampleAt[] = {30, 60, 120, 180};
+            int elapsed = 0;
+            for (int stage : kSampleAt) {
+                if (stage > elapsed) Sleep((stage - elapsed) * 1000);
+                elapsed = stage;
+                char label[32];
+                _snprintf_s(label, sizeof(label), _TRUNCATE, "t+%ds", stage);
+                g_engine.ReportSample(label);
+            }
+            g_engine.CountDerivedFrom("PrimitiveComponent");
+            // No known index here -- this is the mode used on engines where the
+            // brute-force search is unsafe, so the ranking is the output rather
+            // than a calibration.
+            g_engine.ProbeVTablePrologues(-1);
+            if (g_introspect) Introspect(g_engine, g_introspectClasses);
+
+            if (g_peTriageInCensus) {
                 // Explicitly requested. Install() now tries only the handful of
                 // slots the read-only triage shortlisted, and its validator
                 // stops after 2000 samples -- the two things that made the
@@ -745,25 +763,6 @@ DWORD WINAPI DiscoverThread(LPVOID) {
                     segcap::LogWarn("pe-triage: no candidate validated as ProcessEvent");
                 }
             }
-
-            // The census diagnostics themselves, now strictly after the hook the
-            // run may depend on. These sleep to t+180s, which is why anything
-            // waiting on them was starved.
-            const int kSampleAt[] = {30, 60, 120, 180};
-            int elapsed = 0;
-            for (int stage : kSampleAt) {
-                if (stage > elapsed) Sleep((stage - elapsed) * 1000);
-                elapsed = stage;
-                char label[32];
-                _snprintf_s(label, sizeof(label), _TRUNCATE, "t+%ds", stage);
-                g_engine.ReportSample(label);
-            }
-            g_engine.CountDerivedFrom("PrimitiveComponent");
-            // No known index here -- this is the mode used on engines where the
-            // brute-force search is unsafe, so the ranking is the output rather
-            // than a calibration.
-            g_engine.ProbeVTablePrologues(-1);
-            if (g_introspect) Introspect(g_engine, g_introspectClasses);
         }
         segcap::LogInfo("census complete");
         return 0;
