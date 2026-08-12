@@ -66,27 +66,26 @@ class GameProfile:
     # the worst case is unchanged while the common case gets fast.
     menu_ceiling: float = 150.0
     load_ceiling: float = 240.0
-    # How long to wait for load_signal after clicking through the menu, before
-    # assuming the click missed and clicking again.
+    # How long to wait for the loaded world to appear after clicking through the
+    # menu, before assuming the click missed and clicking again.
     #
     # This was a hardcoded 25 in runner.py, in a file whose entire premise is
-    # "signals, not durations". Measured across 58 archived inZOI runs, the gap
-    # between render_signal and the first `world is changing` was:
+    # "signals, not durations", and it was never once satisfied: 0 of 58
+    # archived runs. So every inZOI run ever made clicked Continue and the save
+    # slot, timed out, and clicked BOTH AGAIN into a load that was already
+    # running -- then logged "attempt 2 after 0s", which was the FIRST click's
+    # load finally registering. The retry was self-correcting enough to hide a
+    # ceiling that could not be met.
     #
-    #     min 37.4s   median 43.1s   warm max 46.9s   cold-start max 146.4s
-    #     caught by the 25s ceiling: 0 of 58
+    # The gate now watches the LEVEL NAME rather than object-count churn (see
+    # runner.into_gameplay). Measured across 22 archived runs that reached a
+    # world, render_signal -> OpeningLevel2 becoming RedCity_Map:
     #
-    # Never once. Every inZOI run in this project's history clicked Continue and
-    # the save slot, timed out, and clicked BOTH AGAIN into a world that was
-    # already loading -- and then logged "attempt 2 after 0s", which was the
-    # FIRST click's load finally registering. The retry loop was self-correcting
-    # enough to hide a ceiling that could not be met.
+    #     min 41.5s   median 69.9s   p90 73.4s   max 74.5s
     #
-    # 90s covers every warm run with roughly double the margin. Cold starts
-    # (~140s, first load after boot with the 35 GB save uncached) still fall
-    # through to the retry; that path is survivable and is what happens today,
-    # so this narrows the bug rather than claiming to close it.
-    load_begin_ceiling: float = 90.0
+    # plus one observed outlier at 118.4s with the save no longer disk-cached.
+    # 120s covers that; the common case exits at ~70s and pays nothing.
+    load_begin_ceiling: float = 120.0
 
     # Some titles load paused and need an explicit unpause; some do not.
     settle_after_unpause: float = 60.0

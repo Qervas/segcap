@@ -1622,9 +1622,44 @@ and not what happens: at each `world is changing` line only 0.4-9.3 KB followed
 in the next two seconds. The mechanism is real, this instance is not it, and the
 tail limit is now a known hazard for any *other* signal logged mid-burst.
 
-The ceiling is now a profile field carrying the measured distribution, set to
-90s. Cold starts still fall through to the retry, which is the behaviour today,
-so this narrows the bug rather than claiming to close it.
+**Then the fix failed, and the failure was more interesting than the bug.**
+
+I raised the ceiling to 90s from that measurement and watched the next run report
+`NOT observed within 90s`. The number was not the problem.
+
+`world is changing` is what the DLL logs whenever the object count jumps. The
+menu world settling produces it; a save loading produces it; garbage collection
+produces it. It is **churn, not a load signal**, and I had measured the first
+occurrence of it and called that "when the load starts". In the failing run the
+menu world settled at t=39 and the save did not actually come up until t=118 --
+so the ~43s median I had measured was, in many of those runs, the *menu* world,
+not the thing being waited for.
+
+A number derived from the wrong event landed close enough to look reasonable and
+still could not work. That is worse than an obviously wrong number, and it is the
+same failure as §8.6: a measurement that is coherent, precise, and about
+something else.
+
+Measured again on the unambiguous event -- the `UWorld` name changing from
+`OpeningLevel2` to `RedCity_Map`, across 22 archived runs that reached a world:
+
+```
+min 41.5s   median 69.9s   p90 73.4s   max 74.5s
+25s ceiling: 0/22      90s: 22/22
+```
+
+The gate now watches that instead, with a 120s ceiling to cover an observed
+118.4s outlier from a session where the save was no longer disk-cached. The
+detector was already written and already correct -- `wait_for_level_change`, used
+twenty lines further down for exactly this reason, and documented there as the
+fix for a *previous* bug where marked-component count could not tell menu from
+gameplay. The right instrument existed and the gate above it was watching
+something else.
+
+One trap avoided in the process: switching the gate to the level name would have
+broken Stray, whose profile has no such log line, by making it wait the full
+ceiling for a signal that cannot arrive. It falls back to the old path when the
+menu world's name is unknown.
 
 Why it matters beyond tidiness: that spurious second click sends Continue and a
 save-slot selection into an in-progress world load, which is exactly the sort of

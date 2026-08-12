@@ -162,9 +162,42 @@ class Run:
             if not p.load_signal:
                 entered = True
                 break
-            entered = H.wait_for_log(LOG, [p.load_signal], p.load_begin_ceiling,
-                                     f"the world to begin loading (attempt {attempt})",
-                                     self.pid, self.say)
+            # GATE ON THE LEVEL NAME, NOT ON OBJECT CHURN.
+            #
+            # This waited on `world is changing`, which is what the DLL logs
+            # whenever the object count jumps. That fires for the MENU world
+            # settling as readily as for a save coming up, so it cannot answer
+            # "did my click start a load?" -- and with a 25s ceiling it was
+            # never once satisfied in 58 archived runs, so every inZOI run ever
+            # made clicked Continue and the save slot a second time into a load
+            # that was already running.
+            #
+            # The level NAME is unambiguous: OpeningLevel2 -> RedCity_Map means
+            # the save is up. Measured across 22 archived runs that reached a
+            # world, time from render_signal to that change:
+            #
+            #     min 41.5s   median 69.9s   p90 73.4s   max 74.5s
+            #
+            # plus one observed outlier at 118.4s in a session where the game
+            # had been relaunched a dozen times and the save was no longer
+            # cached. The ceiling covers that; the common case exits at ~70s.
+            #
+            # wait_for_level_change also requires the name to hold steady, which
+            # rejects the intermediate worlds UE passes through on the way.
+            #
+            # Only when we actually know the menu's world name. A title whose
+            # DLL never publishes `state: ... level=` leaves menu_level empty,
+            # and gating on a change from "" would wait the full ceiling for a
+            # signal that cannot arrive -- turning a fix for one game into
+            # exactly this bug for the other.
+            self.say(f"entering the world (attempt {attempt})")
+            if self.menu_level:
+                entered = bool(H.wait_for_level_change(
+                    LOG, self.menu_level, p.load_begin_ceiling, self.pid, self.say))
+            else:
+                entered = H.wait_for_log(LOG, [p.load_signal], p.load_begin_ceiling,
+                                         f"the world to begin loading (attempt {attempt})",
+                                         self.pid, self.say)
             if entered:
                 break
         if not entered:
