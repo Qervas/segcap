@@ -1673,6 +1673,60 @@ sitting where the data never goes. What made this one survive longest is that it
 had a fallback. A guard that fails loudly gets fixed; a guard that fails into a
 retry that works looks like a guard that works.
 
+### 8.18 `?` is truthy
+
+Chasing the load gate one level further down turned up the thing that was
+actually costing runs, and it is one character long.
+
+The DLL prints its state line before the engine layer has resolved a live
+`UWorld`:
+
+```
+state: BOOT level=? sim=? dilation=-1.00 objects=0 ...
+state: MENU level=? sim=? dilation=-1.00 objects=0 ...
+state: WORLD level=RedCity_Map sim=RUNNING objects=564553 ...
+```
+
+`?` is a sentinel meaning "not known yet". `current_level()` returned it
+verbatim:
+
+```python
+return ln.split("level=")[1].split()[0]      # -> "?"
+```
+
+A one-character string is truthy. So `menu_level` became `"?"`, the log printed
+`menu world is '?'` -- **exactly what it prints when the read fails**, so the two
+cases were indistinguishable in every log this project has produced -- and the
+poll I had just added to "wait until the name exists" exited immediately,
+satisfied.
+
+Worse, `wait_for_level_change(was="?")` waits to leave `"?"`. The menu's own
+world, `OpeningLevel2`, is not `"?"`. So the wait was satisfied by **the menu
+appearing**, and the harness announced `loaded world 'OpeningLevel2' after 10s`
+and went on to resume the simulation and arm the capture. In the menu.
+
+How much this cost, counted across the archive:
+
+```
+runs that reached CAPTURE ARMED:              42
+  of those, never logged a WORLD state line:  20   (48%)
+```
+
+Nearly half of every run that got as far as arming was photographing the main
+menu, and each one reported reaching gameplay on the way there. This is the same
+failure as the screenshot in §7 that showed the harness clicking a loading
+screen -- and it survived that fix because the replacement oracle, the level
+name, had an "unknown" value that passed for a name.
+
+`current_level` now treats `?` as unknown and returns empty, which is what the
+callers already assumed it did.
+
+**The lesson is not "check for the sentinel".** It is that `menu world is '?'`
+was printed on every single run, in front of me, for days -- and it was
+ambiguous between "the menu's world is called ?" and "I could not read the
+world". A log line that renders two different states identically cannot be
+evidence for either.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have

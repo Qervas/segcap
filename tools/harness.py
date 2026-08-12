@@ -412,10 +412,25 @@ def frame_changes(root: Path, act: Path, wait: float = 4.0) -> bool:
 
 
 def current_level(path: Path) -> str:
-    """The loaded UWorld's name, straight from the engine's own state line."""
+    """The loaded UWorld's name, straight from the engine's own state line.
+
+    Empty when no world is resolved YET, which is not the same as no state line.
+    The DLL prints `state: MENU level=?` before the engine layer has found a live
+    UWorld, and this used to return that `?` verbatim -- a sentinel that reads as
+    "unknown" to a human and as a perfectly good value to the caller, because a
+    one-character string is truthy.
+
+    The damage was silent and in two places. `menu world is '?'` was
+    indistinguishable from "we could not read it", so a poll that waited for the
+    name to exist exited immediately holding `?`. And the load gate, which waits
+    to leave the menu's world, was then satisfied by the MENU's own name
+    appearing -- passing for the wrong reason at the wrong moment.
+    """
     for ln in reversed(tail(path, 400)):
         if "state: " in ln and "level=" in ln:
-            return ln.split("level=")[1].split()[0]
+            name = ln.split("level=")[1].split()[0]
+            if name and name != "?":
+                return name
     return ""
 
 
