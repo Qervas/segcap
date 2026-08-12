@@ -152,8 +152,27 @@ class Run:
         # screen leaves the next iteration starting from the menu again.
         # Remember which world the MENU is, so the load can be detected as a
         # change rather than guessed at from a timer.
-        self.menu_level = H.current_level(LOG)
-        self.say(f"menu world is '{self.menu_level or '?'}'")
+        # WAIT FOR THE NAME TO EXIST BEFORE RECORDING IT.
+        #
+        # This read current_level() immediately after render_signal and took
+        # whatever was there -- which is nothing. render_signal fires at ~t=22
+        # (the first census line), and the DLL's first `state: ... level=` line
+        # does not appear until ~t=38, once the engine layer has resolved a live
+        # UWorld. So menu_level was reliably '?', and a load gate keyed on "the
+        # level changed FROM the menu" silently degraded to its fallback every
+        # single run.
+        #
+        # Checked once, at startup, at the wrong moment -- the trap this file
+        # already warns about three times over.
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            self.menu_level = H.current_level(LOG)
+            if self.menu_level:
+                break
+            time.sleep(2)
+        self.say(f"menu world is '{self.menu_level or '?'}'"
+                 + ("" if self.menu_level else " -- no level line yet; the load gate will "
+                                               "fall back to the object-churn signal"))
 
         entered = False
         for attempt in range(1, 4):
