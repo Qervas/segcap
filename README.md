@@ -3,8 +3,17 @@
 Per-pixel object-ID segmentation masks extracted from a running commercial game,
 aligned with the rendered frames.
 
-Target: **Stray** (Unreal Engine 4, D3D12, retail Steam build, no source, no
-symbols, shipping binary with debug names stripped).
+Two retail games, no source, no symbols, shipping binaries with debug names
+stripped:
+
+| | engine | result |
+|---|---|---|
+| **Stray** | UE4, D3D12 | masks over gameplay video, 1:1 aligned, subject tracked |
+| **inZOI** | UE5.6 + Nanite, D3D12 | 401 masks/run, 82-91% of pixels labelled, live simulation |
+
+Stray is the complete deliverable. inZOI is the harder case and the more
+interesting one: on a Nanite title the per-object stencil is not in the
+depth-stencil at all, and finding where it *is* took most of the project.
 
 ![overlay](docs/evidence/STRAY-GAMEPLAY-OVERLAY.png)
 
@@ -20,6 +29,7 @@ reflection at runtime, not hardcoded.
 | | |
 |---|---|
 | **The demo** | [`docs/evidence/stray-gameplay-demo.mp4`](docs/evidence/stray-gameplay-demo.mp4) — 30s real-time, rendered left, labelled mask right, live controller panel |
+| **inZOI** | [`docs/evidence/inzoi_hq.mp4`](docs/evidence/inzoi_hq.mp4) — 401 masks at 1280x800, Zois tracked. Masks only; see "What is not done" |
 | **Picking this back up** | [`docs/RESUME.md`](docs/RESUME.md) — state, sanity check, and what to do next |
 | **The debugging story** | [`docs/DEBUGGING.md`](docs/DEBUGGING.md) — every crash and wrong turn, and what actually found each one |
 | **Where AI helped and where it was overridden** | [`docs/AI-USAGE.md`](docs/AI-USAGE.md) |
@@ -36,13 +46,26 @@ Nothing here needs a human at the keyboard.
 
 ```powershell
 .\build.ps1
-.\tools\run_auto.ps1 -Seconds 340
+python tools\capture.py stray --seconds 340
+python tools\capture.py inzoi --inject --walk --seconds 200
+python tools\capture.py inzoi --preflight     # validate the flow, launch nothing
 ```
 
-That disables the screensaver, launches Stray's shipping executable suspended,
+That disables the screensaver, launches the shipping executable suspended,
 injects `segcap.dll` before its first D3D call, resumes it, focuses the window,
-drives the menus with a virtual Xbox pad, patrols for scene variety, captures,
-and restores your settings.
+drives the menus with a virtual Xbox pad, waits for the world to actually finish
+loading, resumes the simulation, captures, and restores your settings.
+
+Everything title-specific — where the executable lives, the route through the
+menus, which log line means "loaded" — is a `GameProfile` in `tools/games.py`.
+The runner is shared, so a fix applies to both titles by construction. That is
+not decoration: the two previous run scripts began as a copy and drifted, and
+each ended up carrying bugs the other did not.
+
+`--preflight` runs the whole control flow with the game stubbed out, in about a
+second. It exists because four runs died to harness mistakes that surfaced only
+when their line executed, four minutes in, each costing a loaded game world to
+discover.
 
 ```powershell
 python tools\overlay.py build\bin\segcap_mask_<N>.pgm `
@@ -103,12 +126,78 @@ none issues GPU work.
 
 ---
 
+## How things were diagnosed
+
+The full account is `DEBUGGING.md`. The short version, because the method is the
+transferable part:
+
+**Read the target's own crash channel first.** UE writes `CrashContext.runtime-xml`
+with an error message and a callstack *by module*. "Is our DLL on the stack?" is
+the cheapest possible answer to "did we cause it?", and it beats any bisect. It
+also misleads: D3D12 reports invalid recorded commands from `Close()`, so a crash
+with none of our frames on it is exactly what our own bad copy looks like.
+
+**A refutation is only as good as its scope.** The stale-footprint theory was
+killed with "the code revalidates every frame" — true of the Present-path
+readback, and silent about the injection ring. Two instances of one class; the
+refutation checked the wrong one.
+
+**Remove one variable rather than argue.** After six theories about a crash, one
+run with colour capture disabled said more than all of them. The habit of
+changing code and reasoning about the result caused three regressions here.
+
+**A number that looks stable is a number nobody is writing.** Every run produced
+exactly 61 masks. I read that as a budget, raised `maxCaptures_` from 150 to 600,
+saw no change, and continued. The cap was two stale marker files on disk from an
+older harness. `ls` would have beaten reading the source, and "my fix had no
+effect" should have been a stop signal.
+
+**Thresholds chosen from one observation become "never".** Four separate times:
+the id probe judged buffers at 8 leased slots where its own guard is
+arithmetically unpassable; "in gameplay" used `marked >= 100`, which the *menu*
+also satisfies; "sim running" accepted an object-count delta of +3 out of
+564,553; slot eviction fired with slots free and drained the pool from 255 to 57.
+Each looked locally reasonable and none separated the cases it existed to
+separate.
+
+**Direct-from-the-engine is not the same as correct.** `UGameplayStatics::IsGamePaused`
+is an authoritative answer to the wrong question — it reports the *engine* pause a
+popup menu sets, while inZOI runs its own world clock. It reads false while the
+world is frozen.
+
+**Look at the screen.** Hours of theorising about pause coordinates, injected
+input filtering and scan codes ended when a single screenshot showed the harness
+had been clicking a **loading screen** the whole time. The transport coordinate
+was correct from the start; the timing was not.
+
+---
+
+## What is not done
+
+**inZOI has no colour underlay**, so its masks are correct but there is no
+overlay-on-video demo for it the way there is for Stray. The colour copy issued
+from our own queue at Present destabilises the game; the fix is to record it into
+the game's own command list at a barrier, exactly as the mask copy already does,
+which is real work rather than a patch. Diagnosis in `DEBUGGING.md`.
+
+**inZOI coverage tops out around 91%**, not 100%. The stencil value is 8 bits —
+255 ids — against ~560,000 objects in an open city. Stray reaches ~100% because
+its alleys genuinely contain fewer than 255 visible things. The 255 are now spent
+on whatever fills screen rather than whatever the object scan reached first.
+
+**Two crash families in inZOI remain unexplained**: `E_INVALIDARG` from the
+game's own `Close()`, and `E_ABORT` from `ResizeBuffers` during world streaming.
+Neither blocks capture — the harness retries around them — and six candidate
+explanations were killed with evidence rather than left as guesses.
+
+---
+
 ## Measured results
 
 | | |
 |---|---|
-| Objects per mask | 60–89 distinct ids |
-| Pixels labelled | 94–99.9% |
+| Objects per mask | Stray 60–89 distinct ids; inZOI 39–80 |
+| Pixels labelled | Stray 94–99.9%; inZOI 82–91% (255-id ceiling, open world) |
 | Every mask id resolves via its sidecar | **0 unbound**, 0.000% of pixels |
 | Identity survives slot loss | 52 objects left and returned; 55 held >1 slot |
 | Slot ambiguity within a frame | **0** |
@@ -139,7 +228,13 @@ src/segcap/      the injected DLL
 src/injector/    suspended launch + inject + resume
 src/vpad/        ViGEm virtual Xbox pad
 src/tests/       25 assertions, no game required
-tools/           harness, overlay, A/B diff, container, identity analysis
+tools/
+  capture.py     one entry point for every title
+  games.py       GameProfile: exe, menu route, load signals, per title
+  runner.py      the run itself, shared by all titles
+  harness.py     Win32 liveness, thread recovery, log waits
+  overlay.py     mask -> colourised overlay, with the alignment refusal
+  mask_movie.py  masks as video when there is no colour to overlay onto
 docs/            DEBUGGING.md, AI-USAGE.md, FORMAT.md, evidence/
 ```
 
@@ -147,11 +242,11 @@ docs/            DEBUGGING.md, AI-USAGE.md, FORMAT.md, evidence/
 
 ## Notes
 
-Two reversible changes to the machine, both made deliberately and both
-documented: `steam_appid.txt` beside Stray's shipping executable (the documented
+Reversible changes to the machine, made deliberately and documented:
+`steam_appid.txt` beside each shipping executable (the documented
 Steamworks mechanism that stops `SteamAPI_RestartAppIfNecessary` relaunching the
 process out from under the injector), and Stray's `GameUserSettings.ini` set to
 windowed 1280×720 with a backup at `GameUserSettings.ini.segcap-backup`.
 
-The game is a legitimately owned retail copy. Marking is gated behind a marker
+Both games are legitimately owned retail copies. Marking is gated behind a marker
 file so a run cannot mutate game state by accident.

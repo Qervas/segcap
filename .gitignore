@@ -17,7 +17,11 @@ out/
 # Capture output from the tool itself
 recordings/
 *.segcap
+# Videos are ignored by default -- captures produce hundreds of MB -- EXCEPT the
+# ones in docs/evidence, which are the deliverable. Order matters: the negation
+# has to come after the pattern it overrides, because the last match wins.
 *.mp4
+!docs/evidence/*.mp4
 
 # Editor / OS
 .vs/

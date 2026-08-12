@@ -87,6 +87,51 @@ plausibly the most valuable artifact here given Antoine's stated priorities.
 
 ---
 
+**The sim was never running, and a photograph proved it.** For hours I reported
+captures as "live gameplay". Frank sent a photo of his screen showing the
+transport bar paused:
+
+> *"you didn't turn on the timer so it's paused"*
+
+Everything I had used to claim otherwise was indirect and each one failed
+differently. Object-count delta accepted +3 out of 564,553 objects as "time is
+flowing" — that is garbage collection. UE's `IsGamePaused` reads false even in
+the opening menu, because inZOI runs its own world clock and the engine flag
+describes a different thing entirely. A full-frame screenshot comparison
+reported motion because the *loading spinner* was animating.
+
+He then had to say it twice more before I acted on the right thing:
+
+> *"don press 1, it's not working, use mouse click"*
+> *"you can web search first"*
+
+The search took thirty seconds and settled a question I had built two rounds of
+machinery around. The screenshot took none and showed the actual state
+immediately: **the harness had been clicking a loading screen**, so no input
+ever reached a transport bar. The coordinate I had spent hours blaming was
+correct from the start.
+
+**"That's not reliable, there must be more direct info."** I was inferring game
+state from render-target counts and object-count deltas. Frank pushed for
+something direct, which led to reading UE's own `UWorld` name — a fact, not a
+correlate, and the signal that finally distinguished the menu from a loaded save
+and fixed the timing. Worth noting that my *first* attempt at "direct" was also
+wrong twice over: it read the Class Default Object instead of the live world,
+and the property route returned zero properties on this engine build.
+
+**"Why don't the objects near her show up?"** A single glance at a mask. The
+answer was that 255 ids were being spent by object-scan order — a palm tree at
+the end of the street held a slot while the chair the character sat on had none.
+Feeding pixel-area back from the mask lifted coverage from 15-64% to 82-91%.
+Nothing in my own testing had asked "are these the *right* 255".
+
+**The pattern.** In every case above the human was looking at the artefact and I
+was looking at instrumentation. My checks were not wrong so much as *aimed
+slightly beside the question*, and each was defended with more confidence than
+the evidence supported. Three separate times I reported something as verified —
+the crash fixed, the sim resumed, the colour path implicated — on evidence that
+could not carry the claim.
+
 ## 3. Where the AI corrected itself, and what did the correcting
 
 Never by reasoning. Always by an instrument.
