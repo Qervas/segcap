@@ -1341,6 +1341,97 @@ the candidate's attempts. It had been counting toward permanent rejection, so th
 correct buffer could be blacklisted for the rest of the session on the strength of
 looking at it too early.
 
+### 8.12 The same guard, failing the other way
+
+§8.11 ends confidently: the acceptance test was being asked a question the sample
+could not answer, the hold-off at 16 leased slots fixes it. That was true and it
+was not enough.
+
+A run today, with **155 slots leased** -- ten times the hold-off, nothing like a
+small sample -- produced this eleven times in a row and then zero masks:
+
+```
+idbuf: 0000026F8A9B5090 channel G16(high) matched 100.0% but 85% of the
+matching texels are a single value -- that is one big region, not a set of
+object ids; not accepting
+```
+
+100.0%. Every non-zero texel in that buffer carried a stencil value we currently
+leased. It is the correct target and the probe rejected it, because of the
+dominance guard rather than the distinctness one this time.
+
+The dominant value is inZOI's apartment shell. Floor, walls and ceiling are a
+single `StaticMeshComponent0`, and indoors it legitimately covers 85% of the
+labelled pixels. The same object is the one that takes ~56% of a normal outdoor
+frame and that the README lists as a cosmetic wart.
+
+**Dominance is not a property of the buffer. It is a property of the scene.**
+"No single value carries more than 60% of the match" reads like a statement about
+whether the data looks like object ids, and it is actually a statement about
+whether the room you are standing in has one big object in it. There is no
+threshold that separates those, because they are not the same question.
+
+What makes it worse is that the guard has never earned its place. Both decoys on
+record -- the `R8_UINT` `{0,1,2}` flag buffer, and the earlier false positive
+where values 1, 2 and 3 covered 58.7% of the screen -- have **three** distinct
+values, and are rejected by the distinctness test alone. Dominance has never been
+the condition that caught anything. It has now been the condition that rejected
+the answer twice.
+
+The comment above the guard names three conditions. Only two were ever
+implemented, and the missing third is the one that does the real work:
+
+```
+//   - enough distinct leased values actually present, ...
+//   - no single value dominating the "match", ...
+//   - a decent share of the leased set observed, not just its head   <- absent
+```
+
+So distinctness now scales with what is actually leased -- an eighth of the
+leased set, floor of 6 -- and dominance is reported rather than enforced. At 155
+slots that demands 19 distinct leased values instead of 6, which is a strictly
+harder test than the one it replaces, and one a decoy cannot pass however its
+pixels are distributed.
+
+The tempting fix was to keep dominance and add the share test as a third
+condition. That would have left `notDominated` implied by `enoughDistinct` -- a
+condition that can never independently fail, which is the exact shape of
+`(state & D3D12_RESOURCE_STATE_PRESENT) == PRESENT` in §8.7 and of the unbounded
+"wait for better evidence" in §8.6. Two vacuous guards is a pattern; three would
+be a habit. One test decides, the other is logged as evidence.
+
+### 8.13 The proof that could not run
+
+Separately, the ground-truth intervention -- unmark exactly one slot, require
+exactly its pixels to vanish -- turns out to have been unable to reach a verdict
+on inZOI at all, for a reason that is entirely self-inflicted.
+
+Both counters tick on the same event, once per completed mask. The verdict waits
+**30**. The coverage evictor fires at **8**:
+
+```cpp
+if (marked_.size() >= IdentityRegistry::kSlotCount - 8 &&
+    tinyStreak_[mp.stencilValue] >= 8) { ...release the slot... }
+```
+
+Unmarking the target drives its slot to zero pixels, which is precisely the
+signal `tinyStreak_` counts. The test's own success condition is what triggers
+the mechanism that destroys the test: at tick 8 the slot is reclaimed and
+reissued to another object, and at tick 30 the verdict correctly reports
+INCONCLUSIVE because a different component is wearing the number.
+
+It never showed up on Stray because that gate also requires
+`marked_.size() >= 247`, and Stray's alleys never fill the pool. **The check was
+built and tuned on the one title where its confound is unreachable.**
+
+The fix pins the slot under measurement against that eviction and against that
+one only. Pinning it against all three release paths was the obvious move and
+would have been a silent disaster: the stale-object drop and the not-rendered
+release are what stop this test reporting a false PASS when the object is
+destroyed or simply walks off camera. Their removing it from `marked_` is what
+makes the verdict's "is the slot still held by the component we unmarked?" check
+fire. Pin everything and every camera cut becomes proof.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have

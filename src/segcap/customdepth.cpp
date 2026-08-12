@@ -284,6 +284,17 @@ void* CustomDepthMarker::UnmarkSlotForGroundTruth(ue4::Engine& engine, uint8_t s
                      "be cleared the way the engine would clear it");
             return nullptr;
         }
+        // Pin BEFORE clearing the flag. From the moment the primitive stops
+        // writing, its slot renders zero pixels -- which is exactly the signal
+        // the coverage evictor in RefreshVisibility counts. Without the pin the
+        // test cannot complete on a title that keeps the pool full: the evictor
+        // needs 8 tiny masks, the verdict needs 30, and both tick once per mask,
+        // so the slot is always reclaimed and reissued ~22 masks before it is
+        // judged. The measurement's own success condition is what triggers it.
+        //
+        // It never showed up on Stray because that gate also requires
+        // marked_.size() >= 247, and Stray's alleys never fill the pool.
+        groundTruthPin_ = slot;
         struct { uint32_t bValue; } off = {0};
         ue4::GetProcessEventHook().CallFunction(mp.component, fnSetRenderCustomDepth_, &off);
         LogWarn("groundtruth: UNMARKED slot %u (%s) -- from here its pixels must vanish "
@@ -381,7 +392,23 @@ int CustomDepthMarker::RefreshVisibility(ue4::Engine& engine, int limit) {
         // of migrating. A free slot costs nothing, so there is no reason to take
         // one back until the budget is actually full -- the point of this is to
         // choose BETWEEN objects when 255 is not enough, not to have fewer.
-        if (marked_.size() >= IdentityRegistry::kSlotCount - 8 &&
+        // The slot under ground-truth measurement is exempt from THIS eviction
+        // and only this one. That asymmetry is the point, not an oversight:
+        //
+        //   - the coverage evictor fires BECAUSE the intervention worked, so
+        //     leaving it live makes the test unable to ever reach a verdict;
+        //   - the stale-object drop above and the not-rendered release below
+        //     fire for reasons that have nothing to do with our flag, and they
+        //     are what STOPS this test reporting a false PASS. If the object is
+        //     destroyed or walks off camera, its pixels vanish for a reason we
+        //     did not cause; those two paths remove it from marked_, and the
+        //     verdict's "is the slot still held by the component we unmarked?"
+        //     check then correctly reports INCONCLUSIVE instead of success.
+        //
+        // Pinning against all three would have silently converted every
+        // camera-cut into proof.
+        const bool pinned = mp.stencilValue == groundTruthPin_.load();
+        if (!pinned && marked_.size() >= IdentityRegistry::kSlotCount - 8 &&
             tinyStreak_[mp.stencilValue] >= 8) {
             tinyStreak_[mp.stencilValue] = 0;
             UnmarkPrimitive(mp);

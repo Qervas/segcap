@@ -81,6 +81,8 @@ class Run:
         self.marker("segcap.inject", o.inject,
                     "INJECT ARMED -- copies recorded into the game's own lists")
         self.marker("segcap.idbuf", o.idbuf or o.inject, "ID-BUFFER PROBE on")
+        self.marker("segcap.groundtruth", getattr(o, "groundtruth", False),
+                    "GROUND-TRUTH INTERVENTION on -- one slot gets unmarked mid-run")
         # OWN THESE, do not inherit them.
         #
         # segcap.captures and segcap.stride were left on disk by the old

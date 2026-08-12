@@ -184,34 +184,60 @@ void Hooks::OnIdBufferReady(const MaskFrame& frame) {
             //     value cannot carry the verdict
             //   - no single value dominating the "match", for the same reason
             //   - a decent share of the leased set observed, not just its head
+            //
+            // THE THIRD CONDITION WAS NEVER IMPLEMENTED. Only the first two were,
+            // and the missing one is the one that matters here: a fixed floor of 6
+            // distinct values is a weak test once 155 slots are leased, while
+            // dominance -- "no single value carries more than 60% of the match" --
+            // is not a fact about the buffer at all. It is a fact about the SCENE.
+            //
+            // inZOI's apartment shell is a single StaticMeshComponent0 covering
+            // floor, walls and ceiling. Indoors it is 85% of the labelled pixels,
+            // legitimately. The probe then reached the correct R16G16_UINT Nanite
+            // target, measured 100.0% of non-zero texels carrying leased slots,
+            // and refused it eleven times running for being "one big region".
+            // Zero masks from a run that had already found the right buffer.
+            //
+            // Dominance has never once caught a decoy. Both decoys on record --
+            // the R8_UINT {0,1,2} flag buffer, and the 58.7%-of-screen match
+            // carried by values 1, 2 and 3 -- have THREE distinct values and are
+            // rejected by distinctness alone. So scale distinctness to the leased
+            // set, which is the test the comment above always claimed to make, and
+            // let it override dominance: a decoy cannot produce a large, scattered
+            // subset of our slots, however the pixels are distributed among them.
             constexpr double kIdChannelThreshold = 0.90;
             constexpr uint32_t kMinDistinctLeasedSeen = 6;
-            constexpr double kMaxSingleValueShare = 0.60;
-            const bool enoughDistinct = bestChan >= 0 && distinctLeasedSeen[bestChan] >= kMinDistinctLeasedSeen;
+            constexpr size_t kLeasedShareDivisor = 8;   // an eighth of what we hold
+            const uint32_t needDistinct = std::max<uint32_t>(
+                kMinDistinctLeasedSeen, static_cast<uint32_t>(leasedCount / kLeasedShareDivisor));
+            const bool enoughDistinct =
+                bestChan >= 0 && distinctLeasedSeen[bestChan] >= needDistinct;
+            // Reported, not enforced. Keeping it as a veto AND scaling distinctness
+            // would have left a condition that can never independently fail, which
+            // is the same shape as the two vacuous guards already in this project's
+            // history ((state & PRESENT) == PRESENT, and an unbounded "wait for
+            // better evidence"). One test decides; the other is evidence.
             const double dominance =
                 (bestChan >= 0 && hit[bestChan])
                     ? static_cast<double>(topLeasedValueCount[bestChan]) /
                           static_cast<double>(hit[bestChan])
                     : 1.0;
-            const bool notDominated = dominance <= kMaxSingleValueShare;
             if (bestChan >= 0 && bestFrac >= kIdChannelThreshold && !enoughDistinct) {
                 LogInfo("idbuf: %p channel %s matched %.1f%% but only %u distinct leased "
-                        "values appear -- too few to distinguish real ids from ordinary "
-                        "small integers; not accepting",
+                        "values appear of the %u needed for %zu leased slots -- too few to "
+                        "distinguish real ids from ordinary small integers; not accepting "
+                        "(top value holds %.0f%% of the match)",
                         static_cast<void*>(idTarget_), names[bestChan], 100.0 * bestFrac,
-                        distinctLeasedSeen[bestChan]);
-            } else if (bestChan >= 0 && bestFrac >= kIdChannelThreshold && !notDominated) {
-                LogInfo("idbuf: %p channel %s matched %.1f%% but %.0f%% of the matching "
-                        "texels are a single value -- that is one big region, not a set of "
-                        "object ids; not accepting",
-                        static_cast<void*>(idTarget_), names[bestChan], 100.0 * bestFrac,
+                        distinctLeasedSeen[bestChan], needDistinct, leasedCount,
                         100.0 * dominance);
-            } else if (bestChan >= 0 && bestFrac >= kIdChannelThreshold && enoughDistinct &&
-                       notDominated) {
+            } else if (bestChan >= 0 && bestFrac >= kIdChannelThreshold && enoughDistinct) {
                 LogWarn("idbuf: FOUND OUR IDS in %p channel %s (%.1f%% of non-zero texels are "
-                        "leased slots, %zu slots leased). This is the per-object id buffer.",
+                        "leased slots; %u distinct leased values of %zu slots leased, needed "
+                        "%u; largest single id holds %.0f%% of the match). This is the "
+                        "per-object id buffer.",
                         static_cast<void*>(idTarget_), names[bestChan], 100.0 * bestFrac,
-                        leasedCount);
+                        distinctLeasedSeen[bestChan], leasedCount, needDistinct,
+                        100.0 * dominance);
                 idChannelFound_ = true;
                 // Remember the SIGNATURE, not just this resource.
                 //

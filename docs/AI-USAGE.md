@@ -175,6 +175,28 @@ bring to it. The habit that actually helped was asking, before trusting a
 number, **"what would this look like if the thing I am claiming were false?"** —
 and if the answer is "the same", the metric is not evidence.
 
+**The sibling failure mode: a guard that reads the world instead of the data.**
+The id probe rejected the correct buffer eleven times running while reporting
+that 100% of its texels carried ids we had leased, because a second condition
+asks "does one value dominate the match?" That sounds like a question about
+whether the buffer contains object ids. It is a question about whether the room
+has one big object in it — and inZOI's apartment shell is a single mesh covering
+85% of an indoor view. No threshold separates those two readings, because they
+are not the same question, and the guard had never once caught the thing it was
+added for. Asking "what is this condition actually a fact *about*?" is the same
+move as asking what failure would look like, applied to a predicate instead of a
+number.
+
+**And the one I liked least: a test whose success condition destroys it.** The
+ground-truth intervention unmarks one object and requires exactly its pixels to
+vanish. Its verdict waits 30 masks; the slot evictor reclaims a slot that renders
+nothing after 8, and *zero rendered pixels is what success looks like*. So on any
+title where the slot pool is full, the measurement is guaranteed to be reported
+INCONCLUSIVE — the stronger the result, the faster it is destroyed. It went
+unnoticed because the test was written and tuned on Stray, whose scenes never
+fill the pool, so the confound is unreachable there. Verifying a check on the
+easy case tells you it runs, not that it can fail.
+
 This is a failure mode LLMs are especially prone to, because generating a
 plausible confirming explanation is cheap and generating doubt is not. The
 countermeasure is not more careful reasoning. It is instruments that can return

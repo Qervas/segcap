@@ -9,7 +9,7 @@ stripped:
 | | engine | result |
 |---|---|---|
 | **Stray** | UE4, D3D12 | masks over gameplay video, 1:1 aligned, subject tracked |
-| **inZOI** | UE5.6 + Nanite, D3D12 | 401 masks/run, 82-91% of pixels labelled, live simulation |
+| **inZOI** | UE5.6 + Nanite, D3D12 | 301-401 masks/run, 79-100% of pixels labelled, live simulation |
 
 Stray is the complete deliverable. inZOI is the harder case and the more
 interesting one: on a Nanite title the per-object stencil is not in the
@@ -29,7 +29,7 @@ reflection at runtime, not hardcoded.
 | | |
 |---|---|
 | **The demo** | [`docs/evidence/stray-gameplay-demo.mp4`](docs/evidence/stray-gameplay-demo.mp4) — 30s real-time, rendered left, labelled mask right, live controller panel |
-| **inZOI** | [`docs/evidence/inzoi_hq.mp4`](docs/evidence/inzoi_hq.mp4) — 401 masks at 1280x800, Zois tracked. Masks only; see "What is not done" |
+| **inZOI** | [`docs/evidence/inzoi-gameplay-demo.mp4`](docs/evidence/inzoi-gameplay-demo.mp4) — masks over live gameplay, 1:1 aligned ([smaller copy](docs/evidence/inzoi-gameplay-demo-small.mp4)); [`inzoi_hq.mp4`](docs/evidence/inzoi_hq.mp4) is the masks alone |
 | **Picking this back up** | [`docs/RESUME.md`](docs/RESUME.md) — state, sanity check, and what to do next |
 | **The debugging story** | [`docs/DEBUGGING.md`](docs/DEBUGGING.md) — every crash and wrong turn, and what actually found each one |
 | **Where AI helped and where it was overridden** | [`docs/AI-USAGE.md`](docs/AI-USAGE.md) |
@@ -160,6 +160,15 @@ also satisfies; "sim running" accepted an object-count delta of +3 out of
 Each looked locally reasonable and none separated the cases it existed to
 separate.
 
+**Check whether your guard is measuring the data or the world.** The id probe
+rejected the correct buffer for being "one big region, not a set of object ids"
+while reporting that 100% of its texels carried ids we had leased. The guard asks
+"does one value dominate?", which sounds like a property of the buffer and is
+actually a property of the room — inZOI's apartment shell is one mesh covering
+85% of an indoor view. No threshold separates those, because they are not the
+same question. It had also never caught anything: both decoys on record have
+three distinct values and die to a different test.
+
 **Direct-from-the-engine is not the same as correct.** `UGameplayStatics::IsGamePaused`
 is an authoritative answer to the wrong question — it reports the *engine* pause a
 popup menu sets, while inZOI runs its own world clock. It reads false while the
@@ -174,16 +183,28 @@ was correct from the start; the timing was not.
 
 ## What is not done
 
-**inZOI has no colour underlay**, so its masks are correct but there is no
-overlay-on-video demo for it the way there is for Stray. The colour copy issued
-from our own queue at Present destabilises the game; the fix is to record it into
-the game's own command list at a barrier, exactly as the mask copy already does,
-which is real work rather than a patch. Diagnosis in `DEBUGGING.md`.
+**inZOI's captured colour frames include the game's HUD**, because the frame is
+copied from the backbuffer at Present, which is after the UI is composited. The
+mask underneath is unaffected — the HUD is not marked and holds no id — so this
+is a presentation flaw in the demo, not a labelling one. Copying earlier, before
+the UI pass, is the fix.
 
-**inZOI coverage tops out around 91%**, not 100%. The stencil value is 8 bits —
-255 ids — against ~560,000 objects in an open city. Stray reaches ~100% because
-its alleys genuinely contain fewer than 255 visible things. The 255 are now spent
-on whatever fills screen rather than whatever the object scan reached first.
+**One inZOI id holds 56–79% of the frame indoors.** `StaticMeshComponent0` is the
+apartment shell: floor, walls and ceiling are one static mesh, so one lease
+correctly labels an enormous area. It is accurate and it looks lazy. Splitting it
+would mean labelling below the component level, which the CustomDepth pass cannot
+express — the stencil value is per primitive. Outdoors the same measure is 30%.
+
+That number is not merely cosmetic: it made the id-probe reject the correct
+buffer outright, because the probe's acceptance test treated "one value dominates
+the match" as evidence against a buffer when it is really a fact about the room.
+`DEBUGGING.md` §8.12.
+
+**inZOI outdoor coverage tops out around 91%**, not 100%. The stencil value is 8
+bits — 255 ids — against ~560,000 objects in an open city. Indoor scenes do reach
+100%, because a room contains fewer than 255 visible things and the sky sphere is
+itself a labelled object. The 255 are spent on whatever fills screen rather than
+whatever the object scan reached first.
 
 **Two crash families in inZOI remain unexplained**: `E_INVALIDARG` from the
 game's own `Close()`, and `E_ABORT` from `ResizeBuffers` during world streaming.
@@ -196,8 +217,8 @@ explanations were killed with evidence rather than left as guesses.
 
 | | |
 |---|---|
-| Objects per mask | Stray 60–89 distinct ids; inZOI 39–80 |
-| Pixels labelled | Stray 94–99.9%; inZOI 82–91% (255-id ceiling, open world) |
+| Objects per mask | Stray 60–89 distinct ids; inZOI 31–110 (mean 56 outdoors, 97 indoors) |
+| Pixels labelled | Stray 94–99.9%; inZOI 79–91% outdoors, 100% indoors |
 | Every mask id resolves via its sidecar | **0 unbound**, 0.000% of pixels |
 | Identity survives slot loss | 52 objects left and returned; 55 held >1 slot |
 | Slot ambiguity within a frame | **0** |

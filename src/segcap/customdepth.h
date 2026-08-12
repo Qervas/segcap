@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -154,6 +155,10 @@ public:
     // held. Must run on the game thread: it calls the engine's own setter.
     void* UnmarkSlotForGroundTruth(ue4::Engine& engine, uint8_t slot);
 
+    // Release the ground-truth slot back to ordinary slot management once the
+    // verdict has been recorded. Held only for the duration of the measurement.
+    void ClearGroundTruthPin() { groundTruthPin_ = 0; }
+
     // Slot -> object identity, for the per-frame sidecar table. The 8-bit
     // stencil value is a lease, not an identity: it only means something joined
     // against this map.
@@ -255,6 +260,11 @@ private:
     // Slots currently held by instanced (environmental) components, capped so
     // the budget cannot be consumed by ground, foliage and building batches.
     size_t instancedLeased_ = 0;
+    // The slot currently under ground-truth measurement, or 0. Exempt from the
+    // coverage evictor below and from nothing else -- see RefreshVisibility.
+    // Atomic because it is set and read on the game thread but cleared on the
+    // render thread when the verdict is recorded.
+    std::atomic<uint8_t> groundTruthPin_{0};
     // Consecutive masks in which a slot rendered below the area threshold.
     // A streak, not a single frame: an object can legitimately be occluded for
     // a moment, and evicting on one bad frame is thrash.

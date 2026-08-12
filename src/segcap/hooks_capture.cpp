@@ -304,6 +304,7 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
                             "it, so its pixel count is no longer about the object we "
                             "unmarked.",
                             static_cast<unsigned>(interveneSlot_), interveneComponent_, holder);
+                    GetMarker().ClearGroundTruthPin();
                     interveneState_ = Intervention::Done;
                     break;
                 }
@@ -350,6 +351,10 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
                                            : "INCONCLUSIVE -- other slots LOST pixels too, so "
                                              "the intervention disturbed more than the one "
                                              "primitive it touched"));
+                // Hand the slot back to ordinary management. It now renders
+                // nothing, so the coverage evictor reclaims it within a few
+                // masks and the budget is not permanently down one label.
+                GetMarker().ClearGroundTruthPin();
                 interveneState_ = Intervention::Done;
                 break;
             }

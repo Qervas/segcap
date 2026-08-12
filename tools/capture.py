@@ -34,6 +34,11 @@ def main() -> int:
     ap.add_argument("--idbuf", action="store_true", help="id-buffer probe (implied by --inject)")
     ap.add_argument("--d3d-debug", action="store_true", help="D3D12 validation layer; slow")
     ap.add_argument("--no-mark", action="store_true", help="read-only; no CustomDepth writes")
+    ap.add_argument("--groundtruth", action="store_true",
+                    help="mid-run, unmark exactly one slot and check that precisely its "
+                         "pixels vanish. The only check here that cannot be satisfied by "
+                         "coherent-but-wrong data -- every other one reads the buffer, this "
+                         "one changes something and requires the mask to follow")
     ap.add_argument("--walk", action="store_true",
                     help="drive the character during the hold. OFF by default: motion "
                          "streams, streaming churns the object graph, and that churn "
