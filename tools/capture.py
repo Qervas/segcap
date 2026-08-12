@@ -92,14 +92,33 @@ def main() -> int:
         # after 4 attempts" about an experiment that had already answered its
         # question.
         if getattr(args, "census", False):
-            verdict = ("the game DIED anyway, with us doing no GPU work and no marking "
-                       "-- so this crash is not something we are doing to it"
+            # A CONTROL IS ONLY A CONTROL IF IT REACHED THE SAME STATE.
+            #
+            # The first version of this printed "the game DIED anyway -- so this
+            # crash is not something we are doing to it" about a run that died
+            # in the MENU, at "the world to begin loading (attempt 2)", having
+            # never reached gameplay. The crash under investigation happens in
+            # the open city with is_loading FALSE; a death in the menu is a
+            # different event and says nothing about it.
+            #
+            # Which is the same unchecked-claim bug this file already fixed once
+            # for the retry message, committed an hour earlier, reintroduced
+            # immediately in new code. The lesson evidently has to be applied,
+            # not just known.
+            if run.outcome != "armed":
+                print(f"[{profile.name}] CONTROL INCONCLUSIVE: the run never reached "
+                      f"gameplay (outcome: {run.outcome}), so it cannot be compared "
+                      f"against a capture run that did. Nothing is proven either way.")
+                return 1
+            verdict = ("the game DIED IN GAMEPLAY anyway, with us doing no GPU work and "
+                       "no marking -- so this crash is not something we are doing to it"
                        if run.died else
-                       "the game SURVIVED the hold with us doing nothing -- which points "
-                       "back at our GPU work or our marking")
+                       "the game SURVIVED the full hold in gameplay with us doing nothing "
+                       "-- which points back at our GPU work or our marking")
             print(f"[{profile.name}] CONTROL RESULT: {verdict}")
-            print(f"[{profile.name}] now check %LOCALAPPDATA%\\BlueClient\\Saved\\Crashes "
-                  f"for a matching report and compare the family against DEBUGGING.md 8.16")
+            print(f"[{profile.name}] one run is one sample. Repeat on a fresh boot before "
+                  f"treating this as established, and check "
+                  f"%LOCALAPPDATA%\\BlueClient\\Saved\\Crashes for a matching report.")
             return 0
 
         masks = len(list((Path(__file__).resolve().parent.parent /
