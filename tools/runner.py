@@ -35,6 +35,8 @@ class Run:
         # "armed" / "refused" / "never-got-there" -- three different failures
         # that were all being described with one hardcoded sentence.
         self.outcome = "never-got-there"
+        # Did the game die under us? The control run's entire result.
+        self.died = False
 
     # --- plumbing ---------------------------------------------------------
     def say(self, msg: str) -> None:
@@ -78,14 +80,30 @@ class Run:
     def prepare(self) -> None:
         self.ps(ROOT / "tools" / "reset_markers.ps1", "-Bin", str(BIN))
         o = self.o
-        self.marker("segcap.mark", not o.no_mark,
+        # CONTROL RUN. census suppresses every GPU path in the DLL (readback,
+        # injected copies, colour) and this clears marking too, so the process
+        # differs from an untouched game only by our hooks and our logging.
+        #
+        # It exists because the crash archive cannot answer whether the
+        # ResizeBuffers deaths are ours: all 62 reports on disk date from
+        # 08-09, the day this project started on inZOI, so there is no
+        # pre-injection baseline to compare against. Inference from that data
+        # is not available at any price; one control run settles it.
+        census = getattr(o, "census", False)
+        if census:
+            self.say("CONTROL RUN -- census mode: hooks and logging only, no GPU work, "
+                     "no marking. If the game still dies the same way, the crash is not "
+                     "something we are doing to it.")
+        self.marker("segcap.census", census)
+        self.marker("segcap.mark", not o.no_mark and not census,
                     "mark marker SET -- this run writes bRenderCustomDepth")
         self.marker("segcap.d3ddebug", o.d3d_debug,
                     "D3D12 VALIDATION LAYER ON -- diagnosis only, slow")
-        self.marker("segcap.inject", o.inject,
+        self.marker("segcap.inject", o.inject and not census,
                     "INJECT ARMED -- copies recorded into the game's own lists")
-        self.marker("segcap.idbuf", o.idbuf or o.inject, "ID-BUFFER PROBE on")
-        self.marker("segcap.groundtruth", getattr(o, "groundtruth", False),
+        self.marker("segcap.idbuf", (o.idbuf or o.inject) and not census,
+                    "ID-BUFFER PROBE on")
+        self.marker("segcap.groundtruth", getattr(o, "groundtruth", False) and not census,
                     "GROUND-TRUTH INTERVENTION on -- one slot gets unmarked mid-run")
         # OWN THESE, do not inherit them.
         #
@@ -431,5 +449,6 @@ class Run:
             self.capture()
         except (H.GameGone, H.GameFrozen) as exc:
             self.say(f"STOPPED: {exc}")
+            self.died = True
         self.report()
         return 0

@@ -34,6 +34,12 @@ def main() -> int:
     ap.add_argument("--idbuf", action="store_true", help="id-buffer probe (implied by --inject)")
     ap.add_argument("--d3d-debug", action="store_true", help="D3D12 validation layer; slow")
     ap.add_argument("--no-mark", action="store_true", help="read-only; no CustomDepth writes")
+    ap.add_argument("--census", action="store_true",
+                    help="CONTROL RUN. Hooks and logging only: no GPU work of any kind "
+                         "(no readback, no injected copies, no colour) and no marking. "
+                         "Navigates to gameplay and holds, to answer the one question the "
+                         "crash archive cannot: does inZOI die the same way when we touch "
+                         "nothing? Overrides --inject/--idbuf/--groundtruth/--mark")
     ap.add_argument("--groundtruth", action="store_true",
                     help="mid-run, unmark exactly one slot and check that precisely its "
                          "pixels vanish. The only check here that cannot be satisfied by "
@@ -79,6 +85,23 @@ def main() -> int:
         rc = run.go()
         if args.preflight:
             return rc
+        # A CONTROL RUN'S RESULT IS SURVIVAL, NOT MASKS.
+        #
+        # Census produces zero masks by construction -- that is the point. Judging
+        # it by mask count would relaunch three more times and report "no capture
+        # after 4 attempts" about an experiment that had already answered its
+        # question.
+        if getattr(args, "census", False):
+            verdict = ("the game DIED anyway, with us doing no GPU work and no marking "
+                       "-- so this crash is not something we are doing to it"
+                       if run.died else
+                       "the game SURVIVED the hold with us doing nothing -- which points "
+                       "back at our GPU work or our marking")
+            print(f"[{profile.name}] CONTROL RESULT: {verdict}")
+            print(f"[{profile.name}] now check %LOCALAPPDATA%\\BlueClient\\Saved\\Crashes "
+                  f"for a matching report and compare the family against DEBUGGING.md 8.16")
+            return 0
+
         masks = len(list((Path(__file__).resolve().parent.parent /
                           "build" / "bin").glob("segcap_mask_*.pgm")))
         if masks:
