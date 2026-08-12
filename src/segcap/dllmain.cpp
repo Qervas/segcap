@@ -784,9 +784,25 @@ DWORD WINAPI DiscoverThread(LPVOID) {
         // floor count so an array that is merely EMPTY early does not read as
         // stable. Typical cost now is a few seconds.
         {
-            const DWORD deadline = GetTickCount() + 25000;
+            // THE CEILING HAS TO OUTLAST THE FLOOR.
+            //
+            // The floor above was raised 50k -> 200k to stop ProcessEvent
+            // installing into a half-built object graph. The 25s ceiling was
+            // left where it was, so on any run where the menu populates slowly
+            // the floor is simply unreachable: the loop times out, and the line
+            // below announces "object graph settled at 53375 slots" -- a
+            // timeout, reported as the success it is not. ProcessEvent then
+            // installs into a quarter-sized graph, every candidate validates
+            // `0 valid, 0 invalid (0 sampled)`, discovery fails, and the run
+            // has no execution point: no marking, no world state, no masks.
+            //
+            // Measured on inZOI: the menu reaches ~245,000 objects at t=38-45s,
+            // and the loop starts at t=8-18s. 25s could not span that. It is a
+            // ceiling, so a fast boot still breaks out in a few seconds.
+            const DWORD deadline = GetTickCount() + 90000;
             int32_t prev = -1;
             int stable = 0;
+            bool settled = false;
             while (GetTickCount() < deadline) {
                 const int32_t n = g_engine.NumObjects();
                 // Growth under 1% between samples counts as settled; two in a row
@@ -802,15 +818,28 @@ DWORD WINAPI DiscoverThread(LPVOID) {
                 // gameplay counts run 240k-468k, so 200k is comfortably inside the
                 // real steady state and still far quicker than the flat sleep.
                 if (n >= 200000 && prev > 0 && n < prev + prev / 100) {
-                    if (++stable >= 2) break;
+                    if (++stable >= 2) { settled = true; break; }
                 } else {
                     stable = 0;
                 }
                 prev = n;
                 Sleep(500);
             }
-            segcap::LogInfo("ue4: object graph settled at %d slots -- installing ProcessEvent",
-                            g_engine.NumObjects());
+            // Say which of the two happened. "Settled" was printed on both paths,
+            // so the log could not distinguish a real plateau from giving up --
+            // and the failure it hides is total: no ProcessEvent means no
+            // marking, no world state and no masks for the whole session.
+            if (settled) {
+                segcap::LogInfo("ue4: object graph settled at %d slots -- installing "
+                                "ProcessEvent", g_engine.NumObjects());
+            } else {
+                segcap::LogWarn("ue4: object graph did NOT settle within 90s -- only %d "
+                                "slots, floor is 200000. Installing ProcessEvent anyway, "
+                                "but discovery has too little live call traffic to "
+                                "validate against and will probably fail; if it does, "
+                                "this run has no execution point at all.",
+                                g_engine.NumObjects());
+            }
         }
         auto& pe = segcap::ue4::GetProcessEventHook();
         if (pe.Install(g_engine)) {
