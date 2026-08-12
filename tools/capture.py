@@ -38,6 +38,10 @@ def main() -> int:
                     help="drive the character during the hold. OFF by default: motion "
                          "streams, streaming churns the object graph, and that churn "
                          "destroys the marked slots the mask is built from")
+    ap.add_argument("--captures", type=int, default=400,
+                    help="mask budget for the run (was pinned at 60 by a stale marker file)")
+    ap.add_argument("--stride", type=int, default=8,
+                    help="keep every Nth frame; 8 is ~4/sec at 30fps")
     ap.add_argument("--preflight", action="store_true",
                     help="validate the control flow without launching anything")
     ap.add_argument("--menu-ceiling", type=float, default=None,

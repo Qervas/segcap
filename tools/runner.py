@@ -80,6 +80,17 @@ class Run:
         self.marker("segcap.inject", o.inject,
                     "INJECT ARMED -- copies recorded into the game's own lists")
         self.marker("segcap.idbuf", o.idbuf or o.inject, "ID-BUFFER PROBE on")
+        # OWN THESE, do not inherit them.
+        #
+        # segcap.captures and segcap.stride were left on disk by the old
+        # PowerShell harness and silently overrode the DLL's defaults, so every
+        # run produced exactly 61 masks no matter what maxCaptures_ was raised to.
+        # A marker nobody writes is a marker nobody can see; the runner now sets
+        # both explicitly every run, so the value in effect is the value asked for.
+        if not self.preflight:
+            (BIN / "segcap.captures").write_text(str(self.o.captures))
+            (BIN / "segcap.stride").write_text(str(self.o.stride))
+        self.say(f"capture budget {self.o.captures} frames, stride {self.o.stride}")
         self.marker("segcap.requirearm", True)
         self.marker("segcap.arm", False)
         self.say("readback DISARMED until gameplay (budget reserved for the world)")
