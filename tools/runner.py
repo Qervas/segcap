@@ -204,7 +204,20 @@ class Run:
         #
         # Checked once, at startup, at the wrong moment -- the trap this file
         # already warns about three times over.
-        deadline = time.monotonic() + 60
+        # 120s, measured, not guessed. The world name cannot exist until
+        # ProbeWorldState runs, which needs ProcessEvent, which waits for UE's
+        # object graph to stop growing. Observed on inZOI:
+        #
+        #   t=33-45s  object graph settled -- installing ProcessEvent
+        #   t=45s     searching vtable slots 60..80
+        #   t=45-80s  first `state: WORLD level=<name>`
+        #
+        # render_signal fires at t=14-22, so a 60s ceiling expired at t=74-82 --
+        # right on top of that range. It resolved on some runs and not others,
+        # which is exactly what a threshold sitting inside the distribution looks
+        # like, and it is the sixth time in this project (see DEBUGGING.md).
+        # A ceiling costs nothing when the answer arrives early.
+        deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             self.menu_level = H.current_level(LOG)
             if self.menu_level:
