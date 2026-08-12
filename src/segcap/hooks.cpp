@@ -797,6 +797,46 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     // the game's own list at a barrier and copies StateBefore out of the caller's
     // struct. This is that same discipline, finally applied to colour.
     if (!censusOnly_ && !noReadback_ && armReady && swapChain && device_ && !noColour_) {
+        // RE-REGISTER AFTER A SWAPCHAIN RESIZE.
+        //
+        // The set below was collected once, under `backBufferCount_ == 0`, and
+        // never invalidated. inZOI resizes its viewport during a session -- the
+        // dominant crash family in this title is the game's own ResizeBuffers
+        // assert, nine of the last twelve crash reports -- and a successful
+        // resize frees every buffer in this array. What is left is stale
+        // pointers, and two things then go wrong quietly:
+        //
+        //   - IsBackBuffer() stops matching, so colour capture silently ends
+        //     while every counter still reports success;
+        //   - worse, D3D12 recycles addresses (see 8.3, where address identity
+        //     was the whole bug), so a stale entry can start matching a
+        //     DIFFERENT resource and we would inject a copy from it.
+        //
+        // Cheap check, every Present: the swapchain's own description. If the
+        // size, count or format moved, everything we knew about its buffers is
+        // void. This does NOT claim to fix the ResizeBuffers crash -- that is
+        // still unexplained and none of our frames appear on its callstack --
+        // it fixes what we do AFTER a resize the game survives.
+        DXGI_SWAP_CHAIN_DESC now = {};
+        if (SUCCEEDED(swapChain->GetDesc(&now))) {
+            if (backBufferCount_ != 0 &&
+                (now.BufferDesc.Width != registeredDesc_.BufferDesc.Width ||
+                 now.BufferDesc.Height != registeredDesc_.BufferDesc.Height ||
+                 now.BufferDesc.Format != registeredDesc_.BufferDesc.Format ||
+                 now.BufferCount != registeredDesc_.BufferCount)) {
+                LogWarn("colour: swapchain changed (%ux%u fmt=%u count=%u -> %ux%u fmt=%u "
+                        "count=%u); dropping %u stale backbuffer pointers and re-registering",
+                        registeredDesc_.BufferDesc.Width, registeredDesc_.BufferDesc.Height,
+                        static_cast<unsigned>(registeredDesc_.BufferDesc.Format),
+                        registeredDesc_.BufferCount, now.BufferDesc.Width, now.BufferDesc.Height,
+                        static_cast<unsigned>(now.BufferDesc.Format), now.BufferCount,
+                        backBufferCount_);
+                for (uint32_t i = 0; i < backBufferCount_; ++i) backBuffers_[i] = nullptr;
+                backBufferCount_ = 0;
+                colourInjectArmed_.store(false, std::memory_order_relaxed);
+            }
+            registeredDesc_ = now;
+        }
         if (backBufferCount_ == 0) {
             // ASK the swapchain how many buffers it has; do not probe until
             // GetBuffer fails. Probing returned FOUR on a swapchain the crash

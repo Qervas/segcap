@@ -212,10 +212,14 @@ bits — 255 ids — against ~560,000 objects in an open city. Indoor scenes do 
 itself a labelled object. The 255 are spent on whatever fills screen rather than
 whatever the object scan reached first.
 
-**Two crash families in inZOI remain unexplained**: `E_INVALIDARG` from the
-game's own `Close()`, and `E_ABORT` from `ResizeBuffers` during world streaming.
-Neither blocks capture — the harness retries around them — and six candidate
-explanations were killed with evidence rather than left as guesses.
+**inZOI crashes remain unexplained, and one family dominates.** Counting twelve
+consecutive crash reports rather than describing the two I remembered: **nine are
+`E_ABORT` from the game's own `ResizeBuffers`**, one is the `E_INVALIDARG` from
+`Close()` that had absorbed most of the effort, and two are access violations —
+a third family the write-up had never mentioned. Neither blocks capture; the
+harness retries, and a run that reaches gameplay captures reliably. Eight
+candidate explanations are now killed with evidence rather than left as guesses.
+`DEBUGGING.md` §8.16.
 
 ---
 

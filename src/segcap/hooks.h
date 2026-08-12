@@ -595,6 +595,9 @@ private:
     // barrier hot path: written before injection is armed and never mutated after.
     ID3D12Resource* backBuffers_[8] = {};
     uint32_t backBufferCount_ = 0;
+    // The swapchain description those pointers were collected under. A resize
+    // frees them all, so any change here invalidates the whole array.
+    DXGI_SWAP_CHAIN_DESC registeredDesc_ = {};
     std::atomic<bool> colourInjectArmed_{false};
     uint64_t colInjRecorded_ = 0;
     uint64_t colInjAttempts_ = 0;

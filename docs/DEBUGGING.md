@@ -1503,6 +1503,71 @@ structural check while containing another buffer's bytes entirely. Every other
 test in this project reads the buffer and asks whether it looks like ids.
 This one changes the world and requires the buffer to follow.
 
+### 8.16 Counting the crashes instead of describing them
+
+The write-up has said for days that inZOI has "two crash families", `E_INVALIDARG`
+from the game's own `Close()` and `E_ABORT` from `ResizeBuffers`, phrased as a
+pair. Reading twelve consecutive crash reports instead of the two I happened to
+remember:
+
+```
+15:15  E_ABORT ResizeBuffers (D3D12Viewport.cpp:554, 0x80004004)
+15:07  E_ABORT ResizeBuffers
+14:57  E_ABORT ResizeBuffers
+10:25  E_ABORT ResizeBuffers
+10:17  EXCEPTION_ACCESS_VIOLATION reading 0x18
+08:21  E_ABORT ResizeBuffers
+08:05  EXCEPTION_ACCESS_VIOLATION reading 0x430
+07:41  Close() failure (D3D12CommandList.cpp:277)
+07:20  E_ABORT ResizeBuffers
+07:19  E_ABORT ResizeBuffers
+07:11  E_ABORT ResizeBuffers
+07:09  E_ABORT ResizeBuffers
+```
+
+Nine of twelve are one family. `Close()` -- the one I had been treating as
+co-equal and had spent the most time on -- appears **once**. There is also a
+third family the write-up never mentioned at all, two access violations. "Two
+families" was an accurate description of the two reports I had read and a wrong
+description of the population, and effort had been allocated on that basis.
+
+What the dominant one says, read carefully:
+
+```
+Result failed at D3D12Viewport.cpp:554 with error 80004004
+Viewport=0x..., Num=3, Size=(2560,1600), PF=18, DXGIFormat=0x18,
+Fullscreen=0, AllowTearing=1
+```
+
+It is resizing to **the size it is already at**. That is not a window resize; it
+is a mode or format transition. The callstack is thirteen `inZOI_Win64_Shipping`
+frames then `kernel32`/`ntdll`, with segcap absent -- though §8.7 is the standing
+warning that absence from a stack does not clear us when D3D12 defers its errors.
+
+Two candidate causes eliminated cheaply, both by reading code rather than running
+anything:
+
+- *We hold a reference to a backbuffer, which blocks `ResizeBuffers`.* The most
+  natural explanation, and already handled: the registration loop calls
+  `Release()` immediately and keeps the raw pointer only for comparison.
+  `Readback::Prepare` likewise stores `preparedFor_` without an `AddRef`.
+- *Our harness triggers it by touching the window.* During the capture hold the
+  harness does a process query, a file stat and `sleep(3)` -- no screenshots, no
+  focus calls. It is only the menu phase that manipulates the window, and these
+  deaths happen ~50s after gameplay begins.
+
+So it remains unexplained, and it is now clearly the item worth the next block of
+time rather than `Close()`.
+
+The investigation did turn up a real bug beside it. `backBuffers_[]` is filled
+once, under `if (backBufferCount_ == 0)`, and never invalidated. A resize the
+game *survives* frees every pointer in it, and then `IsBackBuffer()` quietly
+stops matching -- colour capture ends while every counter still reports success
+-- or, worse, matches a recycled address belonging to a different resource, which
+is precisely the address-identity failure of §8.3. It is now re-registered
+whenever the swapchain's own description changes. That is a consequence of the
+crash family, not a cause of it, and it is not offered as a fix for it.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have
