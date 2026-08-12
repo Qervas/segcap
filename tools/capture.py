@@ -84,8 +84,26 @@ def main() -> int:
             print(f"[{profile.name}] captured {masks} masks on attempt {attempt}")
             return rc
         if attempt < attempts:
-            print(f"[{profile.name}] attempt {attempt} captured nothing "
-                  f"(the game died before arming); retrying")
+            # SAY WHICH FAILURE IT WAS, having looked.
+            #
+            # This printed "the game died before arming" unconditionally, which
+            # is a cause it never checked -- and it is often wrong. A run that
+            # reaches gameplay, arms, and then dies to the ResizeBuffers crash
+            # (DEBUGGING.md 8.16) lands here too, and the two need completely
+            # different follow-up: one is a menu-navigation problem, the other
+            # is the open crash. The log is still on disk at this point and says
+            # which happened.
+            log = Path(__file__).resolve().parent.parent / "build" / "bin" / "segcap.log"
+            armed = False
+            try:
+                with log.open("r", encoding="utf-8", errors="replace") as fh:
+                    armed = any("CAPTURE ARMED" in ln for ln in fh)
+            except OSError:
+                pass
+            why = ("it ARMED and then stopped presenting -- the game died during "
+                   "capture, not before it" if armed else
+                   "it never armed -- the game died before reaching gameplay")
+            print(f"[{profile.name}] attempt {attempt} captured nothing ({why}); retrying")
     print(f"[{profile.name}] no capture after {attempts} attempts")
     return 1
 
