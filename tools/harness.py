@@ -471,14 +471,28 @@ def wait_for_level_change(path: Path, was: str, timeout: float, pid: int,
 
     Requiring it to hold steady rejects the intermediate worlds UE passes
     through while streaming.
+
+    LATCHES ITS OWN BASELINE when `was` is empty. The world name does not exist
+    until UE's object graph is populated enough for ProcessEvent to install, and
+    that only happens once a load is under way -- so at click time the caller
+    frequently has no name to pass. Blocking until it had one deadlocked the
+    harness against itself. Instead, the first name that appears IS the world we
+    started in (we are still in the menu when it resolves), and the wait then
+    runs normally against it.
     """
     t0 = time.monotonic()
-    log(f"waiting to leave '{was or '?'}' for a loaded world (ceiling {timeout:.0f}s)")
+    log(f"waiting to leave '{was or 'the world we start in'}' for a loaded world "
+        f"(ceiling {timeout:.0f}s)")
     seen = ""
     since = time.monotonic()
     while time.monotonic() - t0 < timeout:
         ensure_live(pid, "level change", log)
         now = current_level(path)
+        if not was and now:
+            was = now
+            log(f"baseline world is '{was}' (first name to resolve); waiting to leave it")
+            time.sleep(2)
+            continue
         if now and now != was:
             if now != seen:
                 seen = now

@@ -204,28 +204,29 @@ class Run:
         #
         # Checked once, at startup, at the wrong moment -- the trap this file
         # already warns about three times over.
-        # 120s, measured, not guessed. The world name cannot exist until
-        # ProbeWorldState runs, which needs ProcessEvent, which waits for UE's
-        # object graph to stop growing. Observed on inZOI:
+        # DO NOT BLOCK ON THE WORLD NAME. It cannot arrive until we click.
         #
-        #   t=33-45s  object graph settled -- installing ProcessEvent
-        #   t=45s     searching vtable slots 60..80
-        #   t=45-80s  first `state: WORLD level=<name>`
+        # An earlier version waited up to 120s here for a level name, and that
+        # was a deadlock of my own making:
         #
-        # render_signal fires at t=14-22, so a 60s ceiling expired at t=74-82 --
-        # right on top of that range. It resolved on some runs and not others,
-        # which is exactly what a threshold sitting inside the distribution looks
-        # like, and it is the sixth time in this project (see DEBUGGING.md).
-        # A ceiling costs nothing when the answer arrives early.
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
-            self.menu_level = H.current_level(LOG)
-            if self.menu_level:
-                break
-            time.sleep(2)
-        self.say(f"menu world is '{self.menu_level or '?'}'"
-                 + ("" if self.menu_level else " -- no level line yet; the load gate will "
-                                               "fall back to the object-churn signal"))
+        #   the harness waits for the world name
+        #     -> the name needs ProbeWorldState
+        #       -> which needs ProcessEvent
+        #         -> which needs UE's object graph above 200,000
+        #           -> which only happens once the save starts loading
+        #             -> which needs the click the harness is refusing to make
+        #
+        # Observed exactly that: `object graph did NOT settle within 90s -- only
+        # 53375 slots`, then `ProcessEvent not found`, then `level=?` forever.
+        # Every unexplained '?' after that change was this, not a slow engine.
+        #
+        # So: take the name if it happens to be there, and carry on regardless.
+        # wait_for_level_change latches its own baseline when we have none.
+        self.menu_level = H.current_level(LOG)
+        self.say(f"menu world is '{self.menu_level or 'not yet known'}'"
+                 + ("" if self.menu_level else " -- clicking anyway; the world only "
+                                               "populates once a load starts, so waiting "
+                                               "here would prevent the thing it waits for"))
 
         entered = False
         for attempt in range(1, 4):
