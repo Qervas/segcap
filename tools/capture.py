@@ -75,7 +75,8 @@ def main() -> int:
     # and a harness that gives up after one crash is not automation.
     attempts = max(1, args.retries)
     for attempt in range(1, attempts + 1):
-        rc = Run(profile, args, preflight=args.preflight).go()
+        run = Run(profile, args, preflight=args.preflight)
+        rc = run.go()
         if args.preflight:
             return rc
         masks = len(list((Path(__file__).resolve().parent.parent /
@@ -87,22 +88,27 @@ def main() -> int:
             # SAY WHICH FAILURE IT WAS, having looked.
             #
             # This printed "the game died before arming" unconditionally, which
-            # is a cause it never checked -- and it is often wrong. A run that
-            # reaches gameplay, arms, and then dies to the ResizeBuffers crash
-            # (DEBUGGING.md 8.16) lands here too, and the two need completely
-            # different follow-up: one is a menu-navigation problem, the other
-            # is the open crash. The log is still on disk at this point and says
-            # which happened.
-            log = Path(__file__).resolve().parent.parent / "build" / "bin" / "segcap.log"
-            armed = False
-            try:
-                with log.open("r", encoding="utf-8", errors="replace") as fh:
-                    armed = any("CAPTURE ARMED" in ln for ln in fh)
-            except OSError:
-                pass
-            why = ("it ARMED and then stopped presenting -- the game died during "
-                   "capture, not before it" if armed else
-                   "it never armed -- the game died before reaching gameplay")
+            # is a cause it never checked. THREE different things land here and
+            # they need opposite follow-up:
+            #
+            #   armed          -- reached gameplay, then died. The open
+            #                     ResizeBuffers crash (DEBUGGING.md 8.16).
+            #   refused        -- the world never loaded, so capture() declined
+            #                     to photograph the menu. Navigation/timing.
+            #   never-got-there -- died on the way in.
+            #
+            # The first version of this fix distinguished only the first from
+            # "the rest" and then asserted the rest were the game dying -- which
+            # printed "the game died before reaching gameplay" for a run whose
+            # game was alive and had simply not loaded. Same unchecked claim,
+            # one branch over. The runner knows; it now says.
+            why = {
+                "armed": "it ARMED and then stopped presenting -- the game died "
+                         "during capture, not before it",
+                "refused": "it reached gameplay but the world never loaded, so it "
+                           "refused to arm rather than capture the menu",
+                "never-got-there": "it never reached a loaded world",
+            }[run.outcome]
             print(f"[{profile.name}] attempt {attempt} captured nothing ({why}); retrying")
     print(f"[{profile.name}] no capture after {attempts} attempts")
     return 1

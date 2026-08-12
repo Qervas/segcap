@@ -31,6 +31,10 @@ class Run:
         self.preflight = preflight
         self.pid = 0
         self.menu_level = ""
+        # What actually happened, for the caller to report instead of guess.
+        # "armed" / "refused" / "never-got-there" -- three different failures
+        # that were all being described with one hardcoded sentence.
+        self.outcome = "never-got-there"
 
     # --- plumbing ---------------------------------------------------------
     def say(self, msg: str) -> None:
@@ -337,8 +341,10 @@ class Run:
             self.say(f"REFUSING to arm: still in '{level}', the world we started in. "
                      f"Capturing here would fill the budget with menu frames and "
                      f"report success. Failing this attempt so the run can retry.")
+            self.outcome = "refused"
             return False
 
+        self.outcome = "armed"
         (BIN / "segcap.arm").write_text("1")
         self.say(f"ARMED in '{level or 'unknown world'}' -- every captured frame "
                  f"from here is gameplay")
