@@ -444,8 +444,14 @@ def current_level(path: Path) -> str:
     name to exist exited immediately holding `?`. And the load gate, which waits
     to leave the menu's world, was then satisfied by the MENU's own name
     appearing -- passing for the wrong reason at the wrong moment.
+
+    Scans the whole tail rather than the last 400 lines. tail() reads a fixed
+    256 KB block either way, so the smaller window bought nothing and lost the
+    answer whenever a census burst -- one line per render target -- pushed the
+    state line further back than 400. Observed as `ARMED in 'unknown world'`
+    seconds after the level had been confirmed twice.
     """
-    for ln in reversed(tail(path, 400)):
+    for ln in reversed(tail(path, 100_000)):
         if "state: " in ln and "level=" in ln:
             name = ln.split("level=")[1].split()[0]
             if name and name != "?":
