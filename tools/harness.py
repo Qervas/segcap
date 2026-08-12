@@ -396,15 +396,34 @@ def frame_changes(root: Path, act: Path, wait: float = 4.0) -> bool:
     walk, the clock ticks and the pixels differ. If it is paused with a static
     camera, the frames are effectively identical. Compared as bytes rather than
     images so this needs no PIL -- PNG encoding of identical pixels is identical.
+
+    DELETE BOTH FIRST, AND REQUIRE BOTH BACK. act.ps1 throws before writing
+    anything if the game is gone, so the files keep whatever a PREVIOUS call left
+    in them -- and a previous call's two frames differ, because the screen really
+    was changing then. A dead game therefore compared two stale images, found
+    them different, and this returned True.
+
+    Observed exactly that: the transport click failed with "inZOI-Win64-Shipping
+    is not running", the very next line was "sim IS running -- screen changed
+    with no input", and the harness armed a capture on a process that did not
+    exist. The DLL's counters for that run agree -- inject attempts=0, 0 live
+    slots, 0 identities.
+
+    A missing file means the screenshot failed. That is not the same as "nothing
+    moved", but it is certainly not evidence that something did.
     """
     a = root / "build" / "bin" / "pause_probe_a.png"
     b = root / "build" / "bin" / "pause_probe_b.png"
+    for out in (a, b):
+        out.unlink(missing_ok=True)
     for out in (a, b):
         subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                         "-File", str(act), "-Wait", "0.2", "-Out", str(out)],
                        cwd=str(root), capture_output=True)
         if out is a:
             time.sleep(wait)
+    if not (a.exists() and b.exists()):
+        return False
     try:
         return a.read_bytes() != b.read_bytes()
     except OSError:
