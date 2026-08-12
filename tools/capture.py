@@ -106,9 +106,18 @@ def main() -> int:
             # immediately in new code. The lesson evidently has to be applied,
             # not just known.
             if run.outcome != "armed":
-                print(f"[{profile.name}] CONTROL INCONCLUSIVE: the run never reached "
-                      f"gameplay (outcome: {run.outcome}), so it cannot be compared "
-                      f"against a capture run that did. Nothing is proven either way.")
+                # RETRY, don't give up. Roughly half of all attempts die before
+                # gameplay, so returning here would report INCONCLUSIVE most of
+                # the time and burn the launch for nothing. The verdict needs ONE
+                # attempt that reaches the city; getting there is what retries
+                # are for, exactly as they are for a capture run.
+                print(f"[{profile.name}] control attempt {attempt} never reached gameplay "
+                      f"(outcome: {run.outcome}); retrying")
+                if attempt < attempts:
+                    continue
+                print(f"[{profile.name}] CONTROL INCONCLUSIVE after {attempts} attempts: "
+                      f"never reached gameplay, so nothing can be compared against a "
+                      f"capture run that did. Nothing is proven either way.")
                 return 1
             verdict = ("the game DIED IN GAMEPLAY anyway, with us doing no GPU work and "
                        "no marking -- so this crash is not something we are doing to it"
