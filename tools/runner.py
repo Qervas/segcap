@@ -162,7 +162,7 @@ class Run:
             if not p.load_signal:
                 entered = True
                 break
-            entered = H.wait_for_log(LOG, [p.load_signal], 25,
+            entered = H.wait_for_log(LOG, [p.load_signal], p.load_begin_ceiling,
                                      f"the world to begin loading (attempt {attempt})",
                                      self.pid, self.say)
             if entered:

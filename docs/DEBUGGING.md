@@ -1586,6 +1586,58 @@ is precisely the address-identity failure of §8.3. It is now re-registered
 whenever the swapchain's own description changes. That is a consequence of the
 crash family, not a cause of it, and it is not offered as a fix for it.
 
+### 8.17 A ceiling that was never once met, hidden by its own retry
+
+Every inZOI run logs this, successful ones included:
+
+```
+[inzoi] waiting for the world to begin loading (attempt 1) (ceiling 25s)
+[inzoi] the world to begin loading (attempt 1) NOT observed within 25s
+[inzoi] Continue
+[inzoi] first save slot
+[inzoi] waiting for the world to begin loading (attempt 2) (ceiling 25s)
+[inzoi] the world to begin loading (attempt 2) after 0s
+```
+
+I had read that for days as "the first click sometimes misses, the retry fixes
+it" -- which is what the code comment says it is for. Measuring the gap between
+`render_signal` and the first `world is changing` across all 58 archived runs:
+
+```
+min 37.4s   median 43.1s   warm max 46.9s   cold-start max 146.4s
+caught by the 25s ceiling: 0 of 58
+```
+
+Not "sometimes". **Never.** The signal cannot arrive inside that window, so every
+inZOI run ever made has clicked Continue and the save slot, given up, and clicked
+both again into a world that was already loading. And `attempt 2 after 0s` is not
+the second click succeeding -- it is the *first* click's load finally registering,
+about 43s in, immediately visible to the next poll.
+
+The first hypothesis was wrong and worth recording because measuring killed it in
+one step. The segcap log is enormous and `tail()` reads a fixed 256 KB, so a
+signal written during a census burst can scroll out before anyone polls -- the
+worst 2-second window in a run writes **657 KB**, well past the tail. Plausible,
+and not what happens: at each `world is changing` line only 0.4-9.3 KB followed
+in the next two seconds. The mechanism is real, this instance is not it, and the
+tail limit is now a known hazard for any *other* signal logged mid-burst.
+
+The ceiling is now a profile field carrying the measured distribution, set to
+90s. Cold starts still fall through to the retry, which is the behaviour today,
+so this narrows the bug rather than claiming to close it.
+
+Why it matters beyond tidiness: that spurious second click sends Continue and a
+save-slot selection into an in-progress world load, which is exactly the sort of
+thing that makes an engine tear down and recreate its viewport -- and the
+dominant crash here is the game's own `ResizeBuffers` assert (§8.16). That is a
+hypothesis, not a result. But it had been invisible, because the retry loop
+reported success every time it fired.
+
+**The pattern, for the sixth time in this file:** a threshold nobody remeasured,
+sitting where the data never goes. What made this one survive longest is that it
+had a fallback. A guard that fails loudly gets fixed; a guard that fails into a
+retry that works looks like a guard that works.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have
