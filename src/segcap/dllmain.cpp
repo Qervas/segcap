@@ -833,8 +833,15 @@ DWORD WINAPI DiscoverThread(LPVOID) {
             // Gated behind a marker file, deliberately. This is the only code in
             // the project that mutates the game, and it must never happen by
             // accident on a run intended as read-only.
-            if (g_markCustomDepth) {
-                segcap::LogInfo("customdepth: MARK MODE ENABLED");
+            // The loop starts either way. It carries the world-state probe and
+            // the settle detector, which are observation, not mutation -- see
+            // the note at the MarkBatch call. Only the writes are gated.
+            {
+                segcap::LogInfo("customdepth: %s",
+                                g_markCustomDepth
+                                    ? "MARK MODE ENABLED"
+                                    : "observation only (no marker) -- world state will be "
+                                      "reported, nothing will be written");
                 // Resolve on the game thread, then collect off it.
                 pe.RunOnGameThread([](segcap::ue4::Engine& e) { g_marker.Resolve(e); });
                 g_marker.CollectCandidates(g_engine, true);
@@ -1056,6 +1063,21 @@ DWORD WINAPI MarkLoopThread(LPVOID) {
         // MarkBatch passes ran inside 15 milliseconds and took the working set
         // from 0 to 255 in one frame. Rate-limiting the producer is not enough
         // if the consumer batches; the flag makes the pass self-limiting.
+        // Observation runs regardless; only MUTATION is gated on the marker.
+        //
+        // Everything above -- the settle detector, the resolve retry, and
+        // ProbeWorldState -- is read-only, and it used to be unreachable without
+        // marking because this whole thread was created inside
+        // `if (g_markCustomDepth)`. So a --no-mark run had no world state at
+        // all: `state: MENU level=? objects=0` forever, and the level oracle the
+        // harness depends on simply did not exist.
+        //
+        // That is what defeated three attempts at building a control run. The
+        // control has to disable marking (that is the variable under test) and
+        // has to know it reached gameplay (or it is not a control), and those
+        // two requirements were mutually exclusive by construction rather than
+        // by intent. Probing what the world IS was never a mutation.
+        if (!g_markCustomDepth) continue;
         if (!g_markPassPending.exchange(true, std::memory_order_acq_rel)) {
             pe.RunOnGameThread([](segcap::ue4::Engine& e) {
                 // Scan wider per pass. 300 candidates every 250ms against

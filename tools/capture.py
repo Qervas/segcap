@@ -106,6 +106,16 @@ def main() -> int:
             # for the retry message, committed an hour earlier, reintroduced
             # immediately in new code. The lesson evidently has to be applied,
             # not just known.
+            # "Armed" is not the same as "armed in the world". A run whose level
+            # oracle never resolved arms anyway -- the refusal only fires when
+            # the level is KNOWN and still the menu's -- so requiring outcome
+            # alone would let an unverified run render a verdict, which is the
+            # exact failure this gate exists to prevent.
+            if run.outcome == "armed" and not run.armed_level:
+                print(f"[{profile.name}] CONTROL INCONCLUSIVE: armed, but the world was "
+                      f"never identified, so there is no evidence it reached gameplay "
+                      f"rather than sitting in the menu.")
+                return 1
             if run.outcome != "armed":
                 # RETRY, don't give up. Roughly half of all attempts die before
                 # gameplay, so returning here would report INCONCLUSIVE most of

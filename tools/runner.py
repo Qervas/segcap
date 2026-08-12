@@ -37,6 +37,9 @@ class Run:
         self.outcome = "never-got-there"
         # Did the game die under us? The control run's entire result.
         self.died = False
+        # The world we were in when the capture armed, empty if never identified.
+        # A control cannot claim "died in gameplay" without this.
+        self.armed_level = ""
 
     # --- plumbing ---------------------------------------------------------
     def say(self, msg: str) -> None:
@@ -395,6 +398,7 @@ class Run:
             return False
 
         self.outcome = "armed"
+        self.armed_level = level
         (BIN / "segcap.arm").write_text("1")
         self.say(f"ARMED in '{level or 'unknown world'}' -- every captured frame "
                  f"from here is gameplay")
