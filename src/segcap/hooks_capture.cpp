@@ -106,16 +106,25 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     const MaskFrame& mf = view;
 
     bool seen[256] = {};
+    // Pixels per slot, fed back to the marker so the 255-slot budget migrates
+    // onto whatever actually fills screen instead of whatever the object scan
+    // happened to reach first.
+    uint32_t pixelsPerSlot[256] = {};
     for (uint32_t y = 0; y < mf.height; ++y) {
         const uint8_t* row = mf.data + static_cast<size_t>(y) * mf.rowPitch;
         for (uint32_t x = 0; x < mf.width; ++x) {
             seen[row[x]] = true;
+            ++pixelsPerSlot[row[x]];
         }
     }
     uint32_t distinctIds = 0;
     for (int i = 1; i < 256; ++i) {
         if (seen[i]) ++distinctIds;
     }
+    // Report the areas back so the marker can retire slots that are labelling
+    // specks. This is the only place in the system that knows what a slot is
+    // actually worth on screen.
+    GetMarker().NoteMaskCoverage(pixelsPerSlot);
 
     // "Content" means a USEFUL mask, not merely a non-empty one.
     //

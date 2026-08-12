@@ -97,6 +97,22 @@ public:
     size_t pendingCount() const { return pending_.size(); }
     size_t markedCount() const { return marked_.size(); }
 
+    // How many PIXELS each slot actually covered in the last mask.
+    //
+    // Slots were held purely on UE's WasRecentlyRendered, which is a visibility
+    // test: a playground two blocks away is "recently rendered" exactly as much
+    // as the chair the Zoi is sitting on. With only 255 ids for a world of
+    // 560,000 objects, that spends the entire budget on whatever the object
+    // scan reached first, and nearby objects never get labelled at all --
+    // measured at 15-64% of pixels covered, with the seat under the character
+    // unlabelled while distant palms were not.
+    //
+    // Screen area is the thing we actually care about and the mask measures it
+    // for free. A slot whose id keeps rendering to almost nothing is paying for
+    // itself in nothing.
+    void NoteMaskCoverage(const uint32_t* pixelsPerSlot);
+    size_t slotsFreedForCoverage() const { return slotsFreedForCoverage_; }
+
     // Thread-safe snapshot of the current slot table, for emitting alongside a
     // captured mask. Marking runs on the game thread; mask dumps happen on the
     // render thread, so the table cannot simply be read across.
@@ -235,6 +251,11 @@ private:
     uint64_t visibilityTested_ = 0;
     uint64_t visibilityHits_ = 0;
     uint64_t slotsReleased_ = 0;
+    size_t slotsFreedForCoverage_ = 0;
+    // Consecutive masks in which a slot rendered below the area threshold.
+    // A streak, not a single frame: an object can legitimately be occluded for
+    // a moment, and evicting on one bad frame is thrash.
+    uint8_t tinyStreak_[256] = {};
     uint64_t staleDropped_ = 0;   // marked objects that were destroyed under us
 
     // Rebuilt and republished whenever the slot table changes. Guarded by

@@ -368,6 +368,36 @@ int CustomDepthMarker::RefreshVisibility(ue4::Engine& engine, int limit) {
         // Equal thresholds make an object hovering at the edge of visibility
         // acquire and release a slot every pass, which is thrash by another
         // name. The gap is hysteresis.
+        // Rendered, but is it rendering ANYTHING? Four consecutive masks under
+        // the area threshold means this slot is labelling a speck, and a speck
+        // costs exactly as much as the foreground object that has no label. Hand
+        // it back so the next scan can lease it to something that fills pixels.
+        // The stable id survives, so if the object comes closer it resumes its
+        // identity rather than appearing as a new one.
+        // ONLY UNDER PRESSURE. Evicting whenever a slot looks small shrank the
+        // working set from 255 live slots to 57: slots were handed back faster
+        // than the object scan could re-lease them, and every re-leased
+        // candidate was itself liable to be small, so the pool drained instead
+        // of migrating. A free slot costs nothing, so there is no reason to take
+        // one back until the budget is actually full -- the point of this is to
+        // choose BETWEEN objects when 255 is not enough, not to have fewer.
+        if (marked_.size() >= IdentityRegistry::kSlotCount - 8 &&
+            tinyStreak_[mp.stencilValue] >= 8) {
+            tinyStreak_[mp.stencilValue] = 0;
+            UnmarkPrimitive(mp);
+            {
+                std::lock_guard<std::mutex> lock(identityMutex_);
+                identity_.ReleaseSlot(mp.stencilValue);
+            }
+            slotTable_.erase(mp.stencilValue);
+            alreadyMarked_.erase(mp.component);
+            marked_.erase(marked_.begin() + static_cast<ptrdiff_t>(refreshCursor_));
+            ++released;
+            ++slotsReleased_;
+            ++slotsFreedForCoverage_;
+            continue;
+        }
+
         if (WasRecentlyRendered(mp.component, 1.0f)) {
             std::lock_guard<std::mutex> lock(identityMutex_);
             identity_.Touch(mp.stencilValue, markPass_);
@@ -677,6 +707,26 @@ int CustomDepthMarker::RestoreAll() {
     marked_.clear();
     slotTable_.clear();
     return restored;
+}
+
+// Slots are a budget of 255 for a world of half a million objects, so the only
+// question that matters is whether a slot is buying screen. This is the reply
+// from the mask: how much area each id actually covered.
+void CustomDepthMarker::NoteMaskCoverage(const uint32_t* pixelsPerSlot) {
+    if (!pixelsPerSlot) return;
+    // ~0.02% of a 1280x800 frame. Below this an object is a speck at the far end
+    // of the street, and a speck is not worth one of 255 labels while the chair
+    // in the foreground has none.
+    constexpr uint32_t kMinPixels = 200;
+
+    for (int slot = 1; slot < 256; ++slot) {
+        if (pixelsPerSlot[slot] >= kMinPixels) {
+            tinyStreak_[slot] = 0;
+        } else if (tinyStreak_[slot] < 255) {
+            ++tinyStreak_[slot];
+        }
+    }
+
 }
 
 }  // namespace segcap
