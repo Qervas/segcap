@@ -138,6 +138,24 @@ private:
         bool recorded = false;
         uint64_t recordedFrame = 0;
         ID3D12Fence* ownFence = nullptr;   // per-slot; see the note on RecordInto
+        // WHICH fence carries this slot's completion, recorded at submit time.
+        //
+        // Drain used to infer this -- `s.ownFence ? ownFence : fence_` -- and that
+        // inference silently stopped being true. ownFence is created for every
+        // slot in Prepare (deliberately, so a ring can enter foreign mode without
+        // a re-Prepare), so the test was always true, while the OWNED path signals
+        // the shared fence_ and never touches ownFence. Drain therefore read a
+        // fence stuck at 0, skipped every slot, and the Present-path ring
+        // delivered nothing for two days: submitted=3, delivered=0, dropped=10319.
+        //
+        // Nothing was wrong with the copies. A ring that fills three slots and
+        // never frees one is not a copy failure, it is a completion-test failure,
+        // and the counter shape says so: submitted stops at exactly kRingDepth.
+        //
+        // So this is now assigned where the Signal is issued and is never derived
+        // from anything. nullptr means "not submitted", which is also the correct
+        // answer for a recorded-but-unsubmitted foreign slot.
+        ID3D12Fence* signalledOn = nullptr;
     };
 
     void ReleaseResources();
@@ -148,7 +166,6 @@ private:
     // parallel command-list recording threads at once. The owned path is
     // Present-thread-only and takes no lock; this one must.
     std::mutex foreignMutex_;
-    bool foreignMode_ = false;
     uint64_t foreignSignalValue_ = 0;
     ID3D12Device* device_ = nullptr;
     ID3D12Resource* preparedFor_ = nullptr;
@@ -168,6 +185,8 @@ private:
     uint64_t submitted_ = 0;
     uint64_t delivered_ = 0;
     uint64_t dropped_ = 0;
+    // Consecutive Drain calls in which every slot was pending and none completed.
+    uint64_t fullyStalled_ = 0;
 };
 
 }  // namespace segcap

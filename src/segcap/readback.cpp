@@ -228,8 +228,12 @@ bool Readback::Enqueue(ID3D12CommandQueue* queue, ID3D12Resource* target,
     s.fenceValue = nextFenceValue_++;
     s.frameIndex = frameIndex;
     s.pending = true;
+    // Set the fence Drain will test, right here where the Signal is issued, so
+    // the two cannot drift apart. See Slot::signalledOn.
+    s.signalledOn = fence_;
     if (FAILED(queue->Signal(fence_, s.fenceValue))) {
         s.pending = false;
+        s.signalledOn = nullptr;
         return false;
     }
 
@@ -325,7 +329,11 @@ bool Readback::NotifySubmitted(ID3D12CommandQueue* queue, const InjectToken& tok
     // but signalled at submit time, and the game decides the submit order -- so
     // "fenceValue <= completed" could pass for a slot whose copy had not run.
     s.fenceValue = ++foreignSignalValue_;
-    if (FAILED(queue->Signal(s.ownFence, s.fenceValue))) return false;
+    s.signalledOn = s.ownFence;
+    if (FAILED(queue->Signal(s.ownFence, s.fenceValue))) {
+        s.signalledOn = nullptr;
+        return false;
+    }
 
     s.recorded = false;
     s.pending = true;
@@ -351,18 +359,23 @@ void Readback::ReclaimStaleRecordings(uint64_t currentFrame, uint64_t maxAge) {
 void Readback::Drain(const MaskCallback& onMask) {
     if (!fence_) return;
 
-    // GetCompletedValue, never SetEventOnCompletion + Wait. This function is
-    // called from the render thread and must be able to do nothing at all.
-    const uint64_t completed = fence_->GetCompletedValue();
-
+    uint32_t stillPending = 0;
     for (uint32_t i = 0; i < kRingDepth; ++i) {
         Slot& s = slots_[i];
         if (!s.pending) continue;
-        // Foreign mode signals a per-slot fence, because the game decides submit
-        // order and a shared monotonic value would let one slot's completion
-        // vouch for another's.
-        const uint64_t done = s.ownFence ? s.ownFence->GetCompletedValue() : completed;
-        if (s.fenceValue > done) continue;
+        // Test the fence that was SIGNALLED for this slot, recorded at submit
+        // time. Foreign mode signals a per-slot fence, because the game decides
+        // submit order and a shared monotonic value would let one slot's
+        // completion vouch for another's; the owned path signals the shared one.
+        // Do not infer which from the slot's contents -- that is the bug this
+        // field exists to prevent (see Slot::signalledOn).
+        //
+        // GetCompletedValue, never SetEventOnCompletion + Wait. This runs on the
+        // render thread and must be able to do nothing at all.
+        if (!s.signalledOn || s.fenceValue > s.signalledOn->GetCompletedValue()) {
+            ++stillPending;
+            continue;
+        }
 
         void* mapped = nullptr;
         const D3D12_RANGE readRange = {0, static_cast<SIZE_T>(requiredSize_)};
@@ -389,6 +402,30 @@ void Readback::Drain(const MaskCallback& onMask) {
             LogError("readback: Map failed on slot %u", i);
         }
         s.pending = false;
+        s.signalledOn = nullptr;
+    }
+
+    // A RING THAT NEVER FREES A SLOT IS THE FAILURE, NOT A SYMPTOM OF ONE.
+    //
+    // Drain skipping a slot is ordinary -- that is what asynchronous means. Drain
+    // skipping EVERY slot, thousands of frames running, is a completion test that
+    // cannot pass. Downstream that presents as "no masks were captured", which
+    // sends the search to the mask handler, the election, the colour ring: every
+    // place except the one that is stuck. That search cost two days.
+    //
+    // The counters were already in the shutdown summary and already said it
+    // -- submitted frozen at exactly kRingDepth -- but only to someone who knew
+    // that shape. This says it in words, while the run is still going.
+    if (stillPending == kRingDepth) {
+        if (++fullyStalled_ == 600 || (fullyStalled_ % 6000) == 0) {
+            LogError("readback: ring FULL and NOTHING completing across %llu drains "
+                     "(submitted=%llu delivered=%llu dropped=%llu). Every slot is "
+                     "waiting on a fence that is not advancing. The copies are not "
+                     "the suspect here -- the completion test is.",
+                     fullyStalled_, submitted_, delivered_, dropped_);
+        }
+    } else {
+        fullyStalled_ = 0;
     }
 }
 
@@ -396,6 +433,9 @@ void Readback::ReleaseResources() {
     for (uint32_t i = 0; i < kRingDepth; ++i) {
         Slot& s = slots_[i];
         s.recorded = false;
+        // Before the Release below, not after: this aliases ownFence or fence_,
+        // both of which are about to be freed.
+        s.signalledOn = nullptr;
         SafeRelease(s.ownFence);
         SafeRelease(s.list);
         SafeRelease(s.allocator);

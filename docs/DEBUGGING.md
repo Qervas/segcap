@@ -1960,6 +1960,71 @@ changelog: **the moment before you hand something over is the first time you are
 forced to use it as a stranger would.** Every one of these had been sitting in
 front of me for days behind a green check.
 
+### 8.24 A mode flag that was never wired, and a proxy that stopped being true
+
+Stray was driving correctly — menu cleared on the pad, gameplay in 6s, the cat
+walking — and writing zero masks. The counters said where it stopped:
+
+```
+readback submitted=3  delivered=0  dropped=10319
+```
+
+I had written that up as "probably a regression from 08-13, not yet bisected"
+and listed suspects. The bisect was never needed. The shape of those three
+numbers is a complete diagnosis on its own, and I did not read it.
+
+`submitted` stops at **exactly `kRingDepth`**. Not near it — on it. A ring that
+fills every slot and then never frees one is not failing to copy; it is failing
+to notice that a copy finished. Everything after the third frame is dropped for
+want of a slot, which is what the other 10,319 are. Had I read the counters as a
+shape instead of as a magnitude, this was a two-minute fix on day one.
+
+The cause is one line in `Drain`:
+
+```cpp
+const uint64_t done = s.ownFence ? s.ownFence->GetCompletedValue() : completed;
+```
+
+There are two submit paths. The **owned** path (`Enqueue`, used at Present)
+signals the ring's shared `fence_`. The **foreign** path (`NotifySubmitted`, used
+by `--inject`) signals a per-slot `ownFence`, because the game chooses submit
+order and a shared counter would let one slot's completion vouch for another's.
+`Drain` has to know which. It asked whether a per-slot fence *existed*.
+
+`Prepare` creates `ownFence` for **every** slot, unconditionally and
+deliberately, so that a ring can enter foreign mode without a re-`Prepare`. Its
+comment says so. So the test was always true; the owned path read a fence nobody
+had ever signalled, found 0, and skipped every slot for the life of the process.
+
+The commit that introduced foreign mode also declared the flag that should have
+carried this — `bool foreignMode_` — and never read it. Not once, anywhere. The
+mode was designed, the field was added, and then the code asked a proxy question
+instead: *does this slot have a per-slot fence?* That proxy was true at the
+moment it was written and false by the end of the same function.
+
+**Why it hid for two days.** inZOI ran `--inject` exclusively, so both its rings
+took the foreign path and delivered normally — 401 masks, ground truth PASS. The
+owned path has exactly one user, Stray, and Stray last captured on 08-11, the
+morning the commit landed. A path no test exercises is where a regression sits,
+and here the *working* title was structurally incapable of touching it.
+
+Two changes, because the fix and the fault are different sizes:
+
+- `Slot::signalledOn` records which fence carries that slot's completion, and is
+  assigned on the line that issues the `Signal`. Not derived, not inferred. A
+  fact written where it is created cannot go stale somewhere else.
+- `Drain` now says when it is stuck. Skipping a slot is ordinary; skipping every
+  slot across 600 consecutive drains is a completion test that cannot pass, and
+  it now logs exactly that, in words, while the run is still going. The counters
+  had been saying it all along, but only to someone who already knew the shape.
+
+The general form is one this file keeps rediscovering: **a derived answer is a
+cached answer, and nobody invalidates it.** §7.9 was one set doing two jobs;
+§8.3 was address identity standing in for object identity. Here a fence's
+existence stood in for a fence's role. Each time the substitute was exactly
+correct when written, and each time something later made it silently wrong —
+because a proxy has no way to announce that it has stopped being a proxy.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have
