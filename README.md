@@ -37,6 +37,7 @@ reflection at runtime, not hardcoded.
 |---|---|
 | **The demo** | [`docs/evidence/stray-gameplay-demo.mp4`](docs/evidence/stray-gameplay-demo.mp4) — 30s real-time, rendered left, labelled mask right, live controller panel |
 | **inZOI** | [`docs/evidence/inzoi-gameplay-demo.mp4`](docs/evidence/inzoi-gameplay-demo.mp4) — masks over live gameplay, 1:1 aligned ([smaller copy](docs/evidence/inzoi-gameplay-demo-small.mp4)); [`inzoi_hq.mp4`](docs/evidence/inzoi_hq.mp4) is the masks alone |
+| **How it is put together** | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the four layers, what is engine-general vs per-title, how to add a third game, and where it is thin |
 | **Picking this back up** | [`docs/RESUME.md`](docs/RESUME.md) — state, sanity check, and what to do next |
 | **The debugging story** | [`docs/DEBUGGING.md`](docs/DEBUGGING.md) — every crash and wrong turn, and what actually found each one |
 | **Where AI helped and where it was overridden** | [`docs/AI-USAGE.md`](docs/AI-USAGE.md) |
