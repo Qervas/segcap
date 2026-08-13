@@ -433,6 +433,27 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
                  static_cast<void*>(electedTarget_));
     }
 
+    // SAY WHY NOTHING IS BEING RECORDED. hasContent has three conditions and
+    // only one of them (ourMarks == 0, below) ever announced itself. A run could
+    // arm, hold for its whole duration, write zero masks and leave nothing in
+    // the log to say which condition failed -- which is exactly the state a
+    // Stray run reached: armed, marking up to 70 live slots, no masks, silence.
+    //
+    // Rate-limited by CHANGE rather than by count: the numbers move every frame
+    // while the working set fills, so logging each one would bury the log, and
+    // logging once would miss the transition that matters.
+    if ((!requireArm_ || armed_) && !hasContent) {
+        const uint32_t bucket = distinctIds / 8;
+        if (bucket != lastNoContentBucket_ || ourMarks != lastNoContentMarks_) {
+            lastNoContentBucket_ = bucket;
+            lastNoContentMarks_ = ourMarks;
+            LogInfo("capture: NOT recording -- distinct ids %u (need %u), of ours %u "
+                    "(need >0), ids-are-ours %s. Elected %p.",
+                    distinctIds, kMinIdsToStart, ourMarks,
+                    idsAreOurs ? "yes" : "NO", static_cast<void*>(electedTarget_));
+        }
+    }
+
     if (distinctIds >= kMinIdsToStart && ourMarks == 0 && !warnedForeignStencil_) {
         warnedForeignStencil_ = true;
         LogWarn("capture: elected target holds %u distinct stencil values but WE HAVE "

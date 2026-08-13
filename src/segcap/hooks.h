@@ -419,6 +419,10 @@ private:
     // menu should not open a session).
     bool recording_ = false;
     bool warnedForeignStencil_ = false;   // "that stencil is not ours", said once
+    // Last reported reason for not recording, so the explanation is emitted when
+    // it CHANGES rather than every frame or only once.
+    uint32_t lastNoContentBucket_ = 0xFFFFFFFFu;
+    uint32_t lastNoContentMarks_ = 0xFFFFFFFFu;
     // "those VALUES are not ours" -- the stronger claim, checked against the
     // slots the sidecar actually leased. Said once so a permanently-wrong target
     // does not write the message every frame.
