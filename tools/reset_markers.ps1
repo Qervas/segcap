@@ -52,6 +52,11 @@ $markers = @(
     "segcap.radius",      # only mark objects within N units of the character
     "segcap.plateau",     # object count that means "engine up", per title
     "segcap.nocolour",    # skip backbuffer colour capture entirely
+    "segcap.idformat",    # seed the id-buffer format -- inZOI-specific, was
+                          # written 08-11 and never cleared, so every Stray run
+                          # since has started with "only DXGI format 36 will be
+                          # considered". Fourth marker to be left behind; the
+                          # list is only authoritative if things are added to it.
     "segcap.injectdry",   # observe render passes / barrier shapes, record nothing
     "segcap.inject",      # record copies into the game's own command lists
     "segcap.introspect"   # reflection dump
