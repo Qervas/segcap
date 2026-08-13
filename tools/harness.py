@@ -246,7 +246,37 @@ def ensure_live(pid: int, what: str, log: Callable[[str], None]) -> None:
 
 
 def find_pid_is_dead(pid: int) -> bool:
-    return cpu_seconds(pid) is None
+    """Has the process actually exited? Asked of the OS, not inferred.
+
+    This used to be `cpu_seconds(pid) is None`, which is not the same question.
+    Windows keeps a process object alive while any handle to it remains open, so
+    OpenProcess still succeeds and GetProcessTimes still returns the CPU the
+    process consumed before it died. A dead game therefore reported a number,
+    read as alive.
+
+    is_hung() does not cover for it either: with no window left there is nothing
+    to send a message to, so it answers "not hung" and ensure_live returns
+    happily.
+
+    Measured cost of getting this wrong: an attempt whose game had already
+    exited spent 120s waiting for a load signal, then 240s for the world to
+    settle, then 240s for a level change -- about fourteen minutes of ceilings
+    against a corpse, while act.ps1 was printing "inZOI-Win64-Shipping is not
+    running" the whole time.
+
+    GetExitCodeProcess is the direct answer. STILL_ACTIVE (259) means running.
+    """
+    STILL_ACTIVE = 259
+    h = kernel32.OpenProcess(0x0400 | 0x1000, False, pid)  # QUERY_INFORMATION|LIMITED
+    if not h:
+        return True                      # cannot even open it: gone
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return True
+        return code.value != STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(h)
 
 
 def log_is_advancing(path: Path, seconds: float = 12.0) -> bool:
