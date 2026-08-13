@@ -315,6 +315,11 @@ private:
     double markRadius_ = 0.0;
     size_t skippedFar_ = 0;
     size_t releasedFar_ = 0;
+    // Last values actually printed, so the gate line is emitted on change rather
+    // than every pass.
+    size_t lastLoggedSkippedFar_ = 0;
+    size_t lastLoggedReleasedFar_ = 0;
+    bool lastLoggedAnchorValid_ = false;
     // Consecutive masks in which a slot rendered below the area threshold.
     // A streak, not a single frame: an object can legitimately be occluded for
     // a moment, and evicting on one bad frame is thrash.

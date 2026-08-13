@@ -894,7 +894,20 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
         // far-skipped / far-released are logged so the radius can be CHOSEN from
         // a run rather than guessed: near-zero means it is too generous to be
         // doing anything, and a mask that has lost the room means too tight.
-        if (markRadius_ > 0.0) {
+        //
+        // ONLY WHEN THE NUMBERS MOVE. The first version printed every pass --
+        // three lines a second saying nothing changed. The log is this project's
+        // primary instrument and tail() reads a fixed 256 KB window, so padding
+        // it with restatements pushes real signals out of view; that mechanism
+        // has already cost a day here. A counter worth logging is worth logging
+        // when it changes.
+        if (markRadius_ > 0.0 &&
+            (skippedFar_ != lastLoggedSkippedFar_ ||
+             releasedFar_ != lastLoggedReleasedFar_ ||
+             anchorValid_ != lastLoggedAnchorValid_)) {
+            lastLoggedSkippedFar_ = skippedFar_;
+            lastLoggedReleasedFar_ = releasedFar_;
+            lastLoggedAnchorValid_ = anchorValid_;
             LogInfo("customdepth: distance gate -- %zu candidates skipped as far, "
                     "%zu marked objects handed back after drifting out of range "
                     "(radius %.0f, anchor %s)",
