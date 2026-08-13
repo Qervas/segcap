@@ -113,12 +113,42 @@ class Run:
                      "Check that the ViGEmBus driver is installed (see README "
                      "Prerequisites); vpad exits immediately without it.")
             return
+        # PRESS UNTIL IT WORKED, NOT A FIXED NUMBER OF TIMES.
+        #
+        # `times` was tuned by watching one run: 8 A presses walked Stray from the
+        # title through the intro to the save slot and into the world. It is a
+        # count copied off a stopwatch, and it holds only while the menus take
+        # exactly as long as they did that day. They do not. One run entered the
+        # world in 8s; the next spent 8 presses getting as far as SELECT SAVE with
+        # slot 1 highlighted -- one press short -- and then sat at the menu until
+        # the 120s ceiling expired and the whole route was retried.
+        #
+        # This project has paid for a threshold chosen from one observation five
+        # times over (RESUME.md lists them). A press count is the same mistake
+        # wearing different clothes.
+        #
+        # So `times` is now a CEILING rather than a quantity: press, ask the game
+        # what level it is on, and stop the moment it is no longer a menu world.
+        # The level oracle is already there and already used by the caller to
+        # decide success -- consulting it here as well costs one log read per
+        # press and removes the guess entirely.
+        menus = tuple(getattr(self.p, "menu_worlds", ()) or ())
         for i in range(step.times):
             if not H.pad_send(BIN / "vpad_cmd.txt", btn=step.btn, ms=step.ms):
                 self.say(f"!! pad press {i + 1}/{step.times} ({step.btn}) was never "
                          f"acknowledged -- is vpad running, and is the ViGEmBus "
                          f"driver installed?")
             time.sleep(step.gap)
+            if not menus or self.preflight:
+                continue
+            # "?" means the oracle does not know yet, which is NOT "left the
+            # menu" -- treating it as such is the `?`-is-truthy bug (DEBUGGING
+            # 8.18) that photographed the menu on 20 of 42 armed runs.
+            level = H.current_level(LOG)
+            if level and level != "?" and level not in menus:
+                self.say(f"pad: '{level}' reached after {i + 1} press(es) "
+                         f"of {step.times} -- stopping here")
+                return
 
     # --- phases -----------------------------------------------------------
     def prepare(self) -> None:

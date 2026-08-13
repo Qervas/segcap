@@ -306,8 +306,14 @@ STRAY = GameProfile(
     #
     # The click that used to be here -- Step(0.5, 0.62, ...) -- was a coordinate
     # nobody validated, and it never worked. DEBUGGING.md 8.23.
-    to_load=(PadStep(btn="A", times=8, ms=250, gap=0.9,
-                     what="menu: A x8 on the virtual pad"),),
+    # `times` is a CEILING, not a quantity -- runner.pad() stops as soon as the
+    # level oracle says a non-menu world is loaded. 8 was tuned by watching one
+    # run and was one press short on another, which cost that run the full 120s
+    # load ceiling and a whole retry of the route. Raised to 16 because with an
+    # early exit the only cost of a higher ceiling is on runs that were failing
+    # anyway.
+    to_load=(PadStep(btn="A", times=16, ms=250, gap=0.9,
+                     what="menu: A on the virtual pad until the world loads"),),
     # The start map, observed. Gameplay is Slums_ZONE.
     # MainStart is the title screen, Intro the opening cinematic. Gameplay is
     # Slums_ZONE; both of the others are observed on the way.
