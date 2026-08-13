@@ -462,7 +462,7 @@ def frame_changes(root: Path, act: Path, process: str, wait: float = 4.0) -> boo
         return False
 
 
-def pad_send(cmd_path: Path, seq: int, btn: str = "", ms: int = 400,
+def pad_send(cmd_path: Path, btn: str = "", ms: int = 400,
              lx: int = 0, ly: int = 0, rx: int = 0, ry: int = 0,
              timeout: float = 6.0) -> bool:
     """Press something on the virtual Xbox pad and wait for vpad to confirm it.
@@ -488,6 +488,18 @@ def pad_send(cmd_path: Path, seq: int, btn: str = "", ms: int = 400,
     """
     ack = Path(str(cmd_path) + ".ack")
     tmp = Path(str(cmd_path) + ".tmp")
+    # SEQUENCE COMES FROM THE ACK, not from a counter of our own.
+    #
+    # act.ps1 already writes to this same file and picks `ack + 1`. A private
+    # counter here would fight it: once act.ps1 had advanced the ack past our
+    # number -- which the --walk path does on every stick nudge -- vpad would
+    # discard our presses as stale, silently, because it only applies seq >
+    # lastSeq. Two writers, one shared clock.
+    seq = 1
+    try:
+        seq = int(ack.read_text().strip() or 0) + 1
+    except (OSError, ValueError):
+        pass
     line = (f"seq={seq} lx={lx} ly={ly} rx={rx} ry={ry} ms={ms}"
             + (f" btn={btn}" if btn else "") + "\n")
     tmp.write_text(line)

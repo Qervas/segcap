@@ -45,9 +45,6 @@ class Run:
         # at one specific game and silently misfired for the other.
         image = profile.image
         self.proc = image[:-4] if image.lower().endswith(".exe") else image
-        # vpad applies a command only when its seq exceeds the last one applied,
-        # so this has to advance for every press in a run.
-        self.pad_seq = 0
 
     # --- plumbing ---------------------------------------------------------
     def say(self, msg: str) -> None:
@@ -117,9 +114,7 @@ class Run:
                      "Prerequisites); vpad exits immediately without it.")
             return
         for i in range(step.times):
-            self.pad_seq += 1
-            if not H.pad_send(BIN / "vpad_cmd.txt", self.pad_seq,
-                              btn=step.btn, ms=step.ms):
+            if not H.pad_send(BIN / "vpad_cmd.txt", btn=step.btn, ms=step.ms):
                 self.say(f"!! pad press {i + 1}/{step.times} ({step.btn}) was never "
                          f"acknowledged -- is vpad running, and is the ViGEmBus "
                          f"driver installed?")
@@ -346,14 +341,27 @@ class Run:
             # exactly this bug for the other.
             self.say(f"entering the world (attempt {attempt})")
             if not p.expects_level_change:
-                # Nothing to leave. The title drops straight into gameplay, so
-                # "a world resolved and stopped churning" is the whole signal.
-                entered = bool(H.current_level(LOG))
-                self.say(f"world is '{H.current_level(LOG) or 'not yet named'}' -- this "
-                         f"title has no separate menu world, so there is no change to "
-                         f"wait for")
-                if entered:
+                # Nothing to leave, so the signal is simply that a world resolved
+                # at all. WAIT for it rather than sampling once: the name cannot
+                # appear until ProcessEvent installs, which waits on the object
+                # graph settling, so immediately after the pad presses it is
+                # always empty and a single check always says no.
+                self.say("no separate menu world on this title -- waiting for any world "
+                         f"to resolve (ceiling {p.load_begin_ceiling:.0f}s)")
+                deadline = time.monotonic() + p.load_begin_ceiling
+                level = ""
+                while time.monotonic() < deadline:
+                    H.ensure_live(self.pid, "world to resolve", self.say)
+                    level = H.current_level(LOG)
+                    if level:
+                        break
+                    time.sleep(2)
+                if level:
+                    self.say(f"in world '{level}' after "
+                             f"{p.load_begin_ceiling - (deadline - time.monotonic()):.0f}s")
+                    entered = True
                     break
+                self.say("no world resolved within the ceiling -- retrying the route")
             elif self.menu_level:
                 entered = bool(H.wait_for_level_change(
                     LOG, self.menu_level, p.load_begin_ceiling, self.pid, self.say))
