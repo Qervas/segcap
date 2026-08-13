@@ -60,7 +60,12 @@ void Hooks::OnIdBufferReady(const MaskFrame& frame) {
         std::vector<bool> leased(65536, false);
         size_t leasedCount = 0;
         for (const auto& b : sc->bindings) {
-            if (b.slot > 0 && b.slot < 65536) {
+            // `b.slot < 65536` was vacuous -- slot is a uint8_t. The 65536 was
+            // wishful thinking about the CARRIER: the Nanite path writes into a
+            // 16-bit channel, so the buffer could hold that many, but the value
+            // originates from CustomDepthStencilValue which UE clamps to 255.
+            // The ceiling is the engine's property, not the storage.
+            if (b.slot) {
                 if (!leased[b.slot]) ++leasedCount;
                 leased[b.slot] = true;
             }

@@ -200,7 +200,12 @@ void Hooks::OnMaskReady(const MaskFrame& frame) {
     if (auto sc = atSubmission) {
         bool leased[256] = {};
         for (const auto& b : sc->bindings) {
-            if (b.slot > 0 && b.slot < 256) leased[b.slot] = true;
+            // No upper bound: slot is a uint8_t, so `< 256` is vacuously true
+            // and reads as a range check that could never fail. This project
+            // has shipped two guards of exactly that shape already -- the
+            // PRESENT-state mask in 8.7 and the unbounded probe exemption in
+            // 8.6 -- and both hid real bugs behind an appearance of rigour.
+            if (b.slot) leased[b.slot] = true;
         }
         leaseCheckPossible = !sc->bindings.empty();
         for (int i = 1; i < 256; ++i) {

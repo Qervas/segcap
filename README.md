@@ -261,15 +261,22 @@ src/segcap/      the injected DLL
 src/injector/    suspended launch + inject + resume
 src/vpad/        ViGEm virtual Xbox pad
 src/tests/       25 assertions, no game required
-tools/
+tools/           see tools/README.md for the full map
   capture.py     one entry point for every title
   games.py       GameProfile: exe, menu route, load signals, per title
   runner.py      the run itself, shared by all titles
   harness.py     Win32 liveness, thread recovery, log waits
   overlay.py     mask -> colourised overlay, with the alignment refusal
   mask_movie.py  masks as video when there is no colour to overlay onto
+  legacy/        the PowerShell harness capture.py replaced
+  renderdoc/     the RenderDoc route, closed when Nanite turned out to write
+                 its visibility buffer through a UAV
 docs/            DEBUGGING.md, AI-USAGE.md, FORMAT.md, evidence/
+  archive/       superseded notes, kept because DEBUGGING.md refers to them
 ```
+
+`legacy/` and `renderdoc/` are dead ends preserved on purpose. The brief asked
+how things were diagnosed, and half that answer is the routes that did not work.
 
 ---
 
