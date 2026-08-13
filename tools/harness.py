@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import os
 import re
 import subprocess
 import time
@@ -459,6 +460,48 @@ def frame_changes(root: Path, act: Path, process: str, wait: float = 4.0) -> boo
         return a.read_bytes() != b.read_bytes()
     except OSError:
         return False
+
+
+def pad_send(cmd_path: Path, seq: int, btn: str = "", ms: int = 400,
+             lx: int = 0, ly: int = 0, rx: int = 0, ry: int = 0,
+             timeout: float = 6.0) -> bool:
+    """Press something on the virtual Xbox pad and wait for vpad to confirm it.
+
+    THIS IS THE ONLY INPUT SOME GAMES ACCEPT. Stray ignores SendInput outright --
+    proven by its object array staying at the menu's slot count after four
+    scan-code taps -- because ViGEm presents the pad through a kernel bus driver
+    and the game cannot tell it from real hardware. A mouse click at a guessed
+    coordinate is not a substitute for a button the game is actually listening
+    for.
+
+    vpad --serve is already running (runner.launch starts it). It polls this file
+    and applies any line whose seq is higher than the last one it applied, then
+    writes the seq it applied to <cmd>.ack. Waiting for that ack is what makes
+    this a synchronous press rather than a hopeful write: without it we would
+    queue the next command over one that had not been read yet, and the pad would
+    silently skip presses.
+
+    Written to a temp file and renamed, because vpad's parser is deliberately
+    tolerant -- a half-written line simply fails to match and is retried, so a
+    torn read costs a poll interval rather than applying garbage. Renaming makes
+    that impossible in the first place.
+    """
+    ack = Path(str(cmd_path) + ".ack")
+    tmp = Path(str(cmd_path) + ".tmp")
+    line = (f"seq={seq} lx={lx} ly={ly} rx={rx} ry={ry} ms={ms}"
+            + (f" btn={btn}" if btn else "") + "\n")
+    tmp.write_text(line)
+    os.replace(tmp, cmd_path)
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if int(ack.read_text().strip() or 0) >= seq:
+                return True
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.1)
+    return False
 
 
 def current_level(path: Path) -> str:

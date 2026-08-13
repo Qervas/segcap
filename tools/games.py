@@ -117,6 +117,29 @@ class Step:
 
 
 @dataclass(frozen=True)
+class PadStep:
+    """One virtual-gamepad press on the route into gameplay.
+
+    SOME GAMES ACCEPT NOTHING ELSE. Stray ignores SendInput entirely -- its
+    object array stayed at the menu's slot count after four scan-code taps -- so
+    its menus can only be driven through ViGEm, which the game cannot distinguish
+    from real hardware.
+
+    This existed in the PowerShell runner as `vpad --menu --menu-presses 8` and
+    was lost when the two runners were generalised into one Python runner:
+    GameProfile could express a click and a keypress and had no way to say
+    "press A". Stray's profile was given a click at a coordinate nobody had
+    validated, so `capture.py stray` reached the menu and stopped there, and the
+    README documented a command that had never run. See DEBUGGING.md 8.23.
+    """
+    btn: str                      # A, B, X, Y, START, DU/DD/DL/DR, LB, RB, ...
+    times: int = 1                # presses; menus often need several
+    ms: int = 400                 # how long to hold each one
+    gap: float = 0.8              # seconds between presses
+    what: str = ""
+
+
+@dataclass(frozen=True)
 class GameProfile:
     name: str                     # short slug; also the archive directory prefix
     image: str                    # process image name, for find/kill
@@ -129,8 +152,9 @@ class GameProfile:
     # Split at the load boundary: everything before the world streams in, and
     # everything after. The runner waits for the world between them, so a title
     # that loads instantly and one that takes three minutes share the same code.
-    to_load: tuple[Step, ...] = ()
-    after_load: tuple[Step, ...] = ()
+    # A route may mix mouse clicks and pad presses; some titles accept only one.
+    to_load: tuple[Step | PadStep, ...] = ()
+    after_load: tuple[Step | PadStep, ...] = ()
 
     # --- signals, not durations --------------------------------------------
     # A fixed sleep is a guess that nobody remeasures; these are things the DLL
@@ -164,6 +188,18 @@ class GameProfile:
     # plus one observed outlier at 118.4s with the save no longer disk-cached.
     # 120s covers that; the common case exits at ~70s and pays nothing.
     load_begin_ceiling: float = 120.0
+
+    # Does entering gameplay CHANGE the world's name?
+    #
+    # inZOI goes OpeningLevel2 -> RedCity_Map, so "we left the menu's world" is
+    # the signal that the save is up. Stray has no separate menu world: by the
+    # time the engine layer resolves a UWorld at all, the pad has already cleared
+    # the title screen and the name is Slums_ZONE -- the level we came to
+    # capture. Waiting to leave it means waiting out the ceiling in the right
+    # place, then proceeding anyway.
+    #
+    # This cannot be inferred from the name, so the profile states it.
+    expects_level_change: bool = True
 
     # Some titles load paused and need an explicit unpause; some do not.
     settle_after_unpause: float = 60.0
@@ -219,8 +255,22 @@ STRAY = GameProfile(
     workdir=_STRAY_EXE.parent,
     launch_args="-dx12",
     steam_appid=1332010,
-    # Stray drops into gameplay from a single continue; it does not load paused.
-    to_load=(Step(0.5, 0.62, 4, "continue"),),
+    # PAD, NOT MOUSE. Stray ignores SendInput -- four scan-code taps left the
+    # object array at the menu's slot count -- so the menu is driven through
+    # ViGEm, which it cannot tell from real hardware.
+    #
+    # Eight presses of A, which is what run_auto.ps1 used (`--menu-presses 8`).
+    # More than the menu strictly needs, deliberately: A is idempotent once the
+    # save is loading, and the depth of the menu varies with whether the title
+    # screen has a "press any button" gate that frame. Under-pressing leaves it
+    # in the menu; over-pressing costs nothing.
+    #
+    # The click that used to be here -- Step(0.5, 0.62, ...) -- was a coordinate
+    # nobody validated, and it never worked. DEBUGGING.md 8.23.
+    to_load=(PadStep(btn="A", times=8, ms=250, gap=0.9,
+                     what="menu: A x8 on the virtual pad"),),
+    # No menu world to leave -- see expects_level_change.
+    expects_level_change=False,
     after_load=(),
     menu_ceiling=90.0,
     load_ceiling=120.0,

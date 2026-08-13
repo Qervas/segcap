@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 import harness as H
-from games import GameProfile
+from games import GameProfile, PadStep
 
 ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / "build" / "bin"
@@ -45,6 +45,9 @@ class Run:
         # at one specific game and silently misfired for the other.
         image = profile.image
         self.proc = image[:-4] if image.lower().endswith(".exe") else image
+        # vpad applies a command only when its seq exceeds the last one applied,
+        # so this has to advance for every press in a run.
+        self.pad_seq = 0
 
     # --- plumbing ---------------------------------------------------------
     def say(self, msg: str) -> None:
@@ -76,13 +79,51 @@ class Run:
             path.unlink(missing_ok=True)
 
     def click(self, step) -> None:
-        H.ensure_live(self.pid, step.what, self.say)
+        """Perform one route step, whichever kind it is.
+
+        Dispatches on the step type rather than assuming a mouse, because a
+        profile may legitimately need either and Stray needs the pad: it ignores
+        SendInput outright, so a click is not a fallback for a button.
+        """
+        H.ensure_live(self.pid, step.what or getattr(step, "btn", "step"), self.say)
+        if isinstance(step, PadStep):
+            self.pad(step)
+            return
         self.say(step.what)
         if self.preflight:
             return
         subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                         "-File", str(ACT), "-Process", self.proc, "-ClickFx", str(step.fx),
                         "-ClickFy", str(step.fy), "-Wait", str(step.wait)], cwd=str(ROOT))
+
+    def pad(self, step: PadStep) -> None:
+        """Press a pad button N times through the vpad command channel.
+
+        vpad --serve is already running from launch(); this is the client half
+        that was never written. Each press waits for vpad's ack, so a press
+        cannot be queued over one that has not been read yet -- without that the
+        pad silently skips them.
+        """
+        label = step.what or f"pad {step.btn} x{step.times}"
+        self.say(label)
+        if self.preflight:
+            return
+        # Is the pad server even alive? It is spawned in launch() and nothing
+        # checked afterwards, so a vpad that failed to start left the route
+        # pressing buttons into nothing while every step reported fine.
+        if not H.find_pid("vpad.exe"):
+            self.say("!! vpad is NOT running -- no pad input will reach the game. "
+                     "Check that the ViGEmBus driver is installed (see README "
+                     "Prerequisites); vpad exits immediately without it.")
+            return
+        for i in range(step.times):
+            self.pad_seq += 1
+            if not H.pad_send(BIN / "vpad_cmd.txt", self.pad_seq,
+                              btn=step.btn, ms=step.ms):
+                self.say(f"!! pad press {i + 1}/{step.times} ({step.btn}) was never "
+                         f"acknowledged -- is vpad running, and is the ViGEmBus "
+                         f"driver installed?")
+            time.sleep(step.gap)
 
     # --- phases -----------------------------------------------------------
     def prepare(self) -> None:
@@ -153,6 +194,19 @@ class Run:
         if not self.preflight:
             H.kill_all([self.p.image, "vpad.exe"])
             time.sleep(3)
+            # CLEAR THE PAD CHANNEL. vpad applies a command only when its seq
+            # exceeds the last it applied, and it reports progress by writing
+            # that seq to <cmd>.ack -- both files survive the run that wrote
+            # them. A leftover ack of 768 makes every press in the next run
+            # return "acknowledged" the instant it is sent, because the waiter
+            # only asks whether ack >= seq.
+            #
+            # So the press never blocks, nothing verifies it landed, and a run
+            # whose pad was not even running reported eight successful presses.
+            # Same shape as the stale screenshots in frame_changes: old state on
+            # disk read as this run's answer.
+            for leftover in ("vpad_cmd.txt", "vpad_cmd.txt.ack", "vpad_cmd.txt.tmp"):
+                (BIN / leftover).unlink(missing_ok=True)
         # ARCHIVE BEFORE DELETING THE LOG. Reversed, this destroys the one
         # artefact that explains a crash, a moment before the archiver collects
         # it. That bug lived in one of the two old runners and not the other.
@@ -188,8 +242,23 @@ class Run:
             self.say("game never appeared")
             return False
         self.say(f"game pid {self.pid}")
+        # KEEP VPAD'S OUTPUT. It was sent to DEVNULL, so when the pad server
+        # failed there was nothing anywhere saying why -- and it logs exactly
+        # what you need: whether the virtual pad connected, and every command it
+        # applied ("serve: #7 ... btn=A"). Discarding that is what made a run
+        # that pressed nothing look identical to one that pressed eight times.
+        vpad_log = (BIN / "vpad.log").open("w")
         subprocess.Popen([str(VPAD), "--serve", "build/bin/vpad_cmd.txt"], cwd=str(ROOT),
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                         stdout=vpad_log, stderr=subprocess.STDOUT)
+        # Give it a moment, then confirm rather than assume. Without the driver
+        # it exits at once, and every later press would go nowhere silently.
+        time.sleep(1.5)
+        if H.find_pid("vpad.exe"):
+            self.say("vpad: virtual pad server up")
+        else:
+            self.say("!! vpad FAILED TO START -- pad input will not reach the game. "
+                     f"See {BIN / 'vpad.log'}; the usual cause is a missing ViGEmBus "
+                     f"driver (README Prerequisites).")
         return True
 
     def into_gameplay(self) -> None:
@@ -276,7 +345,16 @@ class Run:
             # signal that cannot arrive -- turning a fix for one game into
             # exactly this bug for the other.
             self.say(f"entering the world (attempt {attempt})")
-            if self.menu_level:
+            if not p.expects_level_change:
+                # Nothing to leave. The title drops straight into gameplay, so
+                # "a world resolved and stopped churning" is the whole signal.
+                entered = bool(H.current_level(LOG))
+                self.say(f"world is '{H.current_level(LOG) or 'not yet named'}' -- this "
+                         f"title has no separate menu world, so there is no change to "
+                         f"wait for")
+                if entered:
+                    break
+            elif self.menu_level:
                 entered = bool(H.wait_for_level_change(
                     LOG, self.menu_level, p.load_begin_ceiling, self.pid, self.say))
             else:
@@ -347,7 +425,11 @@ class Run:
         # A screenshot caught the harness clicking the transport bar while a
         # LOADING SCREEN was still up -- tip text, spinner, no HUD at all. Every
         # resume click landed on nothing, which is why the sim was never running.
-        H.wait_for_level_change(LOG, self.menu_level, 240, self.pid, self.say)
+        if self.p.expects_level_change:
+            H.wait_for_level_change(LOG, self.menu_level, 240, self.pid, self.say)
+        else:
+            self.say(f"in world '{H.current_level(LOG) or 'unnamed'}' -- no menu world to "
+                     f"leave on this title")
 
         if p.resume_key or p.transport_y:
             running = False
