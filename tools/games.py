@@ -207,7 +207,17 @@ class GameProfile:
     # Naming it removes the race entirely: in gameplay means a world resolved and
     # it is not this one. No ordering assumption, no latch. Empty falls back to
     # the latch for a title whose menu world is not yet known.
-    menu_world: str = ""
+    # Every world that is NOT gameplay, by name.
+    #
+    # Was a single name, which was not enough: Stray passes through
+    # HK_Project_MainStart AND HK_Project_Intro before Slums_ZONE, so a gate
+    # that only knew the first one reported "in world 'HK_Project_Intro' after
+    # 0s" and marched on into the intro cinematic.
+    #
+    # A set rather than a "gameplay world" name because inZOI streams sublevels
+    # with their own names (Prop_StageSet_A01_RedCity), so matching the wanted
+    # world exactly is the brittle direction. Listing what to skip is not.
+    menu_worlds: tuple[str, ...] = ()
 
     # How many live UObjects mean "the engine is up", for THIS title.
     #
@@ -252,7 +262,7 @@ INZOI = GameProfile(
     # Observed on every inZOI run: the menu is OpeningLevel2 and a loaded save
     # is RedCity_Map. Naming it here means the load gate no longer depends on
     # the level oracle resolving before the load starts.
-    menu_world="OpeningLevel2",
+    menu_worlds=("OpeningLevel2",),
     to_load=(
         Step(0.0883, 0.2169, 2, "Continue"),
         Step(0.6926, 0.3631, 3, "first save slot"),
@@ -299,7 +309,9 @@ STRAY = GameProfile(
     to_load=(PadStep(btn="A", times=8, ms=250, gap=0.9,
                      what="menu: A x8 on the virtual pad"),),
     # The start map, observed. Gameplay is Slums_ZONE.
-    menu_world="HK_Project_MainStart",
+    # MainStart is the title screen, Intro the opening cinematic. Gameplay is
+    # Slums_ZONE; both of the others are observed on the way.
+    menu_worlds=("HK_Project_MainStart", "HK_Project_Intro"),
     # ~175k at the menu, 320k+ in a level. 120k clears boot without needing a
     # population Stray never reaches before a save is loaded.
     object_plateau=120_000,

@@ -343,28 +343,37 @@ class Run:
             # signal that cannot arrive -- turning a fix for one game into
             # exactly this bug for the other.
             self.say(f"entering the world (attempt {attempt})")
-            if p.menu_world:
-                # The profile NAMES the world we start in, so gameplay is simply
-                # "a world resolved and it is not that one". No latch, and no
-                # assumption about whether the name appears before or after the
-                # load completes -- which is the race that produced two opposite
-                # wrong conclusions about Stray.
-                self.say(f"waiting to leave '{p.menu_world}' "
+            if p.menu_worlds:
+                # The profile NAMES the worlds that are not gameplay, so being in
+                # gameplay is "a world resolved and it is none of those". No
+                # latch, and no assumption about whether the name appears before
+                # or after the load -- the race that produced two opposite wrong
+                # conclusions about Stray.
+                #
+                # It must hold steady. Stray passes through Intro on its way to
+                # Slums_ZONE, and a single sample the instant a transition begins
+                # catches whichever world happens to be current.
+                self.say(f"waiting to leave {list(p.menu_worlds)} "
                          f"(ceiling {p.load_begin_ceiling:.0f}s)")
                 t0 = time.monotonic()
-                level = ""
+                level, stable_since = "", 0.0
                 while time.monotonic() - t0 < p.load_begin_ceiling:
                     H.ensure_live(self.pid, "the world to load", self.say)
-                    level = H.current_level(LOG)
-                    if level and level != p.menu_world:
-                        break
-                    level = ""
+                    now = H.current_level(LOG)
+                    if now and now not in p.menu_worlds:
+                        if now != level:
+                            level, stable_since = now, time.monotonic()
+                            self.say(f"world is now '{now}' -- holding 6s to be sure")
+                        elif time.monotonic() - stable_since >= 6.0:
+                            break
+                    else:
+                        level = ""
                     time.sleep(2)
                 if level:
                     self.say(f"in world '{level}' after {time.monotonic() - t0:.0f}s")
                     entered = True
                     break
-                self.say(f"still in '{p.menu_world}' at the ceiling -- retrying the route")
+                self.say(f"never left {list(p.menu_worlds)} -- retrying the route")
             elif self.menu_level:
                 entered = bool(H.wait_for_level_change(
                     LOG, self.menu_level, p.load_begin_ceiling, self.pid, self.say))
@@ -436,8 +445,16 @@ class Run:
         # A screenshot caught the harness clicking the transport bar while a
         # LOADING SCREEN was still up -- tip text, spinner, no HUD at all. Every
         # resume click landed on nothing, which is why the sim was never running.
-        H.wait_for_level_change(LOG, self.p.menu_world or self.menu_level, 240,
-                                self.pid, self.say)
+        if self.p.menu_worlds:
+            # Already established above that we are in a world that is not one of
+            # these; re-confirm cheaply rather than waiting for another change
+            # that will never come.
+            lvl = H.current_level(LOG)
+            self.say(f"in world '{lvl or 'unnamed'}'"
+                     + ("" if lvl and lvl not in self.p.menu_worlds
+                        else " -- WARNING: this is still a menu world"))
+        else:
+            H.wait_for_level_change(LOG, self.menu_level, 240, self.pid, self.say)
 
         if p.resume_key or p.transport_y:
             running = False
@@ -511,8 +528,8 @@ class Run:
         # the latch can capture the gameplay world on a slow resolve, and then
         # this check would compare gameplay against gameplay and refuse a good
         # run -- or, worse, compare menu against nothing and arm in the menu.
-        menu = self.p.menu_world or self.menu_level
-        if level and menu and level == menu:
+        menus = set(self.p.menu_worlds) | ({self.menu_level} if self.menu_level else set())
+        if level and menus and level in menus:
             self.say(f"REFUSING to arm: still in '{level}', the world we started in. "
                      f"Capturing here would fill the budget with menu frames and "
                      f"report success. Failing this attempt so the run can retry.")
