@@ -20,7 +20,15 @@
   .\tools\act.ps1 -Wait 3                 # no input, just look after 3s
 #>
 param(
-    [string]$Process = "inZOI-Win64-Shipping",
+    # NO DEFAULT. This used to default to "inZOI-Win64-Shipping", and runner.py
+    # never passed it -- so every click and screenshot during a STRAY run went
+    # looking for inZOI, threw "inZOI-Win64-Shipping is not running", and the run
+    # crawled through its ceilings having interacted with nothing.
+    #
+    # A default that silently targets the wrong game is worse than no default:
+    # the failure names a process the operator never asked for, which reads as
+    # "the other game is not running" rather than "you forgot an argument".
+    [string]$Process = "",
     [int]$Lx = 0, [int]$Ly = 0, [int]$Rx = 0, [int]$Ry = 0,
     [int]$Lt = 0, [int]$Rt = 0,
     [string]$Btn = "",
@@ -157,6 +165,11 @@ public class Keys1 {
 "@
 }
 
+if (-not $Process) {
+    throw "act.ps1 needs -Process <image name without .exe>, e.g. -Process Stray-Win64-Shipping. " +
+          "It has no default on purpose: the old one pointed at inZOI and made every Stray run " +
+          "interact with nothing while reporting the wrong game's name."
+}
 $g = Get-Process -Name $Process -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $g) { throw "$Process is not running" }
 

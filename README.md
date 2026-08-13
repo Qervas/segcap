@@ -321,3 +321,15 @@ windowed 1280×720 with a backup at `GameUserSettings.ini.segcap-backup`.
 
 Both games are legitimately owned retail copies. Marking is gated behind a marker
 file so a run cannot mutate game state by accident.
+
+---
+
+## Use
+
+Published for review. **No licence is granted** — copyright is retained, and this
+is not offered for reuse or redistribution. That is deliberate rather than an
+omission; ask if you want something different.
+
+The two vendored dependencies keep their own licences and are unaffected by the
+above: `third_party/minhook` is BSD-2-Clause, `third_party/ViGEmClient` is MIT,
+each with its licence file and upstream commit recorded in `VENDORED.md`.

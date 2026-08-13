@@ -414,7 +414,7 @@ def sim_is_running(path: Path, log: Callable[[str], None], samples: int = 4) -> 
     return False
 
 
-def frame_changes(root: Path, act: Path, wait: float = 4.0) -> bool:
+def frame_changes(root: Path, act: Path, process: str, wait: float = 4.0) -> bool:
     """Does the SCREEN change while we hold still? The only honest pause oracle.
 
     inZOI does not use UE's pause flag -- IsGamePaused reads false even sitting
@@ -448,7 +448,8 @@ def frame_changes(root: Path, act: Path, wait: float = 4.0) -> bool:
         out.unlink(missing_ok=True)
     for out in (a, b):
         subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                        "-File", str(act), "-Wait", "0.2", "-Out", str(out)],
+                        "-File", str(act), "-Process", process,
+                        "-Wait", "0.2", "-Out", str(out)],
                        cwd=str(root), capture_output=True)
         if out is a:
             time.sleep(wait)

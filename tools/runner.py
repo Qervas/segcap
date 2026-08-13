@@ -40,6 +40,11 @@ class Run:
         # The world we were in when the capture armed, empty if never identified.
         # A control cannot claim "died in gameplay" without this.
         self.armed_level = ""
+        # Process name act.ps1 targets: the profile's image without .exe. Passed
+        # explicitly on every invocation, because act.ps1's old default pointed
+        # at one specific game and silently misfired for the other.
+        image = profile.image
+        self.proc = image[:-4] if image.lower().endswith(".exe") else image
 
     # --- plumbing ---------------------------------------------------------
     def say(self, msg: str) -> None:
@@ -76,7 +81,7 @@ class Run:
         if self.preflight:
             return
         subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                        "-File", str(ACT), "-ClickFx", str(step.fx),
+                        "-File", str(ACT), "-Process", self.proc, "-ClickFx", str(step.fx),
                         "-ClickFy", str(step.fy), "-Wait", str(step.wait)], cwd=str(ROOT))
 
     # --- phases -----------------------------------------------------------
@@ -359,9 +364,10 @@ class Run:
                 H.ensure_live(self.pid, "transport sweep", self.say)
                 self.say(f"resume: clicking transport at ({x:.3f}, {y:.4f})")
                 subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                                "-File", str(ACT), "-ClickFx", str(x), "-ClickFy", str(y),
+                                "-File", str(ACT), "-Process", self.proc,
+                                "-ClickFx", str(x), "-ClickFy", str(y),
                                 "-Wait", "1"], cwd=str(ROOT))
-                if H.frame_changes(ROOT, ACT):
+                if H.frame_changes(ROOT, ACT, self.proc):
                     self.say(f"sim IS running -- screen changed with no input, "
                              f"play is at x={x:.3f}")
                     running = True
@@ -449,7 +455,8 @@ class Run:
                 # to read. Static capture must work before dynamic means anything.
                 ly = 30000 if step % 2 == 0 else -30000
                 subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                                "-File", str(ACT), "-Ly", str(ly), "-Ms", "2500",
+                                "-File", str(ACT), "-Process", self.proc,
+                                "-Ly", str(ly), "-Ms", "2500",
                                 "-Wait", "0.5"], cwd=str(ROOT), capture_output=True)
             else:
                 time.sleep(3)
