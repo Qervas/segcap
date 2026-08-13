@@ -15,10 +15,57 @@ Preflight walks the whole route with the game stubbed out and fails in a second.
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
+def _reexec_if_ctypes_broken() -> None:
+    """Relaunch under an interpreter that can import ctypes, if this one cannot.
+
+    The `ai` conda env on this machine has a broken `_ctypes` (missing libffi),
+    and the whole harness is ctypes -- process liveness, window handles, input.
+    Running `python tools/capture.py` from an activated `ai` shell therefore dies
+    on an import three frames deep in harness.py:
+
+        ImportError: DLL load failed while importing _ctypes
+
+    which reads as "the harness is broken" rather than "wrong interpreter". That
+    is a five-minute detour every time, and it has already happened more than
+    once. The fix belongs here rather than in a README line nobody re-reads:
+    detect it and re-exec, saying so.
+
+    Only ever moves to a python that WORKS, and only when this one does not, so
+    a healthy environment is untouched.
+    """
+    try:
+        import ctypes  # noqa: F401
+        return
+    except Exception as exc:                       # pragma: no cover - env-specific
+        if os.environ.get("SEGCAP_NO_REEXEC"):
+            raise
+        base = Path(sys.executable).parent
+        # conda layout: envs/<name>/python.exe -> ../../python.exe is the base
+        candidates = [base.parent.parent / "python.exe",
+                      Path(r"C:\Users\djmax\scoop\apps\miniconda3\current\python.exe")]
+        for cand in candidates:
+            if not cand.exists() or cand.resolve() == Path(sys.executable).resolve():
+                continue
+            probe = subprocess.run([str(cand), "-c", "import ctypes"],
+                                   capture_output=True)
+            if probe.returncode != 0:
+                continue
+            print(f"[capture] this interpreter cannot import ctypes ({exc}); "
+                  f"re-running under {cand}", flush=True)
+            env = dict(os.environ, SEGCAP_NO_REEXEC="1")
+            raise SystemExit(subprocess.run([str(cand), *sys.argv], env=env).returncode)
+        raise
+
+
+_reexec_if_ctypes_broken()
 
 from games import PROFILES          # noqa: E402
 from runner import Run              # noqa: E402
