@@ -84,10 +84,27 @@ Nothing here needs a human at the keyboard.
 
 ```powershell
 .\build.ps1
-python tools\capture.py stray --seconds 340
-python tools\capture.py inzoi --inject --walk --seconds 200
+python tools\capture.py inzoi --inject --seconds 200
 python tools\capture.py inzoi --preflight     # validate the flow, launch nothing
+
+# Stray goes through the older PowerShell runner -- see the note below
+powershell -ExecutionPolicy Bypass -File tools\legacy\run_auto.ps1
 ```
+
+**On Stray and `capture.py`.** Every Stray result here — the demo, the 301
+masks, the measured numbers — was produced by `tools/legacy/run_auto.ps1`, and
+that is still its working path. `capture.py stray` reaches the menu and stops
+there: Stray's menus are driven with the **virtual Xbox pad**, and when the two
+PowerShell runners were generalised into one Python runner the pad route was not
+carried across — `GameProfile` can express a mouse click and a keypress, but not
+a pad button. The profile has a click at a coordinate that was never validated.
+
+Found by publishing: deciding to push the repo meant actually running the
+command the README told people to run, which nobody had done. Three smaller
+Stray-only breaks fell out of the same stone — an install path that had always
+been wrong, a `--preflight` that skipped existence checks, and an `act.ps1`
+whose `-Process` defaulted to the other game. All three are fixed; the pad is a
+missing capability rather than a bug, and is written up in `DEBUGGING.md`.
 
 That disables the screensaver, launches the shipping executable suspended,
 injects `segcap.dll` before its first D3D call, resumes it, focuses the window,

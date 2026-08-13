@@ -1912,6 +1912,54 @@ The gate stays, off by default. It is a real mechanism against a real waste and
 it will matter outdoors where the budget genuinely is contended. It is simply
 not the answer to the question that prompted it.
 
+### 8.23 Deciding to publish is a test, and it failed four times
+
+The repo was about to be pushed for review, so for the first time I ran the
+command the README told a reader to run:
+
+```
+python tools\capture.py stray --seconds 340
+```
+
+It could not have worked. Four separate breaks, all on the Stray path, all
+invisible because the Python harness was written against inZOI and the Stray
+half had never once executed.
+
+**The install path had always been wrong.** `games.py` said
+`Stray\Binaries\Win64`; the executable is under `Hk_project\Binaries\Win64`, an
+internal project name. The PowerShell runner it replaced had it right --
+transcribing it is where it broke.
+
+**`--preflight` skipped the existence checks.** The one command whose entire
+purpose is catching a profile mistake in a second rather than four minutes into a
+run was structurally incapable of catching this, and reported `control flow OK`
+every time. A validation pass that excludes the validation.
+
+**`act.ps1` defaulted `-Process` to `inZOI-Win64-Shipping`** and the runner never
+passed one, so every click, keystroke and screenshot in a Stray run went to a
+game that was not running. The error even said `inZOI-Win64-Shipping is not
+running` during a Stray run, which misdirects while it fails. The default was the
+bug; it is now required.
+
+**And the one that is not a typo: the pad route was dropped.** Stray's menus are
+driven with the virtual Xbox pad. `run_auto.ps1` launched `vpad.exe` for exactly
+that. When the two PowerShell runners were generalised into one Python runner --
+a change this file elsewhere defends, because they had drifted and each carried
+bugs the other did not -- `GameProfile` was given a mouse click and a keypress
+and no way to express a pad button. Stray's profile got a click at a coordinate
+nobody validated.
+
+That last one is worth separating from the other three. Consolidating the
+runners was right and the reasons are still true. But a rewrite that unifies two
+things has to enumerate what each one did, and this one dropped a capability
+silently and then reported success at every level: the profile looked complete,
+preflight passed, and the README documented a command that had never run.
+
+The general form, and the reason this is in the debugging file rather than a
+changelog: **the moment before you hand something over is the first time you are
+forced to use it as a stranger would.** Every one of these had been sitting in
+front of me for days behind a green check.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have
