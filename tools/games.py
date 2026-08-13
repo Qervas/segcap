@@ -205,6 +205,23 @@ class GameProfile:
     # the latch for a title whose menu world is not yet known.
     menu_world: str = ""
 
+    # How many live UObjects mean "the engine is up", for THIS title.
+    #
+    # ProcessEvent is installed once the object array stops growing above this
+    # floor, and everything downstream needs it: marking, world state, the level
+    # name the load gate waits for. The floor existed as a hardcoded 200,000,
+    # picked from inZOI's menu population of ~245,000.
+    #
+    # Stray's menu is ~175,000 (run_auto.ps1 measured 175k at the menu, 320k+ in
+    # a level). So on Stray the floor could never be met at the menu: the gate
+    # waited out its whole ceiling every run, ProcessEvent went in late or not at
+    # all, and the level name the harness was waiting for could not exist. The
+    # long "menu wait" was our own instrument, not the game -- Stray was loaded
+    # and idle the entire time.
+    #
+    # It is a property of the title, so it belongs in the title's profile.
+    object_plateau: int = 200_000
+
     # Some titles load paused and need an explicit unpause; some do not.
     settle_after_unpause: float = 60.0
 
@@ -279,6 +296,9 @@ STRAY = GameProfile(
                      what="menu: A x8 on the virtual pad"),),
     # The start map, observed. Gameplay is Slums_ZONE.
     menu_world="HK_Project_MainStart",
+    # ~175k at the menu, 320k+ in a level. 120k clears boot without needing a
+    # population Stray never reaches before a save is loaded.
+    object_plateau=120_000,
     after_load=(),
     menu_ceiling=90.0,
     load_ceiling=120.0,

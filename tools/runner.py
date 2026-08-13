@@ -174,6 +174,9 @@ class Run:
         if not self.preflight:
             (BIN / "segcap.captures").write_text(str(self.o.captures))
             (BIN / "segcap.stride").write_text(str(self.o.stride))
+            # How many objects mean "engine up" for THIS title. Hardcoded to
+            # inZOI's 200k, it was unreachable on Stray's ~175k menu.
+            (BIN / "segcap.plateau").write_text(str(self.p.object_plateau))
             radius = int(getattr(self.o, "radius", 0) or 0)
             if radius:
                 (BIN / "segcap.radius").write_text(str(radius))

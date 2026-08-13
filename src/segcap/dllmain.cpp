@@ -34,6 +34,9 @@ bool g_peTriageInCensus = false;
 // Read from a "segcap.radius" marker before the marker object exists, applied
 // once it does. 0 means no distance gate.
 double g_markRadius = 0.0;
+// Live-object count that means the engine has finished booting. Per title: see
+// the note where it is read. 200,000 is inZOI's; Stray needs far less.
+int32_t g_objectPlateau = 200000;
 
 // True while a marking pass is queued but not yet drained on the game thread.
 std::atomic<bool> g_markPassPending{false};
@@ -488,6 +491,16 @@ DWORD WINAPI InitThread(LPVOID) {
         // No default is baked in here on purpose. The right radius is a property
         // of the scene, not of the code, and the counters this run logs
         // (skipped-far / released-far) are what should choose it.
+        // Object count that means "the engine is up" for this title. 200,000 was
+        // read off inZOI's menu (~245k) and hardcoded; Stray's menu is ~175k, so
+        // the floor was unreachable there and ProcessEvent -- with marking,
+        // world state and the level name behind it -- waited out every ceiling.
+        const unsigned long plateau = readInt(L".plateau");
+        if (plateau) {
+            g_objectPlateau = static_cast<int32_t>(plateau);
+            segcap::LogInfo("ue4: object-graph floor %lu for this title", plateau);
+        }
+
         const unsigned long radius = readInt(L".radius");
         if (radius) {
             g_markRadius = static_cast<double>(radius);
@@ -836,7 +849,7 @@ DWORD WINAPI DiscoverThread(LPVOID) {
                 // only the second half of what it was doing. Observed menu and
                 // gameplay counts run 240k-468k, so 200k is comfortably inside the
                 // real steady state and still far quicker than the flat sleep.
-                if (n >= 200000 && prev > 0 && n < prev + prev / 100) {
+                if (n >= g_objectPlateau && prev > 0 && n < prev + prev / 100) {
                     if (++stable >= 2) { settled = true; break; }
                 } else {
                     stable = 0;
@@ -853,11 +866,11 @@ DWORD WINAPI DiscoverThread(LPVOID) {
                                 "ProcessEvent", g_engine.NumObjects());
             } else {
                 segcap::LogWarn("ue4: object graph did NOT settle within 90s -- only %d "
-                                "slots, floor is 200000. Installing ProcessEvent anyway, "
+                                "slots, floor is %d. Installing ProcessEvent anyway, "
                                 "but discovery has too little live call traffic to "
                                 "validate against and will probably fail; if it does, "
                                 "this run has no execution point at all.",
-                                g_engine.NumObjects());
+                                g_engine.NumObjects(), g_objectPlateau);
             }
         }
         auto& pe = segcap::ue4::GetProcessEventHook();
