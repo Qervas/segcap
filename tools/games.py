@@ -20,8 +20,86 @@ half is then a fix everywhere by construction rather than by memory.
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+def steam_app_dir(appid: int) -> Path | None:
+    """Where Steam actually installed an app, asked of Steam.
+
+    The install path used to be a literal in each profile, which is wrong on any
+    machine but this one -- Steam's root differs, and libraries routinely live on
+    another drive entirely. Nothing about a title's identity is its path; its
+    identity is the appid.
+
+    Registry for Steam's own root, then libraryfolders.vdf for every library it
+    knows about, then the app manifest in each for the real directory name --
+    which is NOT reliably the store name (Stray installs to "Stray", inZOI to
+    "inZOI", but neither is guaranteed and neither is the appid).
+
+    Returns None rather than guessing, so the caller can fall back and say so.
+    """
+    roots: list[Path] = []
+    try:
+        import winreg
+        for hive, key, val in (
+            (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam", "InstallPath"),
+        ):
+            try:
+                with winreg.OpenKey(hive, key) as k:
+                    roots.append(Path(winreg.QueryValueEx(k, val)[0]))
+            except OSError:
+                continue
+    except ImportError:                      # not Windows; harmless
+        pass
+
+    # Every library Steam knows about, including the root one.
+    libraries: list[Path] = list(roots)
+    for root in roots:
+        vdf = root / "steamapps" / "libraryfolders.vdf"
+        try:
+            text = vdf.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # "path"   "D:\\SteamLibrary"
+        for m in re.finditer(r'"path"\s+"([^"]+)"', text):
+            libraries.append(Path(m.group(1).replace("\\\\", "\\")))
+
+    for lib in libraries:
+        manifest = lib / "steamapps" / f"appmanifest_{appid}.acf"
+        try:
+            text = manifest.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        m = re.search(r'"installdir"\s+"([^"]+)"', text)
+        if not m:
+            continue
+        path = lib / "steamapps" / "common" / m.group(1)
+        if path.is_dir():
+            return path
+    return None
+
+
+def game_exe(appid: int, relative: str, env_var: str, fallback: str) -> Path:
+    """Resolve a game executable: explicit override, then Steam, then the literal.
+
+    The fallback is the path this was developed against. It is kept so a machine
+    where Steam discovery fails still runs, and it is deliberately LAST so it
+    cannot mask a working answer.
+    """
+    override = os.environ.get(env_var)
+    if override:
+        return Path(override)
+    found = steam_app_dir(appid)
+    if found:
+        candidate = found / relative
+        if candidate.exists():
+            return candidate
+    return Path(fallback)
 
 
 @dataclass(frozen=True)
@@ -99,11 +177,15 @@ class GameProfile:
     transport_y: float = 0.0
 
 
+_INZOI_EXE = game_exe(
+    2456740, r"BlueClient\Binaries\Win64\inZOI-Win64-Shipping.exe", "SEGCAP_INZOI_EXE",
+    r"C:\Program Files (x86)\Steam\steamapps\common\inZOI\BlueClient\Binaries\Win64\inZOI-Win64-Shipping.exe")
+
 INZOI = GameProfile(
     name="inzoi",
     image="inZOI-Win64-Shipping.exe",
-    exe=Path(r"C:\Program Files (x86)\Steam\steamapps\common\inZOI\BlueClient\Binaries\Win64\inZOI-Win64-Shipping.exe"),
-    workdir=Path(r"C:\Program Files (x86)\Steam\steamapps\common\inZOI\BlueClient\Binaries\Win64"),
+    exe=_INZOI_EXE,
+    workdir=_INZOI_EXE.parent,
     launch_args="-dx12",
     steam_appid=2456740,
     to_load=(
@@ -120,12 +202,23 @@ INZOI = GameProfile(
 )
 
 
+# Hk_project, not Stray. The directory under common/ is "Stray" and the one
+# under it is "Hk_project" -- an internal project name, which is exactly the
+# sort of thing you cannot infer and have to look at. This profile carried
+# `Stray\Binaries\Win64` from the day it was written, so the Python harness
+# had never once launched Stray; the PowerShell runner it replaced had the
+# right path all along (tools/legacy/run_auto.ps1:98).
+_STRAY_EXE = game_exe(
+    1332010, r"Hk_project\Binaries\Win64\Stray-Win64-Shipping.exe", "SEGCAP_STRAY_EXE",
+    r"C:\Program Files (x86)\Steam\steamapps\common\Stray\Hk_project\Binaries\Win64\Stray-Win64-Shipping.exe")
+
 STRAY = GameProfile(
     name="stray",
     image="Stray-Win64-Shipping.exe",
-    exe=Path(r"C:\Program Files (x86)\Steam\steamapps\common\Stray\Stray\Binaries\Win64\Stray-Win64-Shipping.exe"),
-    workdir=Path(r"C:\Program Files (x86)\Steam\steamapps\common\Stray\Stray\Binaries\Win64"),
+    exe=_STRAY_EXE,
+    workdir=_STRAY_EXE.parent,
     launch_args="-dx12",
+    steam_appid=1332010,
     # Stray drops into gameplay from a single continue; it does not load paused.
     to_load=(Step(0.5, 0.62, 4, "continue"),),
     after_load=(),

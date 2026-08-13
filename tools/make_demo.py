@@ -81,8 +81,12 @@ def load_font(size):
     cannot be read are worse than no labels: they add clutter and imply the tool
     is showing something it is not.
     """
+    # WINDIR rather than a literal C:\Windows -- Windows is not always on C:,
+    # and the fallback keeps this working off-platform.
+    font_dirs = (os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
+                 "/usr/share/fonts/truetype/dejavu")
     for name in ("segoeuib.ttf", "seguisb.ttf", "arialbd.ttf", "segoeui.ttf", "arial.ttf"):
-        for d in (r"C:\Windows\Fonts", "/usr/share/fonts/truetype/dejavu"):
+        for d in font_dirs:
             p = os.path.join(d, name)
             if os.path.exists(p):
                 try:

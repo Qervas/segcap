@@ -473,11 +473,30 @@ class Run:
 
     # --- entry ------------------------------------------------------------
     def go(self) -> int:
-        if not self.preflight:
-            for f in (DLL, INJECTOR, VPAD, self.p.exe, ACT):
-                if not f.exists():
-                    self.say(f"missing: {f}")
-                    return 1
+        # PREFLIGHT CHECKS PATHS TOO. It used to skip this block entirely, which
+        # is backwards: the whole point of --preflight is to catch a harness or
+        # profile mistake in one second instead of four minutes into a run.
+        #
+        # It hid a real one. games.py had Stray at `Stray\Binaries\Win64`, but
+        # the executable lives under `Hk_project\Binaries\Win64` -- so the Python
+        # harness had never launched Stray, and `stray --preflight` reported
+        # "control flow OK" every time because it never looked.
+        #
+        # The game executable is profile data and a missing one is a bug, so it
+        # fails. Build outputs are just "run build.ps1 first", so in preflight
+        # they are reported and tolerated -- a fresh clone should still be able
+        # to validate its control flow.
+        missing_build = [f for f in (DLL, INJECTOR, VPAD, ACT) if not f.exists()]
+        if not self.p.exe.exists():
+            self.say(f"MISSING GAME EXECUTABLE: {self.p.exe}")
+            self.say("  set the override env var, or fix the profile in tools/games.py")
+            return 1
+        if missing_build:
+            for f in missing_build:
+                self.say(f"missing build output: {f}")
+            if not self.preflight:
+                return 1
+            self.say("(preflight) continuing anyway -- run .\\build.ps1 before a real run")
         self.prepare()
         if not self.launch():
             return 1

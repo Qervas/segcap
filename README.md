@@ -47,6 +47,37 @@ If you read one thing, read `DEBUGGING.md` §7 and §8.
 
 ---
 
+## Prerequisites
+
+Windows 11, a D3D12 GPU, and:
+
+| | |
+|---|---|
+| **MSVC** | any Visual Studio with the C++ toolset. `build.ps1` finds `vcvars64.bat` by scanning Program Files, so the version is not pinned |
+| **CMake + Ninja** | a Visual Studio *generator* is deliberately not used — see the note at the top of `build.ps1` |
+| **Python 3** | needs a working `ctypes`. If yours cannot import it, `capture.py` finds an interpreter that can and re-execs itself, saying so |
+| **ffmpeg** | only for the demo videos. Found on `PATH`, or set `SEGCAP_FFMPEG` |
+| **ViGEmBus** | kernel driver, only for the virtual gamepad path. v1.22.0, SHA256 in `third_party/ViGEmClient/VENDORED.md`. Without it the pad silently does nothing |
+
+**The games are located through Steam, not hardcoded.** `tools/games.py` reads
+Steam's install root from the registry, walks `libraryfolders.vdf` for every
+library (they routinely live on another drive), and finds each title by **appid**
+via its `appmanifest_*.acf` — inZOI `2456740`, Stray `1332010`. Override with
+`SEGCAP_INZOI_EXE` / `SEGCAP_STRAY_EXE` if you have them somewhere Steam does not
+know about.
+
+`python tools\capture.py <title> --preflight` validates all of this in about a
+second, including that the game executable actually exists, and launches nothing.
+
+Two vendored dependencies, both permissive, both pinned to an exact upstream
+commit with provenance in `third_party/*/VENDORED.md`:
+[MinHook](https://github.com/TsudaKageyu/minhook) (BSD-2-Clause) for the D3D12
+detours, and [ViGEmClient](https://github.com/nefarius/ViGEmClient) (MIT) for the
+virtual pad. Neither is a submodule; both build from source with our CRT
+settings.
+
+---
+
 ## Run it
 
 Nothing here needs a human at the keyboard.
