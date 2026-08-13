@@ -189,17 +189,21 @@ class GameProfile:
     # 120s covers that; the common case exits at ~70s and pays nothing.
     load_begin_ceiling: float = 120.0
 
-    # Does entering gameplay CHANGE the world's name?
+    # The world the title sits in BEFORE a save is loaded, by name.
     #
-    # inZOI goes OpeningLevel2 -> RedCity_Map, so "we left the menu's world" is
-    # the signal that the save is up. Stray has no separate menu world: by the
-    # time the engine layer resolves a UWorld at all, the pad has already cleared
-    # the title screen and the name is Slums_ZONE -- the level we came to
-    # capture. Waiting to leave it means waiting out the ceiling in the right
-    # place, then proceeding anyway.
+    # "Are we in gameplay?" was inferred twice and wrong both times. Latching the
+    # first world to resolve as the menu assumes the name appears before the load
+    # finishes; declaring that a title has no menu world assumes the opposite.
+    # Stray does both depending on timing -- ProcessEvent installs somewhere
+    # between t=40s and t=80s, the pad clears the title screen at t=10s, so the
+    # first name observed is HK_Project_MainStart on a fast resolve and
+    # Slums_ZONE on a slow one. Each observation produced a confident and
+    # opposite conclusion.
     #
-    # This cannot be inferred from the name, so the profile states it.
-    expects_level_change: bool = True
+    # Naming it removes the race entirely: in gameplay means a world resolved and
+    # it is not this one. No ordering assumption, no latch. Empty falls back to
+    # the latch for a title whose menu world is not yet known.
+    menu_world: str = ""
 
     # Some titles load paused and need an explicit unpause; some do not.
     settle_after_unpause: float = 60.0
@@ -224,6 +228,10 @@ INZOI = GameProfile(
     workdir=_INZOI_EXE.parent,
     launch_args="-dx12",
     steam_appid=2456740,
+    # Observed on every inZOI run: the menu is OpeningLevel2 and a loaded save
+    # is RedCity_Map. Naming it here means the load gate no longer depends on
+    # the level oracle resolving before the load starts.
+    menu_world="OpeningLevel2",
     to_load=(
         Step(0.0883, 0.2169, 2, "Continue"),
         Step(0.6926, 0.3631, 3, "first save slot"),
@@ -269,8 +277,8 @@ STRAY = GameProfile(
     # nobody validated, and it never worked. DEBUGGING.md 8.23.
     to_load=(PadStep(btn="A", times=8, ms=250, gap=0.9,
                      what="menu: A x8 on the virtual pad"),),
-    # No menu world to leave -- see expects_level_change.
-    expects_level_change=False,
+    # The start map, observed. Gameplay is Slums_ZONE.
+    menu_world="HK_Project_MainStart",
     after_load=(),
     menu_ceiling=90.0,
     load_ceiling=120.0,

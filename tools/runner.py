@@ -340,28 +340,28 @@ class Run:
             # signal that cannot arrive -- turning a fix for one game into
             # exactly this bug for the other.
             self.say(f"entering the world (attempt {attempt})")
-            if not p.expects_level_change:
-                # Nothing to leave, so the signal is simply that a world resolved
-                # at all. WAIT for it rather than sampling once: the name cannot
-                # appear until ProcessEvent installs, which waits on the object
-                # graph settling, so immediately after the pad presses it is
-                # always empty and a single check always says no.
-                self.say("no separate menu world on this title -- waiting for any world "
-                         f"to resolve (ceiling {p.load_begin_ceiling:.0f}s)")
-                deadline = time.monotonic() + p.load_begin_ceiling
+            if p.menu_world:
+                # The profile NAMES the world we start in, so gameplay is simply
+                # "a world resolved and it is not that one". No latch, and no
+                # assumption about whether the name appears before or after the
+                # load completes -- which is the race that produced two opposite
+                # wrong conclusions about Stray.
+                self.say(f"waiting to leave '{p.menu_world}' "
+                         f"(ceiling {p.load_begin_ceiling:.0f}s)")
+                t0 = time.monotonic()
                 level = ""
-                while time.monotonic() < deadline:
-                    H.ensure_live(self.pid, "world to resolve", self.say)
+                while time.monotonic() - t0 < p.load_begin_ceiling:
+                    H.ensure_live(self.pid, "the world to load", self.say)
                     level = H.current_level(LOG)
-                    if level:
+                    if level and level != p.menu_world:
                         break
+                    level = ""
                     time.sleep(2)
                 if level:
-                    self.say(f"in world '{level}' after "
-                             f"{p.load_begin_ceiling - (deadline - time.monotonic()):.0f}s")
+                    self.say(f"in world '{level}' after {time.monotonic() - t0:.0f}s")
                     entered = True
                     break
-                self.say("no world resolved within the ceiling -- retrying the route")
+                self.say(f"still in '{p.menu_world}' at the ceiling -- retrying the route")
             elif self.menu_level:
                 entered = bool(H.wait_for_level_change(
                     LOG, self.menu_level, p.load_begin_ceiling, self.pid, self.say))
@@ -433,11 +433,8 @@ class Run:
         # A screenshot caught the harness clicking the transport bar while a
         # LOADING SCREEN was still up -- tip text, spinner, no HUD at all. Every
         # resume click landed on nothing, which is why the sim was never running.
-        if self.p.expects_level_change:
-            H.wait_for_level_change(LOG, self.menu_level, 240, self.pid, self.say)
-        else:
-            self.say(f"in world '{H.current_level(LOG) or 'unnamed'}' -- no menu world to "
-                     f"leave on this title")
+        H.wait_for_level_change(LOG, self.p.menu_world or self.menu_level, 240,
+                                self.pid, self.say)
 
         if p.resume_key or p.transport_y:
             running = False
@@ -507,7 +504,12 @@ class Run:
         H.ensure_live(self.pid, "arming", self.say)
 
         level = H.current_level(LOG)
-        if level and self.menu_level and level == self.menu_level:
+        # Prefer the world the PROFILE names over the one we happened to latch:
+        # the latch can capture the gameplay world on a slow resolve, and then
+        # this check would compare gameplay against gameplay and refuse a good
+        # run -- or, worse, compare menu against nothing and arm in the menu.
+        menu = self.p.menu_world or self.menu_level
+        if level and menu and level == menu:
             self.say(f"REFUSING to arm: still in '{level}', the world we started in. "
                      f"Capturing here would fill the budget with menu frames and "
                      f"report success. Failing this attempt so the run can retry.")
