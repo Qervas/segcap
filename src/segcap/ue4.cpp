@@ -255,6 +255,11 @@ int32_t Engine::NumObjects() const {
     return objects_->NumElements;
 }
 
+// Defined below, next to the name decoder that first needed it. Declared here
+// because this function walks the SAME live object graph, on the game thread,
+// while the engine is destroying entries out of it -- see the long note there.
+static bool SafeCopy(void* dst, const void* src, size_t n) noexcept;
+
 bool Engine::GetObject(int32_t index, ObjectRef& out) const {
     if (!objects_ || index < 0 || index >= objects_->NumElements) return false;
 
@@ -262,11 +267,28 @@ bool Engine::GetObject(int32_t index, ObjectRef& out) const {
     const int32_t withinChunk = index % kElementsPerChunk;
     if (chunkIndex >= objects_->NumChunks) return false;
 
-    FUObjectItem* chunk = objects_->Objects[chunkIndex];
+    // EVERY READ BELOW IS GUARDED, because every one of them is a race.
+    //
+    // This walks the engine's live object array. A level transition destroys
+    // objects and frees chunks from the game's own threads while we are part way
+    // through, so a pointer that was valid at the top of this function can be
+    // freed memory by the middle of it. IsReadable cannot close that -- it is a
+    // VirtualQuery, an answer about the moment it was asked.
+    //
+    // It killed the game from two directions before this: FindNamePool during
+    // discovery, and here, reached from ProbeWorldState on the ProcessEvent
+    // detour, both as EXCEPTION_ACCESS_VIOLATION. Failing an object read is
+    // ordinary and already handled everywhere -- callers of GetObject treat
+    // false as "skip this index" -- so a torn read now returns false instead of
+    // taking the process down with it.
+    FUObjectItem* chunk = nullptr;
+    if (!SafeCopy(&chunk, &objects_->Objects[chunkIndex], sizeof(FUObjectItem*)) || !chunk)
+        return false;
     if (!IsReadable(chunk, sizeof(FUObjectItem) * static_cast<size_t>(withinChunk + 1)))
         return false;
 
-    const FUObjectItem& item = chunk[withinChunk];
+    FUObjectItem item{};
+    if (!SafeCopy(&item, &chunk[withinChunk], sizeof(item))) return false;
     if (!item.Object || !LooksLikeUObject(item.Object)) return false;
 
     auto* base = reinterpret_cast<uint8_t*>(item.Object);
@@ -276,14 +298,19 @@ bool Engine::GetObject(int32_t index, ObjectRef& out) const {
     // slots after GC. Pointer identity alone would silently merge two different
     // objects into one -- the exact failure the mask stream must not have.
     out.serialNumber = item.SerialNumber;
-    out.nameIndex = *reinterpret_cast<uint32_t*>(base + UObjectLayout::kNamePrivate);
+    if (!SafeCopy(&out.nameIndex, base + UObjectLayout::kNamePrivate, sizeof(out.nameIndex)))
+        return false;
     out.name = NameToString(out.nameIndex);
 
-    const auto klass = *reinterpret_cast<uintptr_t*>(base + UObjectLayout::kClassPrivate);
-    if (IsReadable(reinterpret_cast<void*>(klass), 0x30)) {
-        const auto classNameIndex = *reinterpret_cast<uint32_t*>(
-            reinterpret_cast<uint8_t*>(klass) + UObjectLayout::kNamePrivate);
-        out.className = NameToString(classNameIndex);
+    uintptr_t klass = 0;
+    if (!SafeCopy(&klass, base + UObjectLayout::kClassPrivate, sizeof(klass))) return false;
+    if (klass && IsReadable(reinterpret_cast<void*>(klass), 0x30)) {
+        uint32_t classNameIndex = 0;
+        if (SafeCopy(&classNameIndex,
+                     reinterpret_cast<uint8_t*>(klass) + UObjectLayout::kNamePrivate,
+                     sizeof(classNameIndex))) {
+            out.className = NameToString(classNameIndex);
+        }
     }
     return true;
 }
