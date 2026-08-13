@@ -1852,6 +1852,66 @@ The practical consequence: a run of attempts on a machine this deep into a
 launch-crash cycle cannot discriminate between hypotheses about our code, and
 should not be used to try. Reboot first.
 
+### 8.22 The right mechanism for the wrong problem
+
+A screenshot indoors showed the road and trees outside holding ids while a sofa
+in the room went unlabelled. The obvious reading: distant objects are stealing
+slots from the room, because `WasRecentlyRendered` is a visibility test with no
+notion of distance and a tree eighty metres away passes it as well as the chair
+the character sits on.
+
+So: a distance gate. `MarkBatch` refuses candidates beyond a radius of the
+character, `RefreshVisibility` hands back marked objects that drift past 1.25x
+it, anchored on the largest character on screen. It worked exactly as designed:
+
+```
+distance gate ACTIVE -- anchored on slot 206 at (94652, 70615, 3722), radius 3000
+220,176 candidates skipped as far, 86 marked objects handed back
+```
+
+Slot 206 is `SkeletalMeshComponentBudgeted / Hair` -- it found the Zoi, not the
+fallback. Eighty-six slots reclaimed from outside.
+
+And the masks got **worse**:
+
+```
+                      no radius      radius 3000
+ids per mask          mean 97        mean 67
+distinct per session  122            89
+largest single id     60% of frame   79%
+```
+
+Two things, and the second matters more than the first.
+
+**Unmarked is not blank, it is wrong.** An object that does not opt in writes
+nothing to CustomDepth, so it also does not occlude there -- whatever is behind
+it paints through its silhouette. The distant scenery visible through the
+apartment windows used to be labelled; now it falls through to the shell mesh,
+which is why the largest single id grew from 60% to 79%. Removing labels does
+not create holes, it enlarges other objects.
+
+**We were never slot-limited near the character.** The run held **113 live slots
+of 255**. Freeing 86 from the street left 142 idle, because only 113 markable
+primitives within 30m pass the gates at all. The road was not competing with the
+sofa for a slot; there was no competition. The hypothesis was wrong, and the fix
+that followed from it could not have helped no matter how well it worked.
+
+Caveat kept deliberately: the two runs are at different camera positions, so
+ids-per-frame is not a clean A/B. The 113-of-255 figure does not depend on that
+comparison, and it is the finding.
+
+Where it actually points: the per-pass line reads `invisible 39, already 6,
+stale 54 of 700 scanned`. Near candidates are being refused by
+`WasRecentlyRendered(0.3f)`, not by budget. An object briefly occluded when the
+scan reaches it fails that test and waits a full sweep -- tens of seconds -- for
+another chance. That is a much better explanation for one sofa than slot
+competition, and unlike the distance theory it is consistent with 142 slots
+sitting unused.
+
+The gate stays, off by default. It is a real mechanism against a real waste and
+it will matter outdoors where the budget genuinely is contended. It is simply
+not the answer to the question that prompted it.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have
