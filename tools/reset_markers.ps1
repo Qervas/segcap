@@ -59,8 +59,41 @@ $markers = @(
                           # list is only authoritative if things are added to it.
     "segcap.injectdry",   # observe render passes / barrier shapes, record nothing
     "segcap.inject",      # record copies into the game's own command lists
-    "segcap.introspect"   # reflection dump
+    "segcap.introspect",  # reflection dump
+    "segcap.captures",    # mask budget; runner.py writes it every run, but a run
+    "segcap.stride",      # that dies before prepare() still leaves both behind
+    "segcap.reprobe"      # discard id-probe rejections and restart discovery.
+                          # Self-deleting when consumed, so it only leaks if the
+                          # run dies before the next Present -- which is exactly
+                          # the run most likely to leave a mess.
 )
+
+# THE LIST IS NOW CHECKED, NOT TRUSTED.
+#
+# The docstring above says a per-script list cannot stay complete, and it was
+# right, so this file was made the single list. That did not fix it either:
+# captures, stride and reprobe were read by the DLL and missing from here, found
+# only because a build listing happened to show segcap.stride sitting on disk.
+# Seven markers have now drifted, and every fix was "remember harder next time".
+#
+# Remembering is not a mechanism. The DLL is the authority on which markers
+# exist, so ask it: every marker is read as a suffix literal, L".<name>", and
+# scanning for those takes milliseconds. If the source knows about one this list
+# does not, say so loudly -- with the line to paste.
+$srcDir = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) "src\segcap"
+if (Test-Path $srcDir) {
+    $found = Select-String -Path (Join-Path $srcDir "*.cpp") -Pattern 'L"\.([a-z0-9]+)"' -AllMatches |
+        ForEach-Object { $_.Matches } | ForEach-Object { "segcap." + $_.Groups[1].Value } |
+        Sort-Object -Unique
+    $missing = $found | Where-Object { $markers -notcontains $_ }
+    if ($missing) {
+        Write-Warning ("[markers] THIS LIST IS INCOMPLETE. The DLL reads these and they are " +
+                       "not cleared here, so they will outlive the run that wrote them and " +
+                       "silently configure the next one:")
+        foreach ($m in $missing) { Write-Warning ("    `"$m`",") }
+        Write-Warning "[markers] add them to the `$markers list in $($MyInvocation.MyCommand.Path)"
+    }
+}
 
 $cleared = @()
 foreach ($m in $markers) {
