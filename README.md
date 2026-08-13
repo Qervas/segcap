@@ -91,8 +91,10 @@ python tools\capture.py inzoi --preflight     # validate the flow, launch nothin
 
 Both titles now go through `capture.py`. A Stray run launches the game, clears
 the menu on a virtual Xbox pad, waits for `Slums_ZONE` to load and settle, arms
-only then, and holds — 401 masks and 401 sidecars on the first attempt, with the
-readback ring reporting `dropped=0`.
+only then, and holds — **401 masks, 400 paired colour frames and 401 sidecars**,
+with the readback ring reporting `dropped=0`. Masks and frames are selected by
+the same stride from the same clock, so they pair by index rather than by
+timestamp matching.
 
 **On Stray and `capture.py`.** This took three goes to get right and the story is
 in `docs/DEBUGGING.md` §8.23–8.25, because it is the most useful part. When the
