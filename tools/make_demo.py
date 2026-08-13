@@ -47,9 +47,16 @@ def find_ffmpeg():
     output at all, not even -version, which looks like a codec problem until you
     check the exit code. So candidates are probed by actually running them
     rather than by existence.
+
+    Search order comes from the environment rather than one machine's home
+    directory: SEGCAP_FFMPEG if set, then scoop's versioned layout under the
+    current user, then whatever is on PATH.
     """
     candidates = []
-    for base in (r"C:\Users\djmax\scoop\apps\ffmpeg",):
+    if os.environ.get("SEGCAP_FFMPEG"):
+        candidates.append(os.environ["SEGCAP_FFMPEG"])
+    home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    for base in (os.path.join(home, "scoop", "apps", "ffmpeg"),):
         if os.path.isdir(base):
             for ver in sorted(os.listdir(base), reverse=True):
                 candidates.append(os.path.join(base, ver, "bin", "ffmpeg.exe"))

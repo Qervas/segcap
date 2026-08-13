@@ -48,9 +48,14 @@ def _reexec_if_ctypes_broken() -> None:
         if os.environ.get("SEGCAP_NO_REEXEC"):
             raise
         base = Path(sys.executable).parent
-        # conda layout: envs/<name>/python.exe -> ../../python.exe is the base
+        # conda layout: envs/<name>/python.exe -> ../../python.exe is the base.
+        # sys.base_prefix is the stdlib's own answer for "the interpreter this
+        # env was made from", which covers venvs too. No machine-specific path.
         candidates = [base.parent.parent / "python.exe",
-                      Path(r"C:\Users\djmax\scoop\apps\miniconda3\current\python.exe")]
+                      Path(sys.base_prefix) / "python.exe",
+                      Path(sys.base_prefix) / "bin" / "python"]
+        if os.environ.get("SEGCAP_PYTHON"):
+            candidates.insert(0, Path(os.environ["SEGCAP_PYTHON"]))
         for cand in candidates:
             if not cand.exists() or cand.resolve() == Path(sys.executable).resolve():
                 continue
