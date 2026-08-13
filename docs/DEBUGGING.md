@@ -2025,6 +2025,76 @@ existence stood in for a fence's role. Each time the substitute was exactly
 correct when written, and each time something later made it silently wrong —
 because a proxy has no way to announce that it has stopped being a proxy.
 
+### 8.25 The same rewrite dropped a second capability, and I chased it for an evening
+
+With the readback fixed, Stray still sat at `HK_Project_MainStart`. The evidence
+was contradictory in a way that should have been a clue much earlier:
+
+- the game was **alive and rendering** — frame 4501 at t=86s, objects 196,013
+- the pad **worked**: `vpad.log` showed all 8 A presses served, and the ack file
+  read `8`. Every press was delivered and acknowledged.
+- the game **ignored all of them**
+
+I started down the list — pad protocol, button mapping, menu timing — which is
+the same list as the last three times the cat did not move. What settled it was
+one line, and it should have been the first thing printed:
+
+```
+input desktop : Screen-saver
+foreground hwnd: 0
+```
+
+After the idle timeout Windows starts the screensaver, and that switches the
+**input desktop** from `Default` to `Screen-saver`. Our process stays on
+`Default`, where `GetForegroundWindow` now correctly returns 0 — there is
+genuinely no foreground window there any more. The game is not focused, so it
+ignores the pad. No window can be focused. `CopyFromScreen` fails with "The
+handle is invalid", so even the screenshot — this project's most reliable
+instrument — goes dark exactly when it is needed.
+
+**This was already solved.** `tools/legacy/run_auto.ps1` suppressed sleep,
+disabled the screensaver for the run, killed an already-running one, and printed
+the desktop name. Its comment calls it "THE fix for the failure that cost the
+most runs in this project". The Python harness that replaced it carried none of
+it, and I spent an evening rediscovering it with worse tools.
+
+That is the **second** capability the PowerShell→Python consolidation dropped in
+silence. §8.23 was the first — the pad route itself. The lesson recorded there
+was that a rewrite unifying two things has to enumerate what each one did. I did
+not do that then, and I had not done it since, so the same rewrite billed me
+twice.
+
+It is also invisible by construction: a run you sit and watch never goes idle.
+Every failure of this kind happens only when nobody is looking, which is the
+condition the brief actually asks for — *"it can't be done by a human in the
+future for production, right?"* The bug and the requirement occupy the same
+space exactly.
+
+`harness.keep_awake()` now does it: `SetThreadExecutionState` with
+`ES_CONTINUOUS`, the screensaver setting saved and restored, an active one
+dismissed, and the desktop name logged at the top of every run — including
+`--preflight`, since it is machine state and preflight is supposed to walk the
+same route, not a shorter one.
+
+One detail worth keeping, because the obvious fix does not work: **you cannot
+nudge the mouse to dismiss it.** `mouse_event` and `SendInput` are scoped to the
+calling process's desktop, and we are on `Default` while input goes to
+`Screen-saver` — unreachable by definition. I wrote the nudge first, and it
+reported honestly that the desktop had not changed, which is the only reason the
+next attempt was a better one rather than a confident wrong claim. The
+screensaver is an ordinary process; ending it returns input to `Default`. It is
+matched on the `.scr` extension rather than by name, because which one runs is a
+user setting.
+
+And a smaller leak found on the way, by an error that had nothing to do with it:
+`build.ps1 -Clean` failed with *"Access to the path
+'build\bin\vpad.exe' is denied"*. A live `vpad.exe` was holding it — the runner
+started the pad server every run and never stopped it, so one survived every run
+on this machine. It was invisible from inside a run, because the *next* run's
+`prepare()` kills it; it only showed between runs. It is now stopped in a
+`finally`, since a run that ends by exception is exactly the run that leaves
+things running.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have

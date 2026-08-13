@@ -634,6 +634,23 @@ class Run:
             if not self.preflight:
                 return 1
             self.say("(preflight) continuing anyway -- run .\\build.ps1 before a real run")
+        # BEFORE ANYTHING ELSE, AND BEFORE THE GAME EXISTS.
+        #
+        # An idle machine starts the screensaver, which moves the input desktop
+        # away from "Default", and from there nothing can be focused and no input
+        # reaches the game -- see harness.keep_awake. This has to happen before
+        # the launch, because a run that STARTS on the Screen-saver desktop never
+        # gets a foreground window at all.
+        #
+        # In preflight too: it is machine state, it is cheap, and preflight is
+        # supposed to walk the same route rather than a shorter one.
+        saver_was_on = H.keep_awake(self.say)
+        try:
+            return self._go()
+        finally:
+            H.restore_screensaver(saver_was_on, self.say)
+
+    def _go(self) -> int:
         self.prepare()
         if not self.launch():
             return 1
@@ -646,5 +663,27 @@ class Run:
         except (H.GameGone, H.GameFrozen) as exc:
             self.say(f"STOPPED: {exc}")
             self.died = True
+        finally:
+            # THE RUN STARTED THE PAD SERVER, SO THE RUN ENDS IT.
+            #
+            # It never did, and vpad.exe outlived every run on this machine.
+            # The next run's prepare() kills it, so inside a run the leak is
+            # invisible -- it only shows up between them, and what it broke was
+            # `build.ps1 -Clean`: a live vpad.exe holds build\bin\vpad.exe open,
+            # Remove-Item fails with "Access to the path is denied", and the
+            # clean build dies before compiling anything.
+            #
+            # In a finally, because a run that ends by exception is exactly the
+            # run that leaves things running. The GAME is deliberately NOT killed
+            # here: a finished capture is often worth looking at on screen.
+            self.stop_pad()
         self.report()
         return 0
+
+    def stop_pad(self) -> None:
+        """Shut down the virtual pad server this run launched."""
+        if self.preflight:
+            return
+        if H.find_pid("vpad.exe"):
+            H.kill_all(["vpad.exe"])
+            self.say("vpad: virtual pad server stopped")

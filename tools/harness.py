@@ -74,6 +74,129 @@ def _ft(f: FILETIME) -> int:
     return (f.dwHighDateTime << 32) | f.dwLowDateTime
 
 
+# --- keeping the session awake -----------------------------------------------
+#
+# THE SINGLE LARGEST CAUSE OF "IT WORKED WHEN I WATCHED IT".
+#
+# After the idle timeout Windows starts the screensaver, and that switches the
+# INPUT DESKTOP from "Default" to "Screen-saver". On that desktop the game is not
+# the foreground window -- there is no foreground window, GetForegroundWindow
+# returns 0 -- so it ignores pad and keyboard input, no window can be focused,
+# and CopyFromScreen fails with "The handle is invalid". Every symptom is a lie
+# about a different subsystem: the pad looks broken (vpad acks all 8 presses and
+# the cat does not move), the click looks broken, the screenshot looks broken.
+#
+# `tools/legacy/run_auto.ps1` handled all of this. The Python harness that
+# replaced it did not, and nobody noticed, because a run you sit and watch never
+# goes idle. It cost a full evening: a Stray run sat at HK_Project_MainStart with
+# all 8 A presses delivered and acknowledged, and I went looking at the readback,
+# the DLL and the pad protocol before printing one desktop name.
+#
+# That is the SECOND capability the PowerShell -> Python consolidation dropped in
+# silence; DEBUGGING.md 8.23 is the first. The lesson there was that a rewrite
+# unifying two things has to enumerate what each one did. This is what not doing
+# that costs the second time.
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+SPI_GETSCREENSAVEACTIVE = 0x0010
+SPI_SETSCREENSAVEACTIVE = 0x0011
+SPIF_SENDCHANGE = 0x0002
+DESKTOP_READOBJECTS = 0x0001
+UOI_NAME = 2
+
+
+def input_desktop() -> str:
+    """Name of the desktop currently receiving input.
+
+    "Default" is the normal one. "Screen-saver" means the screensaver is up.
+    Unopenable means the session is locked, which is a different problem with the
+    same symptoms -- print this before theorising about anything else.
+    """
+    h = user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS)
+    if not h:
+        return "<unopenable -- the session is LOCKED>"
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        need = wt.DWORD()
+        if not user32.GetUserObjectInformationW(h, UOI_NAME, buf,
+                                                ctypes.sizeof(buf), ctypes.byref(need)):
+            return "<unknown>"
+        return buf.value
+    finally:
+        user32.CloseDesktop(h)
+
+
+def keep_awake(log: Callable[[str], None] | None = None) -> bool:
+    """Suppress sleep, display-off and the screensaver for this process's life.
+
+    Returns whether the screensaver had been enabled, so the caller can restore
+    the user's setting afterwards -- this changes a machine-wide preference and
+    leaving it off would be rude.
+
+    ES_CONTINUOUS makes the request stick to the thread rather than being a
+    one-shot nudge; without it the state lapses and the timeout resumes.
+    """
+    kernel32.SetThreadExecutionState(
+        ctypes.c_uint(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED))
+
+    was_on = wt.BOOL()
+    user32.SystemParametersInfoW(SPI_GETSCREENSAVEACTIVE, 0, ctypes.byref(was_on), 0)
+    if was_on.value:
+        user32.SystemParametersInfoW(SPI_SETSCREENSAVEACTIVE, False, None, SPIF_SENDCHANGE)
+
+    if log:
+        log(f"sleep suppressed; screensaver was "
+            f"{'ON -- disabled for this run' if was_on.value else 'already off'}")
+
+    # ALREADY RUNNING IS THE CASE THAT MATTERS. Disabling the screensaver does
+    # not dismiss one that is already up, and a run launched onto the
+    # "Screen-saver" desktop fails at the first focus with no explanation.
+    desk = input_desktop()
+    if desk != "Default":
+        if log:
+            log(f"input desktop is '{desk}' -- dismissing")
+        # KILL THE PROCESS; DO NOT SEND IT INPUT.
+        #
+        # The obvious move is a mouse nudge, and it does nothing: mouse_event and
+        # SendInput are scoped to the desktop of the CALLING process, and we are
+        # on "Default" while input is going to "Screen-saver". We cannot reach it
+        # by definition. I wrote the nudge first and it reported, correctly, that
+        # the desktop had not changed.
+        #
+        # The screensaver is an ordinary process, though, and ending it returns
+        # input to Default. Matched by the .scr extension rather than a name,
+        # because which one runs is a user setting (here: scrnsave.scr).
+        for image in _screensaver_images():
+            subprocess.run(["taskkill", "/F", "/IM", image],
+                           capture_output=True, text=True)
+        time.sleep(2.0)
+        desk = input_desktop()
+        if log:
+            log(f"input desktop now '{desk}'"
+                + ("" if desk == "Default" else
+                   " -- STILL NOT Default. If the session is LOCKED, only you can "
+                   "unlock it: no window can be focused and no input can reach the "
+                   "game until you do."))
+    return bool(was_on.value)
+
+
+def _screensaver_images() -> list[str]:
+    """Image names of running screensavers (anything ending .scr)."""
+    out = subprocess.run(["tasklist", "/NH", "/FO", "CSV"],
+                         capture_output=True, text=True).stdout
+    return sorted({m.group(1) for m in re.finditer(r'^"([^"]+\.scr)"', out, re.M | re.I)})
+
+
+def restore_screensaver(was_on: bool, log: Callable[[str], None] | None = None) -> None:
+    """Put the user's screensaver preference back."""
+    kernel32.SetThreadExecutionState(ctypes.c_uint(ES_CONTINUOUS))
+    if was_on:
+        user32.SystemParametersInfoW(SPI_SETSCREENSAVEACTIVE, True, None, SPIF_SENDCHANGE)
+        if log:
+            log("screensaver setting restored")
+
+
 def find_pid(image: str) -> int | None:
     """First pid whose image name matches, via tasklist (no psutil dependency)."""
     out = subprocess.run(
