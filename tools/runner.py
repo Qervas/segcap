@@ -543,7 +543,23 @@ class Run:
                     break
             else:
                 stalled = 0
-            if self.o.walk:
+            if self.o.walk and self.p.pad_walk:
+                # Walk on the pad directly rather than shelling out to act.ps1
+                # per nudge. Each of those spawned a PowerShell, took a
+                # screenshot and held the stick for 2.5s, so the subject moved
+                # in bursts separated by a second of nothing -- and any failure
+                # was swallowed by capture_output=True, which is how a stick
+                # command that threw on EVERY call went unnoticed.
+                #
+                # Forward most of the time with a periodic turn, so the camera
+                # sees new geometry instead of pacing one corridor. The masks are
+                # only as interesting as what is in frame.
+                turn = (step % 4 == 3)
+                H.pad_send(BIN / "vpad_cmd.txt",
+                           ly=28000 if not turn else 12000,
+                           rx=22000 if turn else 0,
+                           ms=2200)
+            elif self.o.walk:
                 # OFF by default. Motion makes UE stream, streaming churns the
                 # object graph, and that churn destroys the marked slots the mask
                 # is built from -- we were destabilising the state we were trying

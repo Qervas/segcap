@@ -152,6 +152,10 @@ class GameProfile:
     # Split at the load boundary: everything before the world streams in, and
     # everything after. The runner waits for the world between them, so a title
     # that loads instantly and one that takes three minutes share the same code.
+    # Drive movement with the virtual pad rather than keyboard/mouse. Required
+    # for any title that ignores SendInput, which is how Stray behaves.
+    pad_walk: bool = False
+
     # A route may mix mouse clicks and pad presses; some titles accept only one.
     to_load: tuple[Step | PadStep, ...] = ()
     after_load: tuple[Step | PadStep, ...] = ()
@@ -299,6 +303,8 @@ STRAY = GameProfile(
     # ~175k at the menu, 320k+ in a level. 120k clears boot without needing a
     # population Stray never reaches before a save is loaded.
     object_plateau=120_000,
+    # Stray discards SendInput, so the cat only moves on the pad.
+    pad_walk=True,
     after_load=(),
     menu_ceiling=90.0,
     load_ceiling=120.0,

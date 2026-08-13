@@ -234,10 +234,21 @@ if ($Btn -or $Lx -or $Ly -or $Rx -or $Ry -or $Lt -or $Rt) {
     if (Test-Path $ackPath) { $seq = [int]((Get-Content $ackPath -Raw).Trim()) + 1 }
     $line = "seq=$seq lx=$Lx ly=$Ly rx=$Rx ry=$Ry lt=$Lt rt=$Rt btn=$(if($Btn){$Btn}else{'-'}) ms=$Ms"
     # Write-then-rename so the server never reads a half-written line.
-    # Move-Item -Force still throws if the destination exists on some hosts;
-    # File.Move with overwrite:true is the one that actually replaces.
+    #
+    # NOT File.Move(src, dst, overwrite). That three-argument overload arrived in
+    # .NET Core 3.0, and this script is run by Windows PowerShell 5.1, which is
+    # .NET Framework -- so it threw "Cannot find an overload for Move and the
+    # argument count 3" on EVERY call. Every stick command and every button press
+    # act.ps1 ever sent failed at this line, and the walk loop passed
+    # capture_output=True, so the exception went nowhere. The cat never moved,
+    # and nothing said why.
+    #
+    # Remove-then-move works on 5.1. The instant where the file is absent is
+    # harmless: vpad simply fails to open it and retries on its next poll, which
+    # is the same tolerance that makes a torn read safe.
     Set-Content -Path "$Cmd.tmp" -Value $line -NoNewline
-    [System.IO.File]::Move((Resolve-Path "$Cmd.tmp").Path, (Join-Path (Get-Location) $Cmd), $true)
+    Remove-Item -LiteralPath $Cmd -Force -ErrorAction SilentlyContinue
+    Move-Item -LiteralPath "$Cmd.tmp" -Destination $Cmd -Force
     Write-Host "sent: $line"
 
     $acked = $false
