@@ -8,6 +8,7 @@ fix for every title rather than for whichever script you happened to edit.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -711,9 +712,41 @@ class Run:
         return 0
 
     def stop_pad(self) -> None:
-        """Shut down the virtual pad server this run launched."""
+        """Shut down the virtual pad server this run launched, ASKING FIRST.
+
+        vpad drives ViGEmBus, which is a KERNEL-MODE driver. taskkill /F takes
+        its client process away mid-operation and never lets vpad reach its own
+        Disconnect() -- the virtual pad is released by the driver cleaning up
+        after a dead process instead of by us handing it back.
+
+        That is the only kernel-mode component this project puts in its loop, and
+        this machine took three unexpected reboots in one evening of runs, one of
+        them a bugcheck 0x50 (PAGE_FAULT_IN_NONPAGED_AREA). No user-mode code can
+        cause that directly; a kernel driver can. Nothing here proves ViGEmBus
+        was the one -- there was no minidump and no TDR, so the driver is not
+        named -- but force-killing the client of a kernel driver on every single
+        run is a bad habit whether or not it is THIS bug.
+
+        vpad has always supported `seq=-1` as "exit" (vpad.cpp: "serve: exit
+        requested"). It was simply never used. So: ask, wait, and only force it
+        if it does not go.
+        """
         if self.preflight:
             return
-        if H.find_pid("vpad.exe"):
-            H.kill_all(["vpad.exe"])
-            self.say("vpad: virtual pad server stopped")
+        if not H.find_pid("vpad.exe"):
+            return
+        cmd = BIN / "vpad_cmd.txt"
+        try:
+            tmp = cmd.with_suffix(".txt.quit")
+            tmp.write_text("seq=-1 lx=0 ly=0 rx=0 ry=0 ms=0 btn=\n")
+            os.replace(tmp, cmd)          # atomic, so vpad never reads half a line
+        except OSError as exc:
+            self.say(f"vpad: could not write the quit command ({exc})")
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if not H.find_pid("vpad.exe"):
+                self.say("vpad: exited cleanly (pad handed back to ViGEmBus)")
+                return
+            time.sleep(0.2)
+        H.kill_all(["vpad.exe"])
+        self.say("vpad: did not exit on request within 3s -- forced")
