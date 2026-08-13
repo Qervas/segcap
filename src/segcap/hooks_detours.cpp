@@ -80,8 +80,24 @@ void STDMETHODCALLTYPE Hooks::ExecuteCommandLists_(ID3D12CommandQueue* self, UIN
     //
     // When nothing is outstanding -- always in dry run, and most frames
     // otherwise -- the cost is now one relaxed load.
-    if (h.foreignInject_ && lists && count &&
-        h.outstandingTokens_.load(std::memory_order_relaxed) != 0) {
+    // GATED ON "IS ANYTHING OUTSTANDING", NOT ON THE INJECT MODE.
+    //
+    // `h.foreignInject_ &&` used to lead this condition, and it is both
+    // redundant and wrong. Redundant because outstandingTokens_ is only ever
+    // non-zero if something was recorded, which is the cheap early-out this
+    // condition already relies on -- the comment above says as much. Wrong
+    // because the COLOUR path records tokens on every title, --inject or not,
+    // so on a run without it the tokens were recorded, counted, and never
+    // claimed: NotifySubmitted was never reached, the ring's slots stayed
+    // `recorded` for ever, and after three of them RecordInto had nothing left
+    // to hand out.
+    //
+    // Fourth place the same mode flag had leaked -- the barrier gate, the drain,
+    // the frame clock, and now the submit claim. Each was a one-line condition
+    // that looked local and correct. What they add up to is a feature flag
+    // wired into four unrelated mechanisms, three of which have nothing to do
+    // with the feature.
+    if (lists && count && h.outstandingTokens_.load(std::memory_order_relaxed) != 0) {
         std::lock_guard<std::mutex> lock(h.listMutex_);
         for (UINT i = 0; i < count && claimedCount < 8; ++i) {
             auto it = h.listState_.find(reinterpret_cast<ID3D12GraphicsCommandList*>(lists[i]));
@@ -222,24 +238,36 @@ void STDMETHODCALLTYPE Hooks::ResourceBarrier_(ID3D12GraphicsCommandList* self, 
                         b.Transition.Subresource, static_cast<unsigned>(b.Flags));
             }
 
-            // ANY write state -> PRESENT, not specifically RENDER_TARGET.
+            // ANY state -> PRESENT on a registered backbuffer. The state it came
+            // FROM does not matter, and testing it was wrong twice.
             //
-            // I matched RENDER_TARGET and nothing ever fired. The barriers this
-            // game actually issues are StateBefore=0x400 -> StateAfter=0x0, and
-            // 0x400 is COPY_DEST -- RENDER_TARGET is 0x4. inZOI writes its final
-            // image to the backbuffer with a COPY (the DLSS upscale blit), never
-            // by rendering into it, so the transition I was waiting for does not
-            // exist on this title. Reusing the same write-state set the mask path
-            // uses makes this title-agnostic instead of a second guess.
+            // First I matched RENDER_TARGET and nothing ever fired: inZOI issues
+            // StateBefore=0x400 (COPY_DEST), because it writes its final image to
+            // the backbuffer with the DLSS upscale blit rather than rendering
+            // into it. So I widened the test to the mask path's write-state set,
+            // which fixed inZOI and looked title-agnostic.
+            //
+            // It was not. Stray goes 0x4 -> 0xC0 -> 0x0: it renders into the
+            // backbuffer, transitions it to SHADER_RESOURCE (0x40|0x80) for the
+            // final composite, and presents from there. StateBefore is a READ
+            // state, the write-state test refuses, and Stray captured masks with
+            // no colour frames to pair them with -- one lone copy at t=159, after
+            // the hold had already ended.
+            //
+            // The write-state rule is inherited from the mask path, where it is
+            // load-bearing: an intermediate render target transitions many times
+            // per frame, and copying as it goes INTO a write state captures the
+            // previous frame or an undefined transient. None of that applies
+            // here. A backbuffer transitioning to PRESENT is finished BY
+            // DEFINITION -- PRESENT means "about to be shown on screen" -- so its
+            // contents are the completed frame no matter which state produced
+            // them. Testing StateBefore was answering a question that only the
+            // mask path asks.
             //
             // PRESENT is 0, so StateAfter must be tested for equality; masking
             // against it is vacuously true and hides exactly this kind of error.
             if (wantColour && !colourInject && b.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE &&
                 b.Transition.StateAfter == D3D12_RESOURCE_STATE_PRESENT &&
-                (b.Transition.StateBefore & (D3D12_RESOURCE_STATE_RENDER_TARGET |
-                                             D3D12_RESOURCE_STATE_COPY_DEST |
-                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
-                                             D3D12_RESOURCE_STATE_RESOLVE_DEST)) != 0 &&
                 h.IsBackBuffer(b.Transition.pResource)) {
                 colourInject = true;
                 colourBack = b.Transition.pResource;

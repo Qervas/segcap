@@ -2095,6 +2095,72 @@ on this machine. It was invisible from inside a run, because the *next* run's
 `finally`, since a run that ends by exception is exactly the run that leaves
 things running.
 
+### 8.26 A ring filled on one condition and drained on another
+
+With the readback fixed and the menu cleared, Stray captured 401 masks and zero
+colour frames. The archive step said so plainly — *"masks but NO colour frames —
+overlays will have nothing to blend onto"* — which is exactly the honest
+instrument this file keeps asking for, and it was still two bugs deep.
+
+**First: the gate demanded a write state.** The colour copy fires on a backbuffer
+transitioning to `PRESENT`, and it also required `StateBefore` to be one of
+`RENDER_TARGET`/`COPY_DEST`/`UNORDERED_ACCESS`/`RESOLVE_DEST`. Stray goes
+`0x4 → 0xC0 → 0x0`: it renders into the backbuffer, transitions it to
+`SHADER_RESOURCE` for the final composite, and presents from there. `0xC0` is a
+*read* state, so the gate refused all through gameplay and fired exactly once, at
+t=159, after the hold had ended.
+
+That test had already been widened once — from `RENDER_TARGET` only to the whole
+write set, because inZOI blits its DLSS output in with a `COPY_DEST`. Widening it
+fixed inZOI and looked title-agnostic. It was not; it was one more title.
+
+The rule itself is imported from the mask path, where it is load-bearing: an
+intermediate render target transitions many times a frame, and copying as it goes
+*into* a write state captures the previous frame or an undefined transient. None
+of that is true here. **A backbuffer transitioning to `PRESENT` is finished by
+definition** — that is what `PRESENT` means — so its contents are the completed
+frame regardless of which state produced them. `StateBefore` was answering a
+question only the other path asks.
+
+Fixing the gate produced copies at t+16ms after arming instead of t=159. It also
+produced zero frames, because behind it were **three more** conditions, each
+found only by fixing the one in front of it. All three are the same mistake:
+
+| # | where | what it said | what happened without `--inject` |
+|---|---|---|---|
+| 1 | barrier gate | `StateBefore` must be a write state | never fired during gameplay |
+| 2 | `OnPresent` | `Drain()` inside `if (foreignInject_)` | copies landed, nobody collected them |
+| 3 | `OnPresent` | `injectFrame_.store()` inside the same block | every copy stamped frame **0**, so the stride test `% 8 == 1` rejected all of them |
+| 4 | `ExecuteCommandLists` | claim loop led by `h.foreignInject_ &&` | tokens recorded and never submitted; slots stuck `recorded` for ever |
+
+Colour copies are recorded whenever `colourInjectArmed_` is set — `foreignInject_`
+appears nowhere in that decision. inZOI always runs `--inject`, so the two
+conditions coincide there and everything works. Stray does not, so the producer
+ran and the consumer, the clock, and the submit claim all sat behind a flag that
+was off.
+
+Number 2 is the same failure as §8.24 in a different ring, found by the same
+tell — a `submitted` counter frozen at `kRingDepth`. Number 4 is the same failure
+one stage earlier. Number 3 is not a ring bug at all; it is a *clock* that only
+ticked in one mode, which is how a working ring delivers frames the writer then
+throws away.
+
+Each of the four is a one-line condition that reads as local and correct where it
+sits. Together they are a feature flag wired into four unrelated mechanisms —
+three of which have nothing to do with the feature. That is the actual defect,
+and it is invisible from any single line.
+
+Two rules, both cheap to check and both violated here:
+
+> **A ring's fill condition and its drain condition must be the same condition.**
+> Any difference between them is a leak with no error message — the producer
+> succeeds, the consumer is never called, and the counters look like throughput
+> right up until they stop.
+
+> **A mode flag may gate the mode's own work and nothing else.** When it starts
+> gating shared machinery — a clock, a submit path, a drain — every other user of
+> that machinery silently inherits the mode.
+
 ### 8.27 The most frequent crash in the archive, never once diagnosed
 
 Attempt 1 of the next run died with *"game exited before: the world to load"*.

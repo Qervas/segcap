@@ -145,8 +145,23 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
     DrainInfoQueue();
 
     readback_.Drain([this](const MaskFrame& f) { OnMaskReady(f); });
+
+    // WHICH FRAME IS THIS -- a fact about the swapchain, not about a mode.
+    //
+    // This was stored inside the `foreignInject_` block below, and the COLOUR
+    // path reads it (hooks_detours.cpp) on every title, --inject or not. So on a
+    // run without --inject it stayed 0 for the entire process, every colour copy
+    // was stamped frame 0, and OnColourReady's stride test -- `frameIndex %
+    // captureStride == 1` -- rejected all of them. 213 masks, zero frames, and a
+    // colour ring that was recording and delivering perfectly the whole time.
+    //
+    // Third bug in one chain, and the third instance of one shape: state
+    // maintained under one condition and consumed under another. The gate, the
+    // drain, and now the clock. Each looked local; together they are a mode flag
+    // that leaked into three places it did not belong.
+    injectFrame_.store(frameIndex_, std::memory_order_relaxed);
+
     if (foreignInject_) {
-        injectFrame_.store(frameIndex_, std::memory_order_relaxed);
         // One ring serves both phases. While the probe is still deciding which
         // buffer carries our ids, completed copies go to the channel test; once
         // a buffer is proven, the same ring feeds the mask writer.
@@ -159,9 +174,29 @@ void Hooks::OnPresent(IDXGISwapChain3* swapChain) {
         // being submitted; without reclaiming, the ring starves to nothing and
         // capture stops with no error anywhere.
         maskInjectRing_.ReclaimStaleRecordings(frameIndex_, 240);
-        colourInjectRing_.Drain([this](const MaskFrame& f) { OnColourReady(f); });
-        colourInjectRing_.ReclaimStaleRecordings(frameIndex_, 240);
     }
+
+    // DRAINED UNCONDITIONALLY, because it is FILLED unconditionally.
+    //
+    // This used to live inside the `foreignInject_` block above, and colour
+    // copies are not gated on that flag -- they are recorded whenever
+    // colourInjectArmed_ is set, from the barrier hook, on any title. So a run
+    // without --inject recorded colour copies into the game's command lists,
+    // submitted them, and then never collected one: the ring filled, and every
+    // frame after the third was dropped for want of a slot.
+    //
+    // Stray is that run. It captured 401 masks and zero colour frames, which
+    // reads as "colour capture is broken" when in fact the copies were landing
+    // perfectly and nobody was picking them up. The mask ring above had exactly
+    // this bug and was fixed by moving its Drain out of a conditional; this is
+    // the same fix on the other ring, found the same way -- a submitted counter
+    // that stops at kRingDepth.
+    //
+    // The rule both cases point at: a ring's fill condition and its drain
+    // condition must be the SAME condition, or the difference between them is a
+    // leak with no error message.
+    colourInjectRing_.Drain([this](const MaskFrame& f) { OnColourReady(f); });
+    colourInjectRing_.ReclaimStaleRecordings(frameIndex_, 240);
 
     // Election runs every frame too. It is cheap (a handful of targets) and the
     // elected target can legitimately change -- resolution changes, or a pass
