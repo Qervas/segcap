@@ -162,6 +162,8 @@ class Run:
                     "INJECT ARMED -- copies recorded into the game's own lists")
         self.marker("segcap.idbuf", (o.idbuf or o.inject) and not census,
                     "ID-BUFFER PROBE on")
+        self.marker("segcap.nocolour", getattr(o, "no_colour", False),
+                    "COLOUR CAPTURE OFF -- masks only, no paired frames")
         self.marker("segcap.groundtruth", getattr(o, "groundtruth", False) and not census,
                     "GROUND-TRUTH INTERVENTION on -- one slot gets unmarked mid-run")
         # OWN THESE, do not inherit them.

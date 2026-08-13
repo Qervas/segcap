@@ -86,6 +86,10 @@ def main() -> int:
     ap.add_argument("--idbuf", action="store_true", help="id-buffer probe (implied by --inject)")
     ap.add_argument("--d3d-debug", action="store_true", help="D3D12 validation layer; slow")
     ap.add_argument("--no-mark", action="store_true", help="read-only; no CustomDepth writes")
+    ap.add_argument("--no-colour", "--no-color", dest="no_colour", action="store_true",
+                    help="skip backbuffer colour capture. Masks only, no paired frames. "
+                         "The colour ring drains on the same Present as the mask ring, so "
+                         "this isolates one from the other")
     ap.add_argument("--control", "--census", dest="census", action="store_true",
                     help="CONTROL RUN. No GPU work of any kind (no readback, no injected "
                          "copies, no colour) and no marking, but otherwise an ordinary "

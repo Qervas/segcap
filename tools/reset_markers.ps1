@@ -51,6 +51,7 @@ $markers = @(
     "segcap.groundtruth", # unmark one slot mid-run and check its pixels vanish
     "segcap.radius",      # only mark objects within N units of the character
     "segcap.plateau",     # object count that means "engine up", per title
+    "segcap.nocolour",    # skip backbuffer colour capture entirely
     "segcap.injectdry",   # observe render passes / barrier shapes, record nothing
     "segcap.inject",      # record copies into the game's own command lists
     "segcap.introspect"   # reflection dump
