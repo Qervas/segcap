@@ -288,11 +288,52 @@ bool Engine::GetObject(int32_t index, ObjectRef& out) const {
     return true;
 }
 
+// IsReadable IS A QUESTION ABOUT THE PAST.
+//
+// It is a VirtualQuery, and it answers truthfully about the moment it was
+// asked. Between that answer and the dereference the game can free the region,
+// change its protection, or unmap the whole reservation -- and during a level
+// transition it does all three, constantly, on another thread. Then a read that
+// was checked faults anyway, and because it is an access violation on OUR thread
+// it takes the whole game down.
+//
+// That is not theoretical. It is the most frequent crash in this project's whole
+// archive: EXCEPTION_ACCESS_VIOLATION with segcap on the stack in 6 of Stray's
+// last 8 crash reports, going back to 08-09, and it was never diagnosed because
+// UE writes <CallStack></CallStack> and puts the real frames in <PCallStack> as
+// bare `segcap + 0x20b61` offsets. Resolved against the PDB they read:
+//
+//     FindNamePool   ue4.cpp:350
+//     Discover       ue4.cpp:1051
+//     DiscoverThread dllmain.cpp:572
+//
+// No length check fixes this, and the ones here were already correct. The read
+// is racing a memory map we do not own and cannot lock.
+//
+// So the fault is caught instead of avoided. For a HEURISTIC SCAN that is not a
+// workaround, it is the right semantics: this code is guessing at addresses on
+// purpose, most guesses are wrong, and "that address went away while I was
+// reading it" belongs in the same bucket as "those bytes were not a name" --
+// skip the candidate and keep scanning. Only a scan that expected to be right
+// would treat it as fatal.
+//
+// Its own function because MSVC forbids __try in a function that needs C++
+// object unwinding, and the decoder below owns a std::string.
+static bool SafeCopy(void* dst, const void* src, size_t n) noexcept {
+    __try {
+        memcpy(dst, src, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // Decodes an FNameEntry at `entry` into text. Returns false if the header does
 // not describe a plausible name, which is also how candidate validation works.
 static bool DecodeNameEntry(const uint8_t* entry, std::string& out) {
     if (!IsReadable(entry, 2)) return false;
-    const uint16_t header = *reinterpret_cast<const uint16_t*>(entry);
+    uint16_t header = 0;
+    if (!SafeCopy(&header, entry, sizeof header)) return false;
     const uint32_t len = header >> kNameLenShift;
     const bool wide = (header & 1) != 0;
 
@@ -303,13 +344,19 @@ static bool DecodeNameEntry(const uint8_t* entry, std::string& out) {
     const size_t bytes = wide ? len * 2 : len;
     if (!IsReadable(entry + 2, bytes)) return false;
 
+    // Copy first, decode from the copy. Decoding in place would put a dozen
+    // more unguarded dereferences in the loop below, each with the same race.
+    uint8_t buf[1024 * sizeof(wchar_t)];
+    if (bytes > sizeof(buf)) return false;
+    if (!SafeCopy(buf, entry + 2, bytes)) return false;
+
     out.clear();
     out.reserve(len);
     if (wide) {
-        const auto* w = reinterpret_cast<const wchar_t*>(entry + 2);
+        const auto* w = reinterpret_cast<const wchar_t*>(buf);
         for (uint32_t i = 0; i < len; ++i) out.push_back(static_cast<char>(w[i] & 0x7F));
     } else {
-        const auto* a = reinterpret_cast<const char*>(entry + 2);
+        const auto* a = reinterpret_cast<const char*>(buf);
         for (uint32_t i = 0; i < len; ++i) {
             const char c = a[i];
             // Names are identifiers and paths; a control byte means we are not

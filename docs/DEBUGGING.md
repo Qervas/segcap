@@ -2095,6 +2095,81 @@ on this machine. It was invisible from inside a run, because the *next* run's
 `finally`, since a run that ends by exception is exactly the run that leaves
 things running.
 
+### 8.27 The most frequent crash in the archive, never once diagnosed
+
+Attempt 1 of the next run died with *"game exited before: the world to load"*.
+Stray writes its own crash report, and this project's rule is to read it before
+touching anything:
+
+```
+Unhandled Exception: EXCEPTION_ACCESS_VIOLATION reading address 0x0000014700000143
+```
+
+Then a survey, which is the part I should have run weeks ago — every Stray crash
+report on the machine, with a count of how many name our DLL:
+
+| when | segcap frames | error |
+|---|---|---|
+| 21:02 | 3 | ACCESS_VIOLATION |
+| 21:01 | 5 | ACCESS_VIOLATION |
+| 19:31 | 4 | ACCESS_VIOLATION |
+| 19:30 | 4 | ACCESS_VIOLATION |
+| 08-10 | 8 | ACCESS_VIOLATION |
+| 08-09 | 6 | ACCESS_VIOLATION |
+
+Six of the last eight, going back to **08-09**, all the same exception, all with
+`segcap` on the stack. Not a new regression — the single most frequent failure in
+the whole archive, sitting unexamined the entire time, and I had spent the
+evening assuming the two crashes I already had names for were the whole story.
+
+**Why it stayed unreadable.** UE writes `<CallStack></CallStack>` — empty — and
+puts the real frames in `<PCallStack>` as bare module offsets:
+
+```
+segcap 0x00007fff8fdc0000 + 20b61
+segcap 0x00007fff8fdc0000 + 20014
+segcap 0x00007fff8fdc0000 + 4415
+KERNEL32 ...
+ntdll ...
+```
+
+Unreadable at a glance, so nobody read them. They are 40 lines of `dbghelp`
+away from being exact, and against the matching PDB they say:
+
+```
+FindNamePool    ue4.cpp:350
+Discover        ue4.cpp:1051
+DiscoverThread  dllmain.cpp:572
+```
+
+Not the render thread, not the marking thread — the **discovery scan**, walking
+memory looking for the FName pool. And `KERNEL32`/`ntdll` under the last frame
+means a thread start, so the fault is on a thread of ours, which is why it takes
+the process with it.
+
+**The cause is a question about the past.** `IsReadable` is a `VirtualQuery`, and
+it answers truthfully about the instant it was asked. Between that answer and the
+dereference, the game can free the region, change its protection, or unmap the
+reservation — and during a level transition it does all three, continuously, on
+another thread. The length checks around the faulting read were all present and
+all correct. None of them can help: the read is racing a memory map we do not own
+and cannot lock.
+
+The fix is to catch the fault rather than try to avoid it, and for a heuristic
+scan that is not a workaround but the correct semantics. This code is guessing at
+addresses deliberately; nearly every guess is wrong; *"that address went away
+while I was reading it"* belongs in the same bucket as *"those bytes were not a
+name"* — skip the candidate, keep scanning. Only code that expected to be right
+would treat it as fatal. `SafeCopy` is SEH-guarded and lives in its own function
+because MSVC forbids `__try` in a function needing C++ object unwinding, and the
+decoder owns a `std::string`.
+
+The general lesson is about the evidence, not the race: **an instrument nobody
+can read is an instrument nobody consults.** §8.19 recorded that once about a log
+nobody looked at. This is the same thing wearing a hex offset — the information
+was in every crash report for four days, complete and correct, and the cost of
+reading it was a script I could have written the first time.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have
