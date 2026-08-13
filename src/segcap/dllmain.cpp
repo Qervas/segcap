@@ -31,6 +31,9 @@ HMODULE g_self = nullptr;
 // the default rather than something that happens because a flag was left on.
 bool g_markCustomDepth = false;
 bool g_peTriageInCensus = false;
+// Read from a "segcap.radius" marker before the marker object exists, applied
+// once it does. 0 means no distance gate.
+double g_markRadius = 0.0;
 
 // True while a marking pass is queued but not yet drained on the game thread.
 std::atomic<bool> g_markPassPending{false};
@@ -478,6 +481,22 @@ DWORD WINAPI InitThread(LPVOID) {
                             g_introspectClasses.size());
         }
 
+        // Spend the 255 slots on what is near the character rather than on
+        // whatever the engine last drew. World units (centimetres in both
+        // titles); 0 or absent keeps the old behaviour.
+        //
+        // No default is baked in here on purpose. The right radius is a property
+        // of the scene, not of the code, and the counters this run logs
+        // (skipped-far / released-far) are what should choose it.
+        const unsigned long radius = readInt(L".radius");
+        if (radius) {
+            g_markRadius = static_cast<double>(radius);
+            segcap::LogInfo("customdepth: mark radius %lu units -- slots go to objects "
+                            "within that of the on-screen character; anything beyond is "
+                            "skipped, and marked objects that drift past 1.25x are "
+                            "handed back", radius);
+        }
+
         const unsigned long caps = readInt(L".captures");
         const unsigned long strd = readInt(L".stride");
         if (caps || strd) {
@@ -872,6 +891,7 @@ DWORD WINAPI DiscoverThread(LPVOID) {
                                     : "observation only (no marker) -- world state will be "
                                       "reported, nothing will be written");
                 // Resolve on the game thread, then collect off it.
+                g_marker.SetMarkRadius(g_markRadius);
                 pe.RunOnGameThread([](segcap::ue4::Engine& e) { g_marker.Resolve(e); });
                 g_marker.CollectCandidates(g_engine, true);
 

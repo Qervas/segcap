@@ -52,6 +52,13 @@ def main() -> int:
                          "destroys the marked slots the mask is built from")
     ap.add_argument("--captures", type=int, default=400,
                     help="mask budget for the run (was pinned at 60 by a stale marker file)")
+    ap.add_argument("--radius", type=int, default=0,
+                    help="only mark objects within N world units (cm) of the on-screen "
+                         "character; marked objects drifting past 1.25x are handed back. "
+                         "0 = off. WasRecentlyRendered has no notion of distance, so "
+                         "indoors most of the 255 slots go to the street outside. Start "
+                         "around 3000 (30m) and read the skipped-far/released-far "
+                         "counters in the log to tune it")
     ap.add_argument("--stride", type=int, default=8,
                     help="keep every Nth frame; 8 is ~4/sec at 30fps")
     ap.add_argument("--retries", type=int, default=3,

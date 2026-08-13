@@ -133,6 +133,13 @@ class Run:
         if not self.preflight:
             (BIN / "segcap.captures").write_text(str(self.o.captures))
             (BIN / "segcap.stride").write_text(str(self.o.stride))
+            radius = int(getattr(self.o, "radius", 0) or 0)
+            if radius:
+                (BIN / "segcap.radius").write_text(str(radius))
+                self.say(f"distance gate ON -- only marking within {radius} units of the "
+                         f"character (drift past {int(radius * 1.25)} hands the slot back)")
+            else:
+                (BIN / "segcap.radius").unlink(missing_ok=True)
         self.say(f"capture budget {self.o.captures} frames, stride {self.o.stride}")
         self.marker("segcap.requirearm", True)
         self.marker("segcap.arm", False)

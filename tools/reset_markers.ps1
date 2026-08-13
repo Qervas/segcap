@@ -49,6 +49,7 @@ $markers = @(
     "segcap.arm",         # the arm trigger itself
     "segcap.idbuf",       # id-buffer probe (copies from integer targets)
     "segcap.groundtruth", # unmark one slot mid-run and check its pixels vanish
+    "segcap.radius",      # only mark objects within N units of the character
     "segcap.injectdry",   # observe render passes / barrier shapes, record nothing
     "segcap.inject",      # record copies into the game's own command lists
     "segcap.introspect"   # reflection dump

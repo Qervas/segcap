@@ -133,8 +133,62 @@ bool CustomDepthMarker::Resolve(ue4::Engine& engine) {
                 "proxy stale, so nothing will actually render");
     }
 
+    // World position, for the distance gate. Declared on USceneComponent, which
+    // UPrimitiveComponent derives from -- try the derived class first in case
+    // FindFunction does not walk the super chain, then the base explicitly.
+    fnGetComponentLocation_ = engine.FindFunction(primClass, "K2_GetComponentLocation");
+    if (!fnGetComponentLocation_) {
+        if (void* sceneClass = engine.FindClass("SceneComponent")) {
+            fnGetComponentLocation_ = engine.FindFunction(sceneClass,
+                                                          "K2_GetComponentLocation");
+        }
+    }
+    if (fnGetComponentLocation_) {
+        // MEASURE the return width. A UFunction is a UStruct, so its parameters
+        // are its properties; the return value is the one marked ReturnValue.
+        // UE4 gives 12 bytes (three floats), UE5 with Large World Coordinates
+        // gives 24 (three doubles). Assuming either one silently produces
+        // coordinates that look like coordinates and are not, which is the
+        // failure this project keeps paying for.
+        for (const auto& p : engine.ListProperties(fnGetComponentLocation_, false)) {
+            if (p.name == "ReturnValue") { locationSize_ = p.size; break; }
+        }
+        LogInfo("customdepth: K2_GetComponentLocation UFunction = %p, returns %d bytes "
+                "(%s)", fnGetComponentLocation_, locationSize_,
+                locationSize_ == 24  ? "3 doubles -- UE5 Large World Coordinates"
+                : locationSize_ == 12 ? "3 floats -- UE4"
+                                      : "UNRECOGNISED, distance gate disabled");
+        if (locationSize_ != 12 && locationSize_ != 24) fnGetComponentLocation_ = nullptr;
+    } else {
+        LogWarn("customdepth: K2_GetComponentLocation not found -- no distance gate, "
+                "slots will go to whatever the engine drew anywhere");
+    }
+
     resolved_ = true;
     return true;
+}
+
+// Ask the engine where this component is. GAME THREAD ONLY.
+bool CustomDepthMarker::GetWorldLocation(void* component, double out[3]) {
+    if (!component || !fnGetComponentLocation_ || !locationSize_) return false;
+    // The parameter block for a no-argument function is just its return value.
+    // Oversized and zeroed so a wider signature than we measured cannot write
+    // past the end.
+    alignas(8) uint8_t params[64] = {};
+    ue4::GetProcessEventHook().CallFunction(component, fnGetComponentLocation_, params);
+    if (locationSize_ == 24) {
+        double v[3];
+        std::memcpy(v, params, sizeof(v));
+        out[0] = v[0]; out[1] = v[1]; out[2] = v[2];
+    } else {
+        float v[3];
+        std::memcpy(v, params, sizeof(v));
+        out[0] = v[0]; out[1] = v[1]; out[2] = v[2];
+    }
+    // A component at exactly the origin is far more likely to be a failed call
+    // than a real position, and treating it as real would drag the anchor to
+    // (0,0,0) and reject the entire world.
+    return !(out[0] == 0.0 && out[1] == 0.0 && out[2] == 0.0);
 }
 
 bool CustomDepthMarker::WriteMarked(void* component, uint8_t stencilValue,
@@ -366,6 +420,7 @@ int CustomDepthMarker::RefreshVisibility(ue4::Engine& engine, int limit) {
                 identity_.ReleaseSlot(mp.stencilValue);
             }
             slotTable_.erase(mp.stencilValue);
+            slotIsCharacter_[mp.stencilValue] = 0;
             alreadyMarked_.erase(mp.component);
             pooled_.erase(mp.component);
             marked_.erase(marked_.begin() + static_cast<ptrdiff_t>(refreshCursor_));
@@ -408,6 +463,47 @@ int CustomDepthMarker::RefreshVisibility(ue4::Engine& engine, int limit) {
         // Pinning against all three would have silently converted every
         // camera-cut into proof.
         const bool pinned = mp.stencilValue == groundTruthPin_.load();
+
+        // HAND BACK SLOTS THAT HAVE DRIFTED OUT OF RANGE.
+        //
+        // The gate in MarkBatch stops NEW slots going to the street; this is
+        // what frees the ones already there. Without it the road and trees keep
+        // their ids for as long as they stay nominally rendered, and the room
+        // never gets the budget -- which is the symptom that started this.
+        //
+        // 1.25x the acquisition radius, for the same reason the visibility test
+        // uses a wider tolerance than acquisition: equal thresholds make an
+        // object at the boundary acquire and release every pass, which is thrash
+        // with extra steps.
+        if (!pinned && markRadius_ > 0.0 && anchorValid_) {
+            double p[3];
+            if (GetWorldLocation(mp.component, p)) {
+                const double dx = p[0] - anchor_[0];
+                const double dy = p[1] - anchor_[1];
+                const double dz = p[2] - anchor_[2];
+                const double limit = markRadius_ * 1.25;
+                if (dx * dx + dy * dy + dz * dz > limit * limit) {
+                    UnmarkPrimitive(mp);
+                    {
+                        std::lock_guard<std::mutex> lock(identityMutex_);
+                        identity_.ReleaseSlot(mp.stencilValue);
+                    }
+                    if (mp.className.find("InstancedStaticMesh") != std::string::npos ||
+                        mp.className.find("Foliage") != std::string::npos) {
+                        if (instancedLeased_) --instancedLeased_;
+                    }
+                    slotTable_.erase(mp.stencilValue);
+                    slotIsCharacter_[mp.stencilValue] = 0;
+                    alreadyMarked_.erase(mp.component);
+                    marked_.erase(marked_.begin() + static_cast<ptrdiff_t>(refreshCursor_));
+                    ++released;
+                    ++slotsReleased_;
+                    ++releasedFar_;
+                    continue;   // erase shifted the next element into this cursor
+                }
+            }
+        }
+
         if (!pinned && marked_.size() >= IdentityRegistry::kSlotCount - 8 &&
             tinyStreak_[mp.stencilValue] >= 8) {
             tinyStreak_[mp.stencilValue] = 0;
@@ -421,6 +517,7 @@ int CustomDepthMarker::RefreshVisibility(ue4::Engine& engine, int limit) {
                 if (instancedLeased_) --instancedLeased_;
             }
             slotTable_.erase(mp.stencilValue);
+            slotIsCharacter_[mp.stencilValue] = 0;
             alreadyMarked_.erase(mp.component);
             marked_.erase(marked_.begin() + static_cast<ptrdiff_t>(refreshCursor_));
             ++released;
@@ -542,6 +639,45 @@ int CustomDepthMarker::CollectCandidates(ue4::Engine& engine, bool renderableOnl
 int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
     if (!resolved_) return 0;
 
+    // Re-locate the anchor once per pass, on the game thread where calling a
+    // UFunction is legal. The render thread chose which SLOT is the character;
+    // this turns that into a position.
+    //
+    // Re-read every pass rather than cached, because the character walks. A
+    // stale anchor would keep the radius centred on where she was, which is the
+    // same bug as WasRecentlyRendered's time tolerance, just slower.
+    if (markRadius_ > 0.0 && fnGetComponentLocation_) {
+        const uint8_t slot = anchorSlot_.load(std::memory_order_relaxed);
+        void* anchorComponent = nullptr;
+        if (slot) {
+            for (const auto& mp : marked_) {
+                if (mp.stencilValue == slot) {
+                    if (engine.StillLive(mp.component, mp.objectIndex, mp.serialNumber)) {
+                        anchorComponent = mp.component;
+                    }
+                    break;
+                }
+            }
+        }
+        if (anchorComponent) {
+            double p[3];
+            if (GetWorldLocation(anchorComponent, p)) {
+                anchor_[0] = p[0]; anchor_[1] = p[1]; anchor_[2] = p[2];
+                if (!anchorValid_) {
+                    anchorValid_ = true;
+                    LogInfo("customdepth: distance gate ACTIVE -- anchored on slot %u at "
+                            "(%.0f, %.0f, %.0f), radius %.0f units",
+                            static_cast<unsigned>(slot), p[0], p[1], p[2], markRadius_);
+                }
+            }
+        }
+        // anchorValid_ is never cleared once set. Losing the anchor for a frame
+        // -- the character occluded, the slot reissued -- would otherwise switch
+        // the gate off and let the street back in, which is exactly the flicker
+        // this is meant to remove. The last known position is a better centre
+        // than no centre.
+    }
+
     // Take only as many candidates as there are FREE slots.
     //
     // This bound is the difference between a stable mask and a strobing one.
@@ -633,6 +769,33 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
             continue;
         }
 
+        // THE DISTANCE GATE, before the visibility one on purpose.
+        //
+        // Both cost a UFunction call, and indoors this one rejects far more of
+        // the batch -- the whole city is a candidate while the room is a few
+        // dozen objects -- so testing it first spends one call on a distant
+        // object instead of two.
+        //
+        // WasRecentlyRendered has no notion of where a thing is. A tree eighty
+        // metres down the street passes it exactly as well as the chair the
+        // character is sitting on, and indoors that is most of the budget.
+        if (markRadius_ > 0.0 && anchorValid_) {
+            double p[3];
+            if (GetWorldLocation(c.component, p)) {
+                const double dx = p[0] - anchor_[0];
+                const double dy = p[1] - anchor_[1];
+                const double dz = p[2] - anchor_[2];
+                if (dx * dx + dy * dy + dz * dz > markRadius_ * markRadius_) {
+                    ++skippedFar_;
+                    continue;
+                }
+            }
+            // A component with no readable position is NOT rejected. "I could
+            // not measure it" is not "it is far away", and silently dropping
+            // everything the call fails on would empty the mask for a reason
+            // no counter would show.
+        }
+
         // The visibility gate. Tested BEFORE leasing, because a slot spent on
         // an off-screen primitive is a slot that cannot label a visible one,
         // and there are only 255 of them against ~32,800 candidates.
@@ -707,6 +870,11 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
         marked_.push_back(mp);
         slotTable_[slot] = mp;
         alreadyMarked_.insert(c.component);
+        // Tag it for the anchor picker on the render thread. Skeletal meshes are
+        // the people -- inZOI's Zois come through as SkeletalMeshComponent and
+        // SkeletalMeshComponentBudgeted, Stray's cat the same way.
+        slotIsCharacter_[slot] =
+            c.className.find("SkeletalMesh") != std::string::npos ? 1 : 0;
         --freeSlots;
         ++assigned;
 
@@ -723,6 +891,16 @@ int CustomDepthMarker::MarkBatch(ue4::Engine& engine, int limit) {
     // "marked 0" entries last time.
     if (assigned > 0 || refused > 0 || skippedStale > 0) {
         std::lock_guard<std::mutex> lock(identityMutex_);
+        // far-skipped / far-released are logged so the radius can be CHOSEN from
+        // a run rather than guessed: near-zero means it is too generous to be
+        // doing anything, and a mask that has lost the room means too tight.
+        if (markRadius_ > 0.0) {
+            LogInfo("customdepth: distance gate -- %zu candidates skipped as far, "
+                    "%zu marked objects handed back after drifting out of range "
+                    "(radius %.0f, anchor %s)",
+                    skippedFar_, releasedFar_, markRadius_,
+                    anchorValid_ ? "locked" : "NOT YET FOUND -- gate idle");
+        }
         LogInfo("customdepth: marked %d (refused %d, invisible %d, already %d, stale %d "
                 "of %zu scanned); %zu live slots, %llu identities, %llu evictions, "
                 "%llu dropped-destroyed, visible %llu/%llu tested",
@@ -778,6 +956,28 @@ void CustomDepthMarker::NoteMaskCoverage(const uint32_t* pixelsPerSlot) {
     // of the street, and a speck is not worth one of 255 labels while the chair
     // in the foreground has none.
     constexpr uint32_t kMinPixels = 200;
+
+    // Pick the point everything else is measured from: the biggest character on
+    // screen. The mask is the only place that knows what is actually large in
+    // view, so the choice is made here and the position is looked up later on
+    // the game thread -- a slot number survives that hop, a component pointer
+    // does not.
+    //
+    // Falls back to the largest object of any class so an empty room still has
+    // an anchor. It is a worse anchor -- indoors that is usually the apartment
+    // shell, whose origin can be anywhere -- but a wrong-ish centre is better
+    // than switching the gate off entirely.
+    uint8_t bestCharacter = 0, bestAny = 0;
+    uint32_t bestCharacterPx = 0, bestAnyPx = 0;
+    for (int slot = 1; slot < 256; ++slot) {
+        const uint32_t px = pixelsPerSlot[slot];
+        if (px > bestAnyPx) { bestAnyPx = px; bestAny = static_cast<uint8_t>(slot); }
+        if (slotIsCharacter_[slot] && px > bestCharacterPx) {
+            bestCharacterPx = px;
+            bestCharacter = static_cast<uint8_t>(slot);
+        }
+    }
+    anchorSlot_.store(bestCharacter ? bestCharacter : bestAny, std::memory_order_relaxed);
 
     for (int slot = 1; slot < 256; ++slot) {
         if (pixelsPerSlot[slot] >= kMinPixels) {

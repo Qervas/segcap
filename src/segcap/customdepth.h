@@ -159,6 +159,20 @@ public:
     // verdict has been recorded. Held only for the duration of the measurement.
     void ClearGroundTruthPin() { groundTruthPin_ = 0; }
 
+    // Spend slots on what is NEAR, not merely on what the engine last drew.
+    //
+    // WasRecentlyRendered is a visibility test with no notion of distance, so a
+    // tree eighty metres down the street passes it exactly as well as the chair
+    // the character is sitting on. Indoors that is most of the budget: 95 of 255
+    // ids in view while the road outside holds slots.
+    //
+    // Radius is in world units (centimetres in both titles). 0 disables the gate
+    // entirely, which is the behaviour before this existed.
+    void SetMarkRadius(double units) { markRadius_ = units; }
+    double markRadius() const { return markRadius_; }
+    size_t skippedFar() const { return skippedFar_; }
+    size_t releasedFar() const { return releasedFar_; }
+
     // The slot whose flag was ACTUALLY cleared, or 0 if the unmark has not run
     // or found nothing to unmark. The intervention is scheduled onto the game
     // thread, so this is the only way the render thread can tell "the experiment
@@ -271,6 +285,36 @@ private:
     // Atomic because it is set and read on the game thread but cleared on the
     // render thread when the verdict is recorded.
     std::atomic<uint8_t> groundTruthPin_{0};
+
+    // ---- distance gating ---------------------------------------------------
+    // USceneComponent::K2_GetComponentLocation. Asking the engine for a world
+    // position rather than reading FTransform ourselves: the component may be
+    // attached several levels deep, so RelativeLocation is the wrong number, and
+    // UE5's Large World Coordinates make FVector three DOUBLES where UE4 has
+    // three floats -- read at the wrong width that returns plausible nonsense
+    // instead of failing.
+    void* fnGetComponentLocation_ = nullptr;
+    // 12 or 24, MEASURED from the UFunction's own return parameter. Never
+    // assumed per engine version.
+    int32_t locationSize_ = 0;
+    // Must be called on the GAME THREAD -- it invokes a UFunction.
+    bool GetWorldLocation(void* component, double out[3]);
+
+    // The point distances are measured from: the character on screen. Chosen on
+    // the render thread by mask area (a slot number, not a pointer -- the
+    // component behind it can be destroyed between threads), resolved to a
+    // location on the game thread.
+    // Is the object holding this slot a character? Written on the game thread
+    // when a slot is leased or released, read on the render thread when the mask
+    // arrives. A plain byte array rather than a lookup into slotTable_, because
+    // that map is game-thread state and the mask callback is not on it.
+    uint8_t slotIsCharacter_[256] = {};
+    std::atomic<uint8_t> anchorSlot_{0};
+    double anchor_[3] = {0, 0, 0};
+    bool anchorValid_ = false;
+    double markRadius_ = 0.0;
+    size_t skippedFar_ = 0;
+    size_t releasedFar_ = 0;
     // Consecutive masks in which a slot rendered below the area threshold.
     // A streak, not a single frame: an object can legitimately be occluded for
     // a moment, and evicting on one bad frame is thrash.
