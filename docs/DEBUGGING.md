@@ -2236,6 +2236,66 @@ nobody looked at. This is the same thing wearing a hex offset — the informatio
 was in every crash report for four days, complete and correct, and the cost of
 reading it was a script I could have written the first time.
 
+### 8.28 We did not crash — we handed the game a dangling pointer and it crashed
+
+Two of every three Stray attempts died with *"game exited before: the world to
+load"*. The crash report reads unlike every other one in this archive:
+
+```
+Stray-Win64-Shipping + 2f3ebd0     <- fault here
+Stray-Win64-Shipping + 2b4f4f9
+Stray-Win64-Shipping + 301ed32
+Stray-Win64-Shipping + 1300c69
+Stray-Win64-Shipping + 14627c5
+segcap + 8759                       <- ProbeWorldState's lambda
+segcap + 2485a                       <- ProcessEventDetour
+```
+
+Five **game** frames above ours. Everywhere else in this file, our code faults
+and our frame is on top. Here the engine faults, and our frames are underneath
+it — which is the signature of *we called in with something bad*, not *we read
+something bad*.
+
+I had already guessed wrong once about this crash. When it first appeared I
+guarded `Engine::GetObject`, because the crash before it had been a torn read in
+the object walk and this one came through the same probe. That fix was correct
+in itself and did nothing here — the next run crashed at the identical address.
+**Fixing the previous instance of a pattern is not the same as fixing this one.**
+
+The actual cause is four lines up from the symbol:
+
+```cpp
+pe.RunOnGameThread([cdo, fp, fd, world](segcap::ue4::Engine&) {
+```
+
+`world` is captured **by value**, and `RunOnGameThread` *queues* the lambda — it
+runs later, on the game thread. During a level transition the `UWorld` found a
+moment earlier is destroyed before the callback arrives. We then pass that freed
+pointer to `UGameplayStatics::IsGamePaused` as its `WorldContextObject`, and the
+engine dereferences it.
+
+No guard could have caught this. The pointer was perfectly readable; it had
+simply stopped being a world. `IsReadable` answers "is this memory mapped", and
+the question here is "is this still the object I think it is" — which is
+unanswerable from the outside, and is the same distinction as §8.3, where address
+identity stood in for object identity.
+
+The fix is to resolve the world **inside** the callback instead of capturing it,
+and it closes the window completely rather than narrowing it: UE tears levels
+down on the game thread, and the callback runs on the game thread, so between the
+lookup and the call the world cannot be destroyed — the thread that would destroy
+it is the one executing our code.
+
+The general form, and the reason this is worth more than the fix:
+
+> **A pointer captured for later use on another thread is a fact with an expiry
+> date that nothing in the type system records.** Queue the lookup, not the
+> result.
+
+And the diagnostic lesson: **when your frames are BELOW the fault rather than
+above it, stop looking for a bad read and start looking for a bad argument.** I
+spent two builds guarding reads because guarding reads had worked twice already.
+
 ## 9. What I would do differently
 
 1. **Verify on the fixture before the game, always.** The one crash would have

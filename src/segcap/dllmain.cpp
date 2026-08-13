@@ -144,6 +144,23 @@ void SignalReady() {
 //   paused; it is precisely what UGameplayStatics::IsGamePaused reads. The
 //   offset is found by reflection rather than hardcoded, so it survives an
 //   engine version change.
+// The live UWorld, by walking the object graph.
+//
+// Call this ON THE GAME THREAD whenever the answer is about to be handed back to
+// the engine. A world pointer resolved on any other thread is a fact with an
+// expiry date nobody can see -- see the note in ProbeWorldState's callback.
+void* FindLiveWorld(segcap::ue4::Engine& engine) {
+    const int32_t total = engine.NumObjects();
+    for (int32_t i = 0; i < total; ++i) {
+        segcap::ue4::ObjectRef ref;
+        if (!engine.GetObject(i, ref)) continue;
+        // Class default objects are templates that never participate in a level.
+        if (ref.name.rfind("Default__", 0) == 0) continue;
+        if (ref.className == "World") return ref.object;
+    }
+    return nullptr;
+}
+
 void ProbeWorldState(segcap::ue4::Engine& engine) {
     // Resolved once by reflection, then read every tick. Offsets are looked up
     // by NAME so an engine-version change cannot silently shift them.
@@ -252,7 +269,32 @@ void ProbeWorldState(segcap::ue4::Engine& engine) {
         void* cdo = gsCDO;
         void* fp = fnPaused;
         void* fd = fnDilation;
-        pe.RunOnGameThread([cdo, fp, fd, world](segcap::ue4::Engine&) {
+        pe.RunOnGameThread([cdo, fp, fd](segcap::ue4::Engine& e) {
+            // RESOLVE THE WORLD HERE, NOT IN THE CAPTURE LIST.
+            //
+            // This lambda used to capture `world` by value from the enclosing
+            // scope. RunOnGameThread QUEUES it -- it runs later, on the game
+            // thread -- and during a level transition the UWorld found a moment
+            // ago is destroyed before it gets there. We then handed that freed
+            // pointer to UGameplayStatics::IsGamePaused as its WorldContextObject
+            // and the engine dereferenced it.
+            //
+            // It is the crash that cost two of every three Stray attempts, and
+            // its report reads unlike the others: five Stray-Win64-Shipping
+            // frames ABOVE ours, because the fault is genuinely inside the
+            // engine. We did not crash -- we handed the game a dangling pointer
+            // and it crashed on our behalf, which is worse, because nothing in
+            // our code appears at the fault site.
+            //
+            // Resolving here closes it completely rather than narrowing it. UE
+            // tears levels down ON THE GAME THREAD, and this callback runs on
+            // the game thread, so between the lookup and the call the world
+            // cannot be destroyed -- the thread that would destroy it is us.
+            // Guarding the read would not have helped: the pointer was readable,
+            // it was just no longer a world.
+            void* world = FindLiveWorld(e);
+            if (!world) return;
+
             // Params are laid out as UE lays them out: context pointer first,
             // return value after it, both naturally aligned.
             if (fp) {
