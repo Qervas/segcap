@@ -66,10 +66,30 @@ markable primitives. The slot is a **lease**, not an identity.
 The sidecar resolves it:
 
 ```json
-{"slot": 51, "stableId": 51,  "className": "SkeletalMeshComponent", "objectName": "CharacterMesh0"},
-{"slot": 126,"stableId": 126, "className": "SkeletalMeshComponent", "objectName": "Droid_Head"},
-{"slot": 10, "stableId": 272, "className": "SplineMeshComponent",   "objectName": "NODE_AddSplineMeshComponent-0"}
+{
+  "frameIndex": 6145,
+  "timestampMs": 1786646498443,
+  "width": 1280,
+  "height": 720,
+  "bindings": [
+    {"slot": 51, "stableId": 51,  "className": "SkeletalMeshComponent", "objectName": "CharacterMesh0",  "serial": 8148, "released": false},
+    {"slot": 126,"stableId": 126, "className": "SkeletalMeshComponent", "objectName": "Droid_Head",      "serial": 5423, "released": false},
+    {"slot": 10, "stableId": 272, "className": "SplineMeshComponent",   "objectName": "NODE_AddSplineMeshComponent-0", "serial": 0, "released": false}
+  ]
+}
 ```
+
+The envelope matters to anyone writing a parser: the top level is an **object**,
+not an array, and `bindings` is where the rows live. `frameIndex` is the same
+monotonic index as the `.pgm` filename, so a sidecar can be matched to its mask
+without parsing the name.
+
+Two per-binding fields carry the identity machinery:
+
+| field | meaning |
+|---|---|
+| `serial` | the engine's own serial number for that object. It is half of the `(pointer, serialNumber)` key behind `stableId`, and it is what makes a recycled address detectable rather than silently merging two objects. |
+| `released` | the slot's lease had been handed back by the time this frame's table was written. The row is kept rather than dropped, because pixels carrying that id may still be in *this* frame — a released row is how you tell "the label was retired" apart from "the label was never there". |
 
 `stableId` is a 64-bit identity keyed on `(pointer, serialNumber)`. It survives
 losing a slot, so an object that goes off screen and comes back resumes its

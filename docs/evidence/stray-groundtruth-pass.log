@@ -1,0 +1,28 @@
+Stray ground-truth intervention -- PASS
+
+Unmark exactly one primitive's bRenderCustomDepth via the engine's own
+setter, and require exactly that id's pixels to disappear from the mask.
+This is the only check in the project that cannot be satisfied by
+coherent-but-wrong data: every other one reads the buffer and asks whether
+it looks right, this one CHANGES the world and requires the mask to follow.
+
+Companion to inzoi-groundtruth-pass.log. That one proves it on UE5.6 +
+Nanite, where the ids live in a separate R16G16_UINT colour target. This
+one proves the same property on UE4, where they live in the depth-stencil's
+stencil plane -- a different engine, a different carrier, the same test.
+
+Note the direction of the second number. The OTHER slots GAIN pixels, they
+do not merely stay still, and that is the correct signature rather than a
+tolerance being met: the unmarked surface stops writing to CustomDepth, so
+it stops occluding there, and whatever is behind it paints through its
+silhouette. A mask that simply blanked the slot would leave the rest
+unchanged.
+
+Run: capture.py stray --seconds 120 --groundtruth   (2026-08-13)
+Full log archived under captures/stray_20260813_212631/
+
+----------------------------------------------------------------------
+[segcap      0.000 info ] GROUND-TRUTH INTERVENTION enabled -- one slot will be unmarked mid-run and its pixels checked
+[segcap     46.344 warn ] groundtruth: selected slot 198 with 183790 px (19.94% of frame); everything else holds 316143 px. Requesting unmark.
+[segcap     46.360 warn ] groundtruth: UNMARKED slot 198 (StaticMeshComponent) -- from here its pixels must vanish and no others may move
+[segcap     46.844 warn ] groundtruth RESULT: slot 198 went 183790 -> 0 px (100.0% removed); all other slots 316143 -> 331033 px (-4.7% lost; growth is expected, the unmarked surface stops occluding them). VERDICT: PASS -- exactly the unmarked object's pixels disappeared

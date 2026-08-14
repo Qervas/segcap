@@ -6,19 +6,31 @@ aligned with the rendered frames.
 Two retail games, no source, no symbols, shipping binaries with debug names
 stripped:
 
-| | engine | result |
-|---|---|---|
-| **Stray** | UE4, D3D12 | masks over gameplay video, 1:1 aligned, subject tracked |
-| **inZOI** | UE5.6 + Nanite, D3D12 | 301-401 masks/run, 79-100% of pixels labelled, live simulation |
+| | engine | id carrier | result |
+|---|---|---|---|
+| **Stray** | UE4, D3D12 | stencil plane | 401 masks + 400 paired frames/run, ~100% of pixels labelled |
+| **inZOI** | UE5.6 + Nanite, D3D12 | `R16G16_UINT` colour target | ~400 masks/run, 79-100% labelled, live simulation |
 
-Stray is the complete deliverable. inZOI is the harder case and the more
-interesting one: on a Nanite title the per-object stencil is not in the
-depth-stencil at all, and finding where it *is* took most of the project.
+Both titles run end to end from one command with nobody at the keyboard. inZOI
+is the harder case and the more interesting one: on a Nanite title the
+per-object stencil is not in the depth-stencil at all, and finding where it *is*
+took most of the project.
 
 That the labels are real is not argued from the pictures. Clearing exactly one
-object's `bRenderCustomDepth` removed **exactly that id's pixels and nothing
-else** — twice, on different objects, at 15.8% and 68.1% of the frame, both to
-zero: [`docs/evidence/inzoi-groundtruth-pass.log`](docs/evidence/inzoi-groundtruth-pass.log).
+object's `bRenderCustomDepth` removes **exactly that id's pixels and nothing
+else** — and it now passes on **both engines**, which are two different carriers:
+
+| | object | pixels | result | evidence |
+|---|---|---|---|---|
+| inZOI | slot 102 | 161,787 (15.8% of frame) | → **0** | [log](docs/evidence/inzoi-groundtruth-pass.log) |
+| inZOI | slot 1 | 696,837 (68.1%) | → **0** | [log](docs/evidence/inzoi-groundtruth-pass.log) |
+| Stray | slot 198 | 183,790 (19.9%) | → **0** | [log](docs/evidence/stray-groundtruth-pass.log) |
+
+The direction of the *other* ids is the part worth noticing: they **gain**
+pixels rather than staying still. That is the correct signature rather than a
+tolerance being met — the unmarked surface stops writing to CustomDepth, so it
+stops occluding there, and whatever is behind it paints through its silhouette.
+
 It is the one check here that a coherent-but-wrong mask cannot pass, and getting
 it to run at all took two fixes of its own (`DEBUGGING.md` §8.13–8.15).
 
@@ -273,10 +285,19 @@ whatever the object scan reached first.
 consecutive crash reports rather than describing the two I remembered: **nine are
 `E_ABORT` from the game's own `ResizeBuffers`**, one is the `E_INVALIDARG` from
 `Close()` that had absorbed most of the effort, and two are access violations —
-a third family the write-up had never mentioned. Neither blocks capture; the
+a third family the write-up had never mentioned. None blocks capture; the
 harness retries, and a run that reaches gameplay captures reliably. Eight
 candidate explanations are now killed with evidence rather than left as guesses.
 `DEBUGGING.md` §8.16.
+
+**The access-violation family is now diagnosed and fixed on Stray**, where it was
+two unrelated bugs sharing one exception code: a time-of-check/time-of-use race
+in the discovery scan, and a `UWorld` pointer captured into a queued callback and
+handed back to the engine after the level had been torn down — the second faults
+*inside the game*, five frames above ours, which is why it read as the game's
+fault. `DEBUGGING.md` §8.27–8.28. Whether inZOI's two are the same two causes is
+**unverified**: they share an exception code and a plausible mechanism, and that
+is not evidence.
 
 ---
 
@@ -286,7 +307,7 @@ candidate explanations are now killed with evidence rather than left as guesses.
 |---|---|
 | Objects per mask | Stray 60–89 distinct ids; inZOI 31–110 (mean 56 outdoors, 97 indoors) |
 | Pixels labelled | Stray 94–99.9%; inZOI 79–91% outdoors, 100% indoors |
-| Ground truth by intervention (inZOI) | **PASS, replicated** — two runs, two objects, 15.8% and 68.1% of the frame, both to **exactly 0**, with no other id disturbed |
+| Ground truth by intervention | **PASS on both engines** — inZOI twice (15.8%, 68.1% of frame) and Stray once (19.9%), every one to **exactly 0**, with no other id disturbed |
 | Every mask id resolves via its sidecar | **0 unbound**, 0.000% of pixels |
 | Identity survives slot loss | 52 objects left and returned; 55 held >1 slot |
 | Slot ambiguity within a frame | **0** |
@@ -316,7 +337,7 @@ src/segcap/      the injected DLL
   identity.*     slot leases and stable 64-bit ids
 src/injector/    suspended launch + inject + resume
 src/vpad/        ViGEm virtual Xbox pad
-src/tests/       25 assertions, no game required
+src/tests/       31 assertions, no game required
 tools/           see tools/README.md for the full map
   capture.py     one entry point for every title
   games.py       GameProfile: exe, menu route, load signals, per title
