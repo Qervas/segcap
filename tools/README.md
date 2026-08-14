@@ -51,7 +51,6 @@ minutes in, each costing a loaded game world.
 | `ab_diff.py` | did marking change what the player sees? Judged against the game's own temporal-AA noise floor, not against zero |
 | `dither_probe.py`, `dither_phase.py` | characterise the stippled regions — UE dithered LOD, a real CustomDepth constraint |
 | `probe_controls.py` | discover which button does what by measuring, rather than hardcoding a title's controls |
-| `build_report.py` | inline images into the HTML report templates as data URIs (a published artifact's CSP blocks external hosts) |
 
 The check that outranks all of these lives in the DLL, not here: `--groundtruth`
 unmarks one object mid-run and requires exactly its pixels to vanish. It is the
