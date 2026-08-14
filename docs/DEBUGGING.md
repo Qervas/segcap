@@ -4,7 +4,7 @@ Every failure in this project, what it looked like, what actually caused it, and
 what fixed it.
 
 > *"how you diagnosed things when they didn't work, the debugging story matters
-> more to me than the final coverage number"* — Antoine
+> more to me than the final coverage number"* — the brief
 
 ---
 

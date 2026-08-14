@@ -349,7 +349,7 @@ tools/           see tools/README.md for the full map
   renderdoc/     the RenderDoc route, closed when Nanite turned out to write
                  its visibility buffer through a UAV
 docs/            DEBUGGING.md, AI-USAGE.md, FORMAT.md, evidence/
-  archive/       superseded notes, kept because DEBUGGING.md refers to them
+  ARCHITECTURE.md the four layers and the per-title seam
 ```
 
 `legacy/` and `renderdoc/` are dead ends preserved on purpose. The brief asked

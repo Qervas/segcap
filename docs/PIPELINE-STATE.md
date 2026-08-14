@@ -1,6 +1,6 @@
 # What's dynamic, what's baked into a PSO, and why it decided the architecture
 
-Antoine's second bullet asks for "understanding what state is dynamic vs baked
+The brief's second bullet asks for "understanding what state is dynamic vs baked
 into a PSO". That distinction is not a detail here — it is the reason this
 project routes per-object IDs through Unreal's CustomDepth pass instead of
 writing them itself, and the reason the ID channel is 8 bits wide.

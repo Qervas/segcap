@@ -1,6 +1,6 @@
 # Where AI was used, and where it was overridden
 
-Antoine asked for this explicitly. This is the honest version, including the
+The brief asked for this explicitly. This is the honest version, including the
 parts that do not flatter the tooling.
 
 The whole project was built by Claude Code working against a real shipped game,
@@ -83,7 +83,7 @@ would have hidden the screensaver failure completely.
 
 **"Every crash and fix we need to log them down."** Set the documentation
 discipline. `DEBUGGING.md` exists because of this instruction, and it is
-plausibly the most valuable artifact here given Antoine's stated priorities.
+plausibly the most valuable artifact here given the brief's stated priorities.
 
 ---
 
