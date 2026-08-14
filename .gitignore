@@ -36,9 +36,10 @@ Thumbs.db
 __pycache__/
 *.pyc
 
-# Local scratch notes, not part of the deliverable
+# Local notes
 docs/archive/
 docs/notes/
 docs/superpowers/
+docs/RESUME.md
 HANDOFF.md
 TODO.md
